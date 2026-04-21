@@ -9,7 +9,7 @@ from __future__ import annotations
 from sqlmodel import Session, select
 
 from .db import engine, init_db
-from .models import LightModel, Palette
+from .models import LightModel, LightModelMode, Palette
 
 BUILTIN_MODELS: list[tuple[str, list[str]]] = [
     ("RGB 3ch", ["r", "g", "b"]),
@@ -98,21 +98,56 @@ BUILTIN_PALETTES: list[tuple[str, list[str]]] = [
 
 
 def _upsert_model(sess: Session, name: str, channels: list[str]) -> None:
+    mode_name = f"{len(channels)}ch"
     existing = sess.exec(select(LightModel).where(LightModel.name == name)).first()
     if existing is None:
+        model = LightModel(
+            name=name,
+            channels=channels,
+            channel_count=len(channels),
+            builtin=True,
+        )
+        sess.add(model)
+        sess.flush()
         sess.add(
-            LightModel(
-                name=name,
-                channels=channels,
+            LightModelMode(
+                model_id=model.id,
+                name=mode_name,
+                channels=list(channels),
                 channel_count=len(channels),
-                builtin=True,
+                is_default=True,
             )
         )
-    else:
-        existing.channels = channels
-        existing.channel_count = len(channels)
-        existing.builtin = True
-        sess.add(existing)
+        return
+
+    existing.channels = channels
+    existing.channel_count = len(channels)
+    existing.builtin = True
+    sess.add(existing)
+
+    modes = sess.exec(
+        select(LightModelMode).where(LightModelMode.model_id == existing.id)
+    ).all()
+    if not modes:
+        sess.add(
+            LightModelMode(
+                model_id=existing.id,
+                name=mode_name,
+                channels=list(channels),
+                channel_count=len(channels),
+                is_default=True,
+            )
+        )
+        return
+
+    # Keep the built-in's default mode aligned with the canonical channel list.
+    default = next((m for m in modes if m.is_default), None)
+    if default is None:
+        default = modes[0]
+        default.is_default = True
+    default.channels = list(channels)
+    default.channel_count = len(channels)
+    sess.add(default)
 
 
 def _upsert_palette(sess: Session, name: str, colors: list[str]) -> None:

@@ -10,6 +10,9 @@ Group=dmx
 WorkingDirectory=/opt/dmx-control/backend
 Environment=DMX_PASSWORD=secretsauce
 Environment=DMX_DATA_DIR=/var/lib/dmx-control
+# Optional: holds ANTHROPIC_API_KEY for the Claude-based manual parser.
+# The leading '-' makes systemd tolerate the file being absent.
+EnvironmentFile=-/opt/dmx-control/claudeKey.env
 ExecStart=/opt/dmx-control/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1
 Restart=on-failure
 RestartSec=3

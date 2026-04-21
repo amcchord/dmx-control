@@ -12,6 +12,7 @@ from starlette.requests import Request
 from .artnet import manager, rebuild_manager_sync
 from .config import FRONTEND_DIST
 from .db import init_db
+from .routers import ai as ai_router
 from .routers import auth as auth_router
 from .routers import controllers as controllers_router
 from .routers import lights as lights_router
@@ -44,6 +45,7 @@ app.include_router(models_router.router)
 app.include_router(lights_router.router)
 app.include_router(palettes_router.router)
 app.include_router(state_router.router)
+app.include_router(ai_router.router)
 
 
 @app.get("/api/health")

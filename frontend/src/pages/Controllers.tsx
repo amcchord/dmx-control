@@ -1,15 +1,10 @@
-import React, { useEffect, useMemo, useState } from "react";
-import { Api, Controller, Light, LightModel } from "../api";
+import React, { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
+import { Api, Controller, Light } from "../api";
 import Modal from "../components/Modal";
 import { useToast } from "../toast";
 
 type CtrlForm = Omit<Controller, "id">;
-type LightForm = {
-  name: string;
-  controller_id: number;
-  model_id: number;
-  start_address: number;
-};
 
 const emptyCtrl: CtrlForm = {
   name: "",
@@ -24,23 +19,19 @@ const emptyCtrl: CtrlForm = {
 export default function Controllers() {
   const toast = useToast();
   const [controllers, setControllers] = useState<Controller[]>([]);
-  const [models, setModels] = useState<LightModel[]>([]);
   const [lights, setLights] = useState<Light[]>([]);
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState<Controller | null>(null);
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState<CtrlForm>(emptyCtrl);
-  const [lightFor, setLightFor] = useState<Controller | null>(null);
 
   const refresh = async () => {
     try {
-      const [c, m, l] = await Promise.all([
+      const [c, l] = await Promise.all([
         Api.listControllers(),
-        Api.listModels(),
         Api.listLights(),
       ]);
       setControllers(c);
-      setModels(m);
       setLights(l);
     } catch (e) {
       toast.push(String(e), "error");
@@ -122,12 +113,19 @@ export default function Controllers() {
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
           {controllers.map((c) => {
             const clights = lights.filter((l) => l.controller_id === c.id);
+            let plural = "s";
+            if (clights.length === 1) plural = "";
             return (
               <div key={c.id} className="card p-4">
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
-                      <h3 className="truncate font-semibold">{c.name}</h3>
+                      <Link
+                        to={`/controllers/${c.id}`}
+                        className="truncate font-semibold hover:text-accent"
+                      >
+                        {c.name}
+                      </Link>
                       {!c.enabled && (
                         <span className="pill bg-rose-950 text-rose-300 ring-rose-900">
                           disabled
@@ -155,12 +153,12 @@ export default function Controllers() {
                   </div>
                 </div>
                 <div className="mt-3">
-                  <button
-                    className="btn-secondary w-full"
-                    onClick={() => setLightFor(c)}
+                  <Link
+                    to={`/controllers/${c.id}`}
+                    className="btn-secondary w-full justify-center"
                   >
-                    Manage {clights.length} light{clights.length === 1 ? "" : "s"}
-                  </button>
+                    Open ({clights.length} light{plural})
+                  </Link>
                 </div>
               </div>
             );
@@ -255,14 +253,6 @@ export default function Controllers() {
           </label>
         </form>
       </Modal>
-
-      <LightManagerModal
-        controller={lightFor}
-        onClose={() => setLightFor(null)}
-        models={models}
-        lights={lights.filter((l) => lightFor && l.controller_id === lightFor.id)}
-        onChanged={refresh}
-      />
     </div>
   );
 }
@@ -282,242 +272,4 @@ function Field({
       {children}
     </label>
   );
-}
-
-function LightManagerModal({
-  controller,
-  onClose,
-  models,
-  lights,
-  onChanged,
-}: {
-  controller: Controller | null;
-  onClose: () => void;
-  models: LightModel[];
-  lights: Light[];
-  onChanged: () => Promise<void>;
-}) {
-  const toast = useToast();
-  const [editing, setEditing] = useState<Light | null>(null);
-  const [form, setForm] = useState<LightForm>({
-    name: "",
-    controller_id: 0,
-    model_id: models[0]?.id ?? 0,
-    start_address: 1,
-  });
-  const [showForm, setShowForm] = useState(false);
-  const [count, setCount] = useState(1);
-
-  const reset = () => {
-    setForm({
-      name: "",
-      controller_id: controller?.id ?? 0,
-      model_id: models[0]?.id ?? 0,
-      start_address: nextFreeAddress(lights, models),
-    });
-    setEditing(null);
-    setCount(1);
-  };
-
-  const openCreate = () => {
-    reset();
-    setShowForm(true);
-  };
-
-  const openEdit = (l: Light) => {
-    setForm({
-      name: l.name,
-      controller_id: l.controller_id,
-      model_id: l.model_id,
-      start_address: l.start_address,
-    });
-    setCount(1);
-    setEditing(l);
-    setShowForm(true);
-  };
-
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!controller) return;
-    try {
-      if (editing) {
-        await Api.updateLight(editing.id, { ...form, controller_id: controller.id });
-        toast.push("Light updated", "success");
-      } else {
-        const model = models.find((m) => m.id === form.model_id);
-        const chanCount = model?.channel_count ?? 3;
-        const n = Math.max(1, Math.min(128, count));
-        for (let i = 0; i < n; i++) {
-          const addr = form.start_address + i * chanCount;
-          if (addr + chanCount - 1 > 512) break;
-          await Api.createLight({
-            name: n > 1 ? `${form.name} ${i + 1}` : form.name,
-            controller_id: controller.id,
-            model_id: form.model_id,
-            start_address: addr,
-          });
-        }
-        toast.push(`${n} light${n === 1 ? "" : "s"} created`, "success");
-      }
-      setShowForm(false);
-      await onChanged();
-    } catch (e) {
-      toast.push(String(e), "error");
-    }
-  };
-
-  const remove = async (l: Light) => {
-    if (!confirm(`Delete "${l.name}"?`)) return;
-    try {
-      await Api.deleteLight(l.id);
-      await onChanged();
-    } catch (e) {
-      toast.push(String(e), "error");
-    }
-  };
-
-  useEffect(() => {
-    if (controller) reset();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [controller?.id, models.length, lights.length]);
-
-  return (
-    <Modal
-      open={controller !== null}
-      onClose={onClose}
-      title={controller ? `Lights on ${controller.name}` : ""}
-      size="lg"
-    >
-      {showForm ? (
-        <form onSubmit={submit} className="space-y-3">
-          <Field label="Name">
-            <input
-              className="input"
-              value={form.name}
-              onChange={(e) => setForm({ ...form, name: e.target.value })}
-              required
-            />
-          </Field>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Model">
-              <select
-                className="input"
-                value={form.model_id}
-                onChange={(e) => setForm({ ...form, model_id: Number(e.target.value) })}
-              >
-                {models.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.name} ({m.channel_count}ch)
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label="Start address (1-512)">
-              <input
-                className="input"
-                type="number"
-                min={1}
-                max={512}
-                value={form.start_address}
-                onChange={(e) =>
-                  setForm({ ...form, start_address: Number(e.target.value) })
-                }
-              />
-            </Field>
-          </div>
-          {!editing && (
-            <Field label="Count (auto-numbered & spaced by channel count)">
-              <input
-                className="input"
-                type="number"
-                min={1}
-                max={128}
-                value={count}
-                onChange={(e) => setCount(Number(e.target.value))}
-              />
-            </Field>
-          )}
-          <div className="flex justify-end gap-2 pt-2">
-            <button type="button" className="btn-ghost" onClick={() => setShowForm(false)}>
-              Cancel
-            </button>
-            <button type="submit" className="btn-primary">
-              {editing ? "Save" : "Create"}
-            </button>
-          </div>
-        </form>
-      ) : (
-        <div className="space-y-3">
-          <div className="flex justify-end">
-            <button className="btn-primary" onClick={openCreate}>
-              Add light
-            </button>
-          </div>
-          {lights.length === 0 ? (
-            <div className="rounded-lg border border-dashed border-line p-6 text-center text-sm text-muted">
-              No lights on this controller.
-            </div>
-          ) : (
-            <div className="overflow-hidden rounded-lg ring-1 ring-line">
-              <table className="w-full text-sm">
-                <thead className="bg-bg-elev text-left text-xs uppercase tracking-wide text-muted">
-                  <tr>
-                    <th className="px-3 py-2">Name</th>
-                    <th className="px-3 py-2">Model</th>
-                    <th className="px-3 py-2">Address</th>
-                    <th className="px-3 py-2" />
-                  </tr>
-                </thead>
-                <tbody>
-                  {lights
-                    .slice()
-                    .sort((a, b) => a.start_address - b.start_address)
-                    .map((l) => {
-                      const m = models.find((x) => x.id === l.model_id);
-                      return (
-                        <tr key={l.id} className="border-t border-line">
-                          <td className="px-3 py-2">{l.name}</td>
-                          <td className="px-3 py-2 text-muted">
-                            {m?.name ?? "?"}
-                          </td>
-                          <td className="px-3 py-2 font-mono">
-                            {l.start_address}
-                            {m ? `-${l.start_address + m.channel_count - 1}` : ""}
-                          </td>
-                          <td className="px-3 py-2 text-right">
-                            <button
-                              className="btn-ghost mr-1"
-                              onClick={() => openEdit(l)}
-                            >
-                              Edit
-                            </button>
-                            <button
-                              className="btn-ghost text-rose-300 hover:bg-rose-950 hover:text-rose-200"
-                              onClick={() => remove(l)}
-                            >
-                              Delete
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      )}
-    </Modal>
-  );
-}
-
-function nextFreeAddress(lights: Light[], models: LightModel[]): number {
-  if (lights.length === 0) return 1;
-  const byId = new Map(models.map((m) => [m.id, m.channel_count] as const));
-  let max = 0;
-  for (const l of lights) {
-    const count = byId.get(l.model_id) ?? 3;
-    max = Math.max(max, l.start_address + count - 1);
-  }
-  return Math.min(512, max + 1);
 }

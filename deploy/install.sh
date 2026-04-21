@@ -82,6 +82,13 @@ fi
 log "Building frontend..."
 sudo -u "$DMX_USER" npm run build
 
+log "Securing optional Anthropic API key file (if present)..."
+CLAUDE_ENV="$REPO_ROOT/claudeKey.env"
+if [[ -f "$CLAUDE_ENV" ]]; then
+    chown "root:$DMX_USER" "$CLAUDE_ENV"
+    chmod 640 "$CLAUDE_ENV"
+fi
+
 log "Installing systemd unit..."
 install -m 644 "$DEPLOY_DIR/dmx-control.service" "$SERVICE_UNIT"
 systemctl daemon-reload

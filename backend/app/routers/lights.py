@@ -4,8 +4,15 @@ from sqlmodel import Session, select
 from ..artnet import manager, rebuild_manager_sync
 from ..auth import AuthDep
 from ..db import get_session
-from ..models import Controller, Light, LightModel
-from ..schemas import BulkColorRequest, ColorRequest, LightIn, LightOut
+from ..models import Controller, Light, LightModel, LightModelMode
+from ..schemas import (
+    BulkColorRequest,
+    BulkTarget,
+    ColorRequest,
+    LightIn,
+    LightOut,
+    ReorderLightsRequest,
+)
 
 router = APIRouter(prefix="/api/lights", tags=["lights"], dependencies=[AuthDep])
 
@@ -16,6 +23,7 @@ def _to_out(l: Light) -> LightOut:
         name=l.name,
         controller_id=l.controller_id,
         model_id=l.model_id,
+        mode_id=l.mode_id,
         start_address=l.start_address,
         position=l.position,
         r=l.r,
@@ -26,10 +34,61 @@ def _to_out(l: Light) -> LightOut:
         uv=l.uv,
         dimmer=l.dimmer,
         on=l.on,
+        zone_state=dict(l.zone_state or {}),
+        motion_state=dict(l.motion_state or {}),
     )
 
 
+def _apply_zone_color(zs: dict, req: ColorRequest) -> dict:
+    """Update one zone's color dict in place and return it."""
+    zs["r"] = req.r
+    zs["g"] = req.g
+    zs["b"] = req.b
+    if req.w is not None:
+        zs["w"] = req.w
+    if req.a is not None:
+        zs["a"] = req.a
+    if req.uv is not None:
+        zs["uv"] = req.uv
+    if req.dimmer is not None:
+        zs["dimmer"] = req.dimmer
+    if req.on is not None:
+        zs["on"] = req.on
+    else:
+        zs["on"] = True
+    return zs
+
+
+def _apply_motion(light: Light, req: ColorRequest) -> None:
+    if req.motion is None:
+        return
+    ms = dict(light.motion_state or {})
+    for axis in ("pan", "tilt", "zoom", "focus"):
+        val = getattr(req.motion, axis)
+        if val is not None:
+            ms[axis] = float(val)
+    light.motion_state = ms
+
+
 def _apply_color(light: Light, req: ColorRequest) -> None:
+    """Apply a color request, respecting req.zone_id when present.
+
+    - If ``zone_id`` is set, only that zone is updated.
+    - If ``zone_id`` is absent, the flat fields (whole-fixture fallback) are
+      updated, and any per-zone overrides are cleared so every zone picks
+      up the new color through the fallback.
+    """
+    _apply_motion(light, req)
+    if req.zone_id:
+        zs_map = dict(light.zone_state or {})
+        zs = dict(zs_map.get(req.zone_id) or {})
+        _apply_zone_color(zs, req)
+        zs_map[req.zone_id] = zs
+        light.zone_state = zs_map
+        # Keep flat fields in sync as a "last-touched" fallback so newly
+        # added zones inherit something reasonable.
+        return
+    # Whole-fixture update: flat fields + wipe per-zone overrides.
     light.r = req.r
     light.g = req.g
     light.b = req.b
@@ -45,6 +104,7 @@ def _apply_color(light: Light, req: ColorRequest) -> None:
         light.on = req.on
     else:
         light.on = True
+    light.zone_state = {}
 
 
 def _push(light: Light) -> None:
@@ -59,11 +119,42 @@ def _push(light: Light) -> None:
             "uv": light.uv,
             "dimmer": light.dimmer,
             "on": light.on,
+            "zone_state": dict(light.zone_state or {}),
+            "motion_state": dict(light.motion_state or {}),
         },
     )
 
 
-def _ensure_refs(sess: Session, controller_id: int, model_id: int) -> tuple[Controller, LightModel]:
+def _resolve_mode(
+    sess: Session, model_id: int, mode_id: int | None
+) -> LightModelMode:
+    """Return the mode row to use for a light.
+
+    If ``mode_id`` is provided, it must belong to the given model. Otherwise
+    fall back to the model's default mode (and, failing that, any mode)."""
+    if mode_id is not None:
+        mode = sess.get(LightModelMode, mode_id)
+        if mode is None or mode.model_id != model_id:
+            raise HTTPException(400, "mode does not belong to this model")
+        return mode
+    default = sess.exec(
+        select(LightModelMode).where(
+            LightModelMode.model_id == model_id,
+            LightModelMode.is_default == True,  # noqa: E712
+        )
+    ).first()
+    if default is None:
+        default = sess.exec(
+            select(LightModelMode).where(LightModelMode.model_id == model_id)
+        ).first()
+    if default is None:
+        raise HTTPException(400, "model has no modes defined")
+    return default
+
+
+def _ensure_refs(
+    sess: Session, controller_id: int, model_id: int
+) -> tuple[Controller, LightModel]:
     ctrl = sess.get(Controller, controller_id)
     if ctrl is None:
         raise HTTPException(400, "controller does not exist")
@@ -84,9 +175,12 @@ def list_lights(sess: Session = Depends(get_session)) -> list[LightOut]:
 @router.post("", status_code=201)
 def create_light(payload: LightIn, sess: Session = Depends(get_session)) -> LightOut:
     ctrl, model = _ensure_refs(sess, payload.controller_id, payload.model_id)
-    if payload.start_address + model.channel_count - 1 > 512:
+    mode = _resolve_mode(sess, payload.model_id, payload.mode_id)
+    if payload.start_address + mode.channel_count - 1 > 512:
         raise HTTPException(400, "start_address + channel_count exceeds 512")
-    l = Light(**payload.model_dump())
+    data = payload.model_dump()
+    data["mode_id"] = mode.id
+    l = Light(**data)
     sess.add(l)
     sess.commit()
     sess.refresh(l)
@@ -100,9 +194,18 @@ def update_light(lid: int, payload: LightIn, sess: Session = Depends(get_session
     if l is None:
         raise HTTPException(404, "light not found")
     ctrl, model = _ensure_refs(sess, payload.controller_id, payload.model_id)
-    if payload.start_address + model.channel_count - 1 > 512:
+
+    # If the model changed and no explicit mode was given, reset to default.
+    effective_mode_id = payload.mode_id
+    if payload.model_id != l.model_id and payload.mode_id is None:
+        effective_mode_id = None
+    mode = _resolve_mode(sess, payload.model_id, effective_mode_id)
+
+    if payload.start_address + mode.channel_count - 1 > 512:
         raise HTTPException(400, "start_address + channel_count exceeds 512")
-    for k, v in payload.model_dump().items():
+    data = payload.model_dump()
+    data["mode_id"] = mode.id
+    for k, v in data.items():
         setattr(l, k, v)
     sess.add(l)
     sess.commit()
@@ -136,16 +239,86 @@ def set_color(
     return _to_out(l)
 
 
-@router.post("/bulk-color")
-def bulk_color(req: BulkColorRequest, sess: Session = Depends(get_session)) -> dict:
+@router.post("/reorder")
+def reorder_lights(
+    req: ReorderLightsRequest, sess: Session = Depends(get_session)
+) -> dict:
+    """Reassign ``position`` so the given ``light_ids`` appear in that order.
+
+    Positions are assigned 0..N-1 in list order. Lights not included in the
+    request are left untouched. All referenced ids must exist."""
     if not req.light_ids:
         return {"updated": 0}
     rows = sess.exec(select(Light).where(Light.id.in_(req.light_ids))).all()
-    for l in rows:
-        _apply_color(l, req)
+    by_id = {l.id: l for l in rows}
+    missing = [lid for lid in req.light_ids if lid not in by_id]
+    if missing:
+        raise HTTPException(400, f"unknown light ids: {missing}")
+    for idx, lid in enumerate(req.light_ids):
+        l = by_id[lid]
+        l.position = idx
         sess.add(l)
     sess.commit()
-    for l in rows:
+    return {"updated": len(req.light_ids)}
+
+
+@router.post("/bulk-color")
+def bulk_color(req: BulkColorRequest, sess: Session = Depends(get_session)) -> dict:
+    """Apply the same color to many lights, optionally at zone granularity.
+
+    ``light_ids`` updates the whole fixture (old behavior).
+    ``targets[]`` allows per-light zone selection: each entry is
+    ``{light_id, zone_id?}``. A light may appear multiple times in
+    ``targets`` to update multiple zones in the same call.
+    """
+    wanted_ids: set[int] = set(req.light_ids or [])
+    targets: list[BulkTarget] = list(req.targets or [])
+    for t in targets:
+        wanted_ids.add(t.light_id)
+    if not wanted_ids:
+        return {"updated": 0}
+
+    rows = sess.exec(select(Light).where(Light.id.in_(wanted_ids))).all()
+    by_id = {l.id: l for l in rows}
+
+    touched: set[int] = set()
+
+    # Whole-fixture updates first (so subsequent zone writes for the same
+    # fixture land on top of the freshly reset zone_state).
+    for lid in req.light_ids or []:
+        l = by_id.get(lid)
+        if l is None:
+            continue
+        whole = ColorRequest(
+            r=req.r, g=req.g, b=req.b,
+            w=req.w, a=req.a, uv=req.uv,
+            dimmer=req.dimmer, on=req.on,
+            motion=req.motion,
+        )
+        _apply_color(l, whole)
+        sess.add(l)
+        touched.add(l.id)
+
+    for t in targets:
+        l = by_id.get(t.light_id)
+        if l is None:
+            continue
+        zoned = ColorRequest(
+            r=req.r, g=req.g, b=req.b,
+            w=req.w, a=req.a, uv=req.uv,
+            dimmer=req.dimmer, on=req.on,
+            zone_id=t.zone_id,
+            motion=req.motion,
+        )
+        _apply_color(l, zoned)
+        sess.add(l)
+        touched.add(l.id)
+
+    sess.commit()
+    for lid in touched:
+        l = by_id.get(lid)
+        if l is None:
+            continue
         sess.refresh(l)
         _push(l)
-    return {"updated": len(rows)}
+    return {"updated": len(touched)}

@@ -21,10 +21,31 @@ class Controller(SQLModel, table=True):
 class LightModel(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
+    # Channel fields are a cached mirror of the model's default LightModelMode.
+    # Kept for backwards compatibility and simpler code paths that only need
+    # a quick summary; authoritative channel layouts live in LightModelMode.
     channel_count: int
-    # Ordered list of channel roles, e.g. ["r","g","b","w","a","uv"].
     channels: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     builtin: bool = False
+    image_filename: Optional[str] = None
+
+
+class LightModelMode(SQLModel, table=True):
+    model_config = {"protected_namespaces": ()}
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    model_id: int = Field(foreign_key="lightmodel.id", index=True)
+    name: str
+    channels: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    channel_count: int
+    is_default: bool = False
+    # Optional structural overlay on top of `channels`. When null the mode
+    # behaves as a single global zone (today's behavior for simple pars).
+    # Shape documented in docs; channel references are 0-based indices into
+    # the flat `channels` list.
+    layout: Optional[dict] = Field(
+        default=None, sa_column=Column(JSON, nullable=True)
+    )
 
 
 class Light(SQLModel, table=True):
@@ -34,10 +55,12 @@ class Light(SQLModel, table=True):
     name: str
     controller_id: int = Field(foreign_key="controller.id", index=True)
     model_id: int = Field(foreign_key="lightmodel.id", index=True)
+    mode_id: Optional[int] = Field(
+        default=None, foreign_key="lightmodelmode.id", index=True
+    )
     start_address: int  # 1..512
     position: int = 0
 
-    # Persisted RGBW state so we can restore on restart.
     r: int = 0
     g: int = 0
     b: int = 0
@@ -47,9 +70,42 @@ class Light(SQLModel, table=True):
     dimmer: int = 255
     on: bool = True
 
+    # Per-zone color state for compound fixtures.
+    # { zone_id: {r,g,b,w,a,uv,dimmer,on} }. Empty/missing => all zones
+    # inherit the flat r/g/b/w/a/uv/dimmer/on fallback.
+    zone_state: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    # Motion state for fixtures that have pan/tilt/zoom/focus.
+    # All values are floats in [0, 1]; the DMX renderer splits into
+    # coarse/fine bytes if both offsets are present in the layout.
+    motion_state: dict = Field(default_factory=dict, sa_column=Column(JSON))
+
 
 class Palette(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
     colors: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    builtin: bool = False
+
+
+class Scene(SQLModel, table=True):
+    """A named animated effect over a set of targets.
+
+    Targets mirror the shape of :class:`BulkColorRequest`: whole-fixture
+    ``light_ids`` plus per-zone ``targets``. The engine computes an overlay
+    every frame; the fixture's base color in the DB is left untouched."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    # static | fade | cycle | chase | pulse | rainbow | strobe | sparkle | wave
+    effect_type: str
+    palette_id: Optional[int] = Field(
+        default=None, foreign_key="palette.id", index=True
+    )
+    light_ids: list[int] = Field(default_factory=list, sa_column=Column(JSON))
+    # Each target: {"light_id": int, "zone_id": str | None}
+    targets: list[dict] = Field(default_factory=list, sa_column=Column(JSON))
+    # across_lights | across_fixture | across_zones
+    spread: str = "across_lights"
+    params: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    is_active: bool = False
     builtin: bool = False

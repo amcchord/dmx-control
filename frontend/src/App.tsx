@@ -5,6 +5,7 @@ import { ToastProvider } from "./toast";
 import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
 import Controllers from "./pages/Controllers";
+import ControllerDetail from "./pages/ControllerDetail";
 import Models from "./pages/Models";
 import Palettes from "./pages/Palettes";
 import Nav from "./components/Nav";
@@ -58,6 +59,16 @@ export default function App() {
               <Protected>
                 <Layout>
                   <Controllers />
+                </Layout>
+              </Protected>
+            }
+          />
+          <Route
+            path="/controllers/:id"
+            element={
+              <Protected>
+                <Layout>
+                  <ControllerDetail />
                 </Layout>
               </Protected>
             }

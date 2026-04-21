@@ -29,7 +29,7 @@ import threading
 from dataclasses import dataclass
 from typing import Iterable
 
-from .models import Controller, Light, LightModel
+from .models import Controller, Light, LightModel, LightModelMode
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +60,7 @@ class LightBinding:
     light_id: int
     start_index: int  # 0-based position in the 512-byte DMX buffer
     channels: list[str]  # role per channel, e.g. ["r","g","b","w"]
+    layout: dict | None = None  # compound zone/motion overlay (see docs)
 
 
 class UniverseBuffer:
@@ -76,7 +77,11 @@ class UniverseBuffer:
 
 
 def _compute_channel_values(channels: list[str], state: dict) -> list[int]:
-    """Map a light's logical state dict into DMX channel values ordered by role."""
+    """Map a light's logical state dict into DMX channel values ordered by role.
+
+    Flat (non-compound) path: iterates ``channels`` and emits one byte per
+    slot. For compound fixtures use :func:`_compute_layout_values` instead.
+    """
     r = int(state.get("r", 0))
     g = int(state.get("g", 0))
     b = int(state.get("b", 0))
@@ -99,6 +104,20 @@ def _compute_channel_values(channels: list[str], state: dict) -> list[int]:
         a = min(r, g) // 2
     if uv is None:
         uv = 0
+
+    # Motion defaults (floats in [0, 1]; default centered).
+    motion = state.get("motion") or {}
+    mpan = float(motion.get("pan", 0.5))
+    mtilt = float(motion.get("tilt", 0.5))
+    mzoom = float(motion.get("zoom", 0.5))
+    mfocus = float(motion.get("focus", 0.5))
+
+    def _fine_byte(v: float) -> int:
+        i16 = max(0, min(65535, int(round(max(0.0, min(1.0, v)) * 65535))))
+        return i16 & 0xFF
+
+    def _coarse_byte(v: float) -> int:
+        return max(0, min(255, int(round(max(0.0, min(1.0, v)) * 255))))
 
     values: list[int] = []
     for role in channels:
@@ -123,13 +142,151 @@ def _compute_channel_values(channels: list[str], state: dict) -> list[int]:
         elif role == "speed":
             values.append(0)
         elif role == "pan":
-            values.append(128)
+            values.append(_coarse_byte(mpan))
+        elif role == "pan_fine":
+            values.append(_fine_byte(mpan))
         elif role == "tilt":
-            values.append(128)
+            values.append(_coarse_byte(mtilt))
+        elif role == "tilt_fine":
+            values.append(_fine_byte(mtilt))
+        elif role == "zoom":
+            values.append(_coarse_byte(mzoom))
+        elif role == "focus":
+            values.append(_coarse_byte(mfocus))
         else:  # other / unknown
             values.append(0)
-    # clamp
     return [max(0, min(255, v)) for v in values]
+
+
+def _derive_zone_defaults(
+    zs: dict, global_dimmer: int
+) -> tuple[int, int, int, int, int, int, int, bool]:
+    """Return (r, g, b, w, a, uv, dimmer, on) with fallback derivation."""
+    r = int(zs.get("r", 0))
+    g = int(zs.get("g", 0))
+    b = int(zs.get("b", 0))
+    w = zs.get("w")
+    a = zs.get("a")
+    uv = zs.get("uv")
+    dim = int(zs.get("dimmer", global_dimmer))
+    on = bool(zs.get("on", True))
+    if w is None:
+        w = min(r, g, b)
+    if a is None:
+        a = min(r, g) // 2
+    if uv is None:
+        uv = 0
+    return r, g, b, int(w), int(a), int(uv), dim, on
+
+
+def _compute_layout_values(
+    channels: list[str], layout: dict, state: dict
+) -> list[int]:
+    """Compound-fixture renderer: writes zone/motion/global values into a
+    bytes-like list sized to the mode's channel count."""
+    n = len(channels)
+    vals = [0] * n
+
+    on = bool(state.get("on", True))
+    if not on:
+        return vals
+
+    global_dimmer = int(state.get("dimmer", 255))
+    zone_state = state.get("zone_state") or {}
+    motion_state = state.get("motion_state") or {}
+
+    # Fallback "flat" state for zones that don't have explicit state yet.
+    fallback = {
+        "r": state.get("r", 0),
+        "g": state.get("g", 0),
+        "b": state.get("b", 0),
+        "w": state.get("w"),
+        "a": state.get("a"),
+        "uv": state.get("uv"),
+        "dimmer": global_dimmer,
+        "on": True,
+    }
+
+    def _in_range(off) -> bool:
+        return isinstance(off, int) and 0 <= off < n
+
+    zones = layout.get("zones") or []
+    for zone in zones:
+        zid = zone.get("id")
+        colors = zone.get("colors") or {}
+        dimmer_off = zone.get("dimmer")
+        strobe_off = zone.get("strobe")
+
+        zs = zone_state.get(zid) if zid is not None else None
+        if not isinstance(zs, dict):
+            zs = fallback
+
+        zr, zg, zb, zw, za, zuv, zdim, zon = _derive_zone_defaults(
+            zs, global_dimmer
+        )
+        if not zon:
+            if _in_range(dimmer_off):
+                vals[dimmer_off] = 0
+            continue
+
+        has_zone_dim = _in_range(dimmer_off)
+        scale = 1.0 if has_zone_dim else max(0, min(255, zdim)) / 255.0
+        role_vals = {
+            "r": zr, "g": zg, "b": zb,
+            "w": zw, "a": za, "uv": zuv,
+        }
+        for role, off in colors.items():
+            if not _in_range(off):
+                continue
+            v = role_vals.get(role, 0)
+            vals[off] = max(0, min(255, int(round(v * scale))))
+        if has_zone_dim:
+            vals[dimmer_off] = max(0, min(255, zdim))
+        if _in_range(strobe_off):
+            vals[strobe_off] = 0  # no strobe animation in v1
+
+    # Motion axes — floats in [0, 1]; split to coarse/fine when both exist.
+    motion = layout.get("motion") or {}
+    for axis in ("pan", "tilt", "zoom", "focus"):
+        coarse_off = motion.get(axis)
+        fine_off = motion.get(f"{axis}_fine")
+        has_coarse = _in_range(coarse_off)
+        has_fine = _in_range(fine_off)
+        if not (has_coarse or has_fine):
+            continue
+        raw = motion_state.get(axis)
+        if raw is None:
+            raw = 0.5
+        v = max(0.0, min(1.0, float(raw)))
+        if has_coarse and has_fine:
+            i16 = int(round(v * 65535))
+            i16 = max(0, min(65535, i16))
+            vals[coarse_off] = (i16 >> 8) & 0xFF
+            vals[fine_off] = i16 & 0xFF
+        elif has_coarse:
+            vals[coarse_off] = max(0, min(255, int(round(v * 255))))
+        else:
+            vals[fine_off] = max(0, min(255, int(round(v * 255))))
+
+    # Globals — dimmer/strobe/macro/speed at explicit offsets.
+    globals_ = layout.get("globals") or {}
+    dim_off = globals_.get("dimmer")
+    if _in_range(dim_off):
+        vals[dim_off] = max(0, min(255, global_dimmer))
+    for role in ("strobe", "macro", "speed"):
+        off = globals_.get(role)
+        if _in_range(off):
+            vals[off] = 0
+
+    return vals
+
+
+def _render_binding(binding: LightBinding, state: dict) -> list[int]:
+    """Top-level dispatch: layout-aware renderer if a layout is present,
+    otherwise fall back to the flat channel emission."""
+    if binding.layout:
+        return _compute_layout_values(binding.channels, binding.layout, state)
+    return _compute_channel_values(binding.channels, state)
 
 
 class ArtNetManager:
@@ -163,9 +320,18 @@ class ArtNetManager:
         controllers: Iterable[Controller],
         lights: Iterable[Light],
         models: Iterable[LightModel],
+        modes: Iterable[LightModelMode] = (),
     ) -> None:
         """Rebuild all in-memory state from database snapshots."""
         models_by_id = {m.id: m for m in models}
+        modes_by_id: dict[int, LightModelMode] = {}
+        default_mode_by_model: dict[int, LightModelMode] = {}
+        for mode in modes:
+            modes_by_id[mode.id] = mode
+            if mode.is_default:
+                default_mode_by_model[mode.model_id] = mode
+            else:
+                default_mode_by_model.setdefault(mode.model_id, mode)
         lights_list = list(lights)
 
         with self._lock:
@@ -181,26 +347,42 @@ class ArtNetManager:
                     continue
                 if light.controller_id not in self._controllers:
                     continue
+                # Prefer the light's explicit mode, fall back to the model's
+                # default, then to the cached channel list on LightModel.
+                mode = None
+                if light.mode_id is not None:
+                    mode = modes_by_id.get(light.mode_id)
+                if mode is None:
+                    mode = default_mode_by_model.get(light.model_id)
+                if mode is not None:
+                    channels = list(mode.channels)
+                    channel_count = mode.channel_count
+                    layout = mode.layout if isinstance(mode.layout, dict) else None
+                else:
+                    channels = list(model.channels)
+                    channel_count = model.channel_count
+                    layout = None
                 ctrl, buf = self._controllers[light.controller_id]
                 start = light.start_address - 1  # DMX is 1-indexed; buffer is 0-indexed
-                if start < 0 or start + model.channel_count > UNIVERSE_SIZE:
+                if start < 0 or start + channel_count > UNIVERSE_SIZE:
                     log.warning(
                         "Light %s does not fit in universe (start=%s, count=%s)",
                         light.id,
                         light.start_address,
-                        model.channel_count,
+                        channel_count,
                     )
                     continue
                 binding = LightBinding(
                     light_id=light.id,
                     start_index=start,
-                    channels=list(model.channels),
+                    channels=channels,
+                    layout=layout,
                 )
                 buf.bindings[light.id] = binding
                 self._light_to_controller[light.id] = ctrl.id
 
-                values = _compute_channel_values(
-                    binding.channels,
+                values = _render_binding(
+                    binding,
                     {
                         "r": light.r,
                         "g": light.g,
@@ -210,6 +392,8 @@ class ArtNetManager:
                         "uv": light.uv,
                         "dimmer": light.dimmer,
                         "on": light.on,
+                        "zone_state": getattr(light, "zone_state", {}) or {},
+                        "motion_state": getattr(light, "motion_state", {}) or {},
                     },
                 )
                 for i, v in enumerate(values):
@@ -221,7 +405,11 @@ class ArtNetManager:
                     self._send_buffer(ctrl, buf)
 
     def set_light_state(self, light_id: int, state: dict) -> bool:
-        """Update a light's values and push a packet. Returns True on success."""
+        """Update a light's values and push a packet. Returns True on success.
+
+        ``state`` should include the flat color fields and may include
+        ``zone_state`` / ``motion_state`` dicts for compound fixtures.
+        """
         with self._lock:
             ctrl_id = self._light_to_controller.get(light_id)
             if ctrl_id is None:
@@ -230,7 +418,7 @@ class ArtNetManager:
             binding = buf.bindings.get(light_id)
             if binding is None:
                 return False
-            values = _compute_channel_values(binding.channels, state)
+            values = _render_binding(binding, state)
             for i, v in enumerate(values):
                 buf.data[binding.start_index + i] = v
             if ctrl.enabled:
@@ -278,14 +466,15 @@ async def rebuild_manager_async() -> None:
     from sqlmodel import Session, select
 
     from .db import engine
-    from .models import Controller, Light, LightModel
+    from .models import Controller, Light, LightModel, LightModelMode
 
     def _work() -> None:
         with Session(engine) as sess:
             controllers = list(sess.exec(select(Controller)))
             lights = list(sess.exec(select(Light)))
             models = list(sess.exec(select(LightModel)))
-        manager.rebuild(controllers, lights, models)
+            modes = list(sess.exec(select(LightModelMode)))
+        manager.rebuild(controllers, lights, models, modes)
 
     await asyncio.to_thread(_work)
 
@@ -294,10 +483,11 @@ def rebuild_manager_sync() -> None:
     from sqlmodel import Session, select
 
     from .db import engine
-    from .models import Controller, Light, LightModel
+    from .models import Controller, Light, LightModel, LightModelMode
 
     with Session(engine) as sess:
         controllers = list(sess.exec(select(Controller)))
         lights = list(sess.exec(select(Light)))
         models = list(sess.exec(select(LightModel)))
-    manager.rebuild(controllers, lights, models)
+        modes = list(sess.exec(select(LightModelMode)))
+    manager.rebuild(controllers, lights, models, modes)
