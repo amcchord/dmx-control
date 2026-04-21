@@ -289,6 +289,110 @@ def _render_binding(binding: LightBinding, state: dict) -> list[int]:
     return _compute_channel_values(binding.channels, state)
 
 
+def _decode_binding(binding: "LightBinding", buf: bytearray) -> dict:
+    """Reverse of :func:`_render_binding`: peek at the raw DMX bytes and
+    extract a light's current RGB output.
+
+    The decode is best-effort. We report the byte values exactly as they
+    sit on the wire, including any brightness-baked-in RGB (for fixtures
+    without a dedicated dimmer channel). ``on`` is true when *any* channel
+    has a non-zero value — that matches how the UI interprets colour
+    swatches (an all-zero fixture shows the hatched "off" pattern)."""
+    start = binding.start_index
+    channels = binding.channels
+
+    def _get(off: Optional[int]) -> Optional[int]:
+        if off is None or not isinstance(off, int):
+            return None
+        if off < 0 or off >= len(channels):
+            return None
+        idx = start + off
+        if idx < 0 or idx >= len(buf):
+            return None
+        return int(buf[idx])
+
+    zone_state: dict[str, dict] = {}
+    flat_r = 0
+    flat_g = 0
+    flat_b = 0
+    any_nonzero = False
+
+    layout = binding.layout
+    if layout:
+        zones = layout.get("zones") or []
+        zone_bris: list[int] = []
+        for zone in zones:
+            zid = zone.get("id")
+            if not isinstance(zid, str):
+                continue
+            colors = zone.get("colors") or {}
+            r = _get(colors.get("r")) or 0
+            g = _get(colors.get("g")) or 0
+            b = _get(colors.get("b")) or 0
+            dim = _get(zone.get("dimmer"))
+            # Bake a per-zone dimmer into RGB so the on-screen swatch
+            # reflects what the fixture actually emits.
+            if dim is not None:
+                scale = dim / 255.0
+                r = int(round(r * scale))
+                g = int(round(g * scale))
+                b = int(round(b * scale))
+            on = (r | g | b) > 0
+            if on:
+                any_nonzero = True
+            zone_state[zid] = {"r": r, "g": g, "b": b, "on": on}
+            zone_bris.append(max(r, g, b))
+        if zone_state:
+            # Surface the brightest zone as the flat fallback so the
+            # whole-card swatch also animates.
+            bright = max(zone_state.values(), key=lambda s: max(s["r"], s["g"], s["b"]))
+            flat_r, flat_g, flat_b = bright["r"], bright["g"], bright["b"]
+        # Apply the global dimmer to the flat fallback if present.
+        globals_ = layout.get("globals") or {}
+        gdim = _get(globals_.get("dimmer"))
+        if gdim is not None:
+            scale = gdim / 255.0
+            flat_r = int(round(flat_r * scale))
+            flat_g = int(round(flat_g * scale))
+            flat_b = int(round(flat_b * scale))
+            for zs in zone_state.values():
+                zs["r"] = int(round(zs["r"] * scale))
+                zs["g"] = int(round(zs["g"] * scale))
+                zs["b"] = int(round(zs["b"] * scale))
+                zs["on"] = (zs["r"] | zs["g"] | zs["b"]) > 0
+    else:
+        # Flat fixture: walk channels and pick up the first r/g/b. Apply
+        # any dimmer we see.
+        dim = 255
+        for i, role in enumerate(channels):
+            v = int(buf[start + i]) if 0 <= start + i < len(buf) else 0
+            if role == "r" and flat_r == 0:
+                flat_r = v
+            elif role == "g" and flat_g == 0:
+                flat_g = v
+            elif role == "b" and flat_b == 0:
+                flat_b = v
+            elif role == "dimmer":
+                dim = v
+            if v != 0:
+                any_nonzero = True
+        if dim != 255 and "dimmer" in channels:
+            # The "dimmer" channel already scales the fixture at the
+            # hardware level; reflect that brightness in the swatch too.
+            scale = dim / 255.0
+            flat_r = int(round(flat_r * scale))
+            flat_g = int(round(flat_g * scale))
+            flat_b = int(round(flat_b * scale))
+
+    return {
+        "r": flat_r,
+        "g": flat_g,
+        "b": flat_b,
+        "on": any_nonzero,
+        "zone_state": zone_state,
+    }
+
+
 class ArtNetManager:
     """Thread-safe, send-on-demand Art-Net manager.
 
@@ -481,6 +585,20 @@ class ArtNetManager:
     def controller_id_for_light(self, light_id: int) -> Optional[int]:
         with self._lock:
             return self._light_to_controller.get(light_id)
+
+    def snapshot_rendered(self) -> dict[int, dict]:
+        """Decode the current universe buffers back into per-light RGB state.
+
+        Returns ``{light_id: {r,g,b, on, zone_state: {zone_id: {r,g,b, on}}}}``.
+        Used by the Dashboard to render a realtime preview of what the rig
+        is outputting right now (so animations visibly animate the
+        on-screen cards, not just the physical fixtures)."""
+        out: dict[int, dict] = {}
+        with self._lock:
+            for ctrl_id, (_ctrl, buf) in self._controllers.items():
+                for lid, binding in buf.bindings.items():
+                    out[lid] = _decode_binding(binding, buf.data)
+        return out
 
     def blackout(self, controller_id: int) -> bool:
         """Zero out every channel on a controller and send."""

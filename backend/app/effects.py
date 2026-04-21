@@ -216,7 +216,14 @@ def expand_slots(
 
     ``targets`` entries override which zones participate when provided;
     if empty the fixture's full zone list is used.
+
+    As a convenience, when ``light_ids`` *and* ``targets`` are both empty,
+    the scene is treated as covering every light currently known to the
+    engine. This makes built-in and API-created live scenes "just work"
+    on any rig without the caller having to enumerate the fixtures.
     """
+    if not light_ids and not targets:
+        light_ids = list(lights_by_id.keys())
     # Per-light, collect the set of zones explicitly requested (if any).
     per_light_zones: dict[int, list[Optional[str]]] = {}
     for lid in light_ids:

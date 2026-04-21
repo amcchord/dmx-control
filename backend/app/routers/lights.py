@@ -172,6 +172,16 @@ def list_lights(sess: Session = Depends(get_session)) -> list[LightOut]:
     return [_to_out(l) for l in rows]
 
 
+@router.get("/rendered")
+def list_rendered_lights() -> dict:
+    """Live snapshot of what the rig is outputting right now.
+
+    Returns ``{light_id: {r, g, b, on, zone_state: {zone_id: {r,g,b,on}}}}``.
+    The Dashboard polls this at a high rate while a scene is running so
+    the light cards visibly animate alongside the physical fixtures."""
+    return manager.snapshot_rendered()
+
+
 @router.post("", status_code=201)
 def create_light(payload: LightIn, sess: Session = Depends(get_session)) -> LightOut:
     ctrl, model = _ensure_refs(sess, payload.controller_id, payload.model_id)

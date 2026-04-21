@@ -276,6 +276,27 @@ export type Light = {
   motion_state: MotionState;
 };
 
+/** Live DMX snapshot for one light, decoded from the Art-Net buffer.
+ *
+ * Returned by `GET /api/lights/rendered`. The Dashboard polls this while
+ * any scene is active so the on-screen light cards animate alongside the
+ * physical fixtures. Unlike `Light`, this is ephemeral — the server
+ * reconstructs it from the current universe buffer on every request. */
+export type RenderedLightZone = {
+  r: number;
+  g: number;
+  b: number;
+  on: boolean;
+};
+
+export type RenderedLight = {
+  r: number;
+  g: number;
+  b: number;
+  on: boolean;
+  zone_state: Record<string, RenderedLightZone>;
+};
+
 export type Palette = {
   id: number;
   name: string;
@@ -437,6 +458,8 @@ export const Api = {
     api.del<LightModel>(`/api/models/${id}/image`),
 
   listLights: () => api.get<Light[]>("/api/lights"),
+  listRenderedLights: () =>
+    api.get<Record<string, RenderedLight>>("/api/lights/rendered"),
   createLight: (body: LightPayload) => api.post<Light>("/api/lights", body),
   updateLight: (id: number, body: LightPayload) =>
     api.patch<Light>(`/api/lights/${id}`, body),

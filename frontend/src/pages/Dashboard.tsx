@@ -11,6 +11,7 @@ import {
   LightModelMode,
   Palette,
   PaletteSpread,
+  RenderedLight,
   Scene,
 } from "../api";
 import { useToast } from "../toast";
@@ -98,6 +99,7 @@ export default function Dashboard() {
   const [palettes, setPalettes] = useState<Palette[]>([]);
   const [scenes, setScenes] = useState<Scene[]>([]);
   const [activeScenes, setActiveScenes] = useState<ActiveScene[]>([]);
+  const [rendered, setRendered] = useState<Record<number, RenderedLight>>({});
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<Selection>(new Map());
   const [pickerFor, setPickerFor] = useState<
@@ -163,6 +165,37 @@ export default function Dashboard() {
     return () => window.clearInterval(h);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // When any scene is running, poll the rendered DMX snapshot at 10 Hz so
+  // the on-screen cards visibly animate. Clear the snapshot when nothing
+  // is running so the cards fall back to the DB base state cleanly.
+  useEffect(() => {
+    if (activeScenes.length === 0) {
+      if (Object.keys(rendered).length > 0) setRendered({});
+      return;
+    }
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const snap = await Api.listRenderedLights();
+        if (cancelled) return;
+        const map: Record<number, RenderedLight> = {};
+        for (const [k, v] of Object.entries(snap)) {
+          map[Number(k)] = v;
+        }
+        setRendered(map);
+      } catch {
+        // Ignore — non-fatal background poll.
+      }
+    };
+    tick();
+    const h = window.setInterval(tick, 100);
+    return () => {
+      cancelled = true;
+      window.clearInterval(h);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeScenes.length]);
 
   const modelById = useMemo(() => {
     const m = new Map<number, LightModel>();
@@ -477,6 +510,7 @@ export default function Dashboard() {
               <LightCard
                 key={light.id}
                 light={light}
+                rendered={rendered[light.id] ?? null}
                 model={modelById.get(light.model_id)}
                 layout={layoutOf(light.id)}
                 selection={selected.get(light.id) ?? null}
@@ -666,6 +700,7 @@ function pickerTitle(
 
 function LightCard({
   light,
+  rendered,
   model,
   layout,
   selection,
@@ -676,6 +711,7 @@ function LightCard({
   onToggleOn,
 }: {
   light: Light;
+  rendered: RenderedLight | null;
   model?: LightModel;
   layout: FixtureLayout | null;
   selection: "all" | ZoneSet | null;
@@ -685,8 +721,17 @@ function LightCard({
   onOpenZone: (zoneId: string) => void;
   onToggleOn: () => void;
 }) {
-  const swatch = rgbToHex(light.r, light.g, light.b);
-  const off = !light.on || (light.r === 0 && light.g === 0 && light.b === 0);
+  // Prefer the live-rendered RGB when an effect is running so the card
+  // animates in real time; fall back to the DB base state otherwise.
+  const liveR = rendered?.r ?? light.r;
+  const liveG = rendered?.g ?? light.g;
+  const liveB = rendered?.b ?? light.b;
+  const swatch = rgbToHex(liveR, liveG, liveB);
+  const off =
+    !light.on ||
+    (rendered !== null
+      ? liveR === 0 && liveG === 0 && liveB === 0 && !rendered.on
+      : liveR === 0 && liveG === 0 && liveB === 0);
   const selectedAll = selection === "all";
   const hasAnySelection = selection !== null;
   const compound = isCompoundLayout(layout);
@@ -703,6 +748,7 @@ function LightCard({
       {compound && layout ? (
         <ZoneStrip
           light={light}
+          rendered={rendered}
           layout={layout}
           selection={selection}
           onZoneClick={(zoneId, e) => {
@@ -813,6 +859,7 @@ function LightCard({
 
 function ZoneStrip({
   light,
+  rendered,
   layout,
   selection,
   onZoneClick,
@@ -825,6 +872,7 @@ function ZoneStrip({
   onToggleSelect,
 }: {
   light: Light;
+  rendered: RenderedLight | null;
   layout: FixtureLayout;
   selection: "all" | ZoneSet | null;
   onZoneClick: (zoneId: string, e: React.MouseEvent) => void;
@@ -901,6 +949,7 @@ function ZoneStrip({
         zones={zones}
         layout={layout}
         light={light}
+        rendered={rendered}
         isSelected={isSel}
         onZoneClick={onZoneClick}
         onZoneContextMenu={onZoneContextMenu}
@@ -913,6 +962,7 @@ function ZoneGrid({
   zones,
   layout,
   light,
+  rendered,
   isSelected,
   onZoneClick,
   onZoneContextMenu,
@@ -920,12 +970,23 @@ function ZoneGrid({
   zones: FixtureLayout["zones"];
   layout: FixtureLayout;
   light: Light;
+  rendered: RenderedLight | null;
   isSelected: (zoneId: string) => boolean;
   onZoneClick: (zoneId: string, e: React.MouseEvent) => void;
   onZoneContextMenu: (zoneId: string, e: React.MouseEvent) => void;
 }) {
   const cellBg = (zoneId: string) => {
-    const { hex, on } = zoneHex(light, zoneId);
+    const live = rendered?.zone_state?.[zoneId];
+    let hex: string;
+    let on: boolean;
+    if (live) {
+      hex = rgbToHex(live.r, live.g, live.b);
+      on = live.on;
+    } else {
+      const z = zoneHex(light, zoneId);
+      hex = z.hex;
+      on = z.on;
+    }
     if (!on || hex === "#000000")
       return "repeating-linear-gradient(45deg,#1a1f2b,#1a1f2b 4px,#141821 4px,#141821 8px)";
     return hex;
