@@ -1,0 +1,24 @@
+[Unit]
+Description=DMX Control (Art-Net web interface)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dmx
+Group=dmx
+WorkingDirectory=/opt/dmx-control/backend
+Environment=DMX_PASSWORD=secretsauce
+Environment=DMX_DATA_DIR=/var/lib/dmx-control
+ExecStart=/opt/dmx-control/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=on-failure
+RestartSec=3
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dmx-control
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-accent text-white hover:bg-accent-hover;
+  }
+  .btn-secondary {
+    @apply btn bg-bg-elev text-slate-100 ring-1 ring-line hover:bg-bg-card;
+  }
+  .btn-ghost {
+    @apply btn text-slate-300 hover:bg-bg-elev hover:text-white;
+  }
+  .btn-danger {
+    @apply btn bg-rose-600 text-white hover:bg-rose-500;
+  }
+  .input {
+    @apply w-full rounded-lg bg-bg-elev px-3 py-2 text-sm text-slate-100 ring-1 ring-line placeholder:text-muted focus:outline-none focus:ring-2 focus:ring-accent;
+  }
+  .card {
+    @apply rounded-xl bg-bg-card ring-1 ring-line shadow-card;
+  }
+  .label {
+    @apply block text-xs font-semibold uppercase tracking-wide text-muted;
+  }
+  .pill {
+    @apply inline-flex items-center rounded-full bg-bg-elev px-2.5 py-0.5 text-xs font-medium text-slate-200 ring-1 ring-line;
+  }
+}
+
+/* react-colorful sizing override */
+.react-colorful {
+  width: 100% !important;
+  height: 220px !important;
+}

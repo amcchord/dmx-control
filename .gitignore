@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.sqlite
+*.db
+
+# Frontend
+node_modules/
+dist/
+.vite/
+
+# Local data (should not be checked in)
+backend/data/
+*.log
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Environment
+.env
+.env.local
