@@ -15,6 +15,7 @@ import {
   Scene,
 } from "../api";
 import { useToast } from "../toast";
+import ActiveScenesBar from "../components/ActiveScenesBar";
 import ColorPicker from "../components/ColorPicker";
 import EffectPanel from "../components/EffectPanel";
 import Modal from "../components/Modal";
@@ -484,6 +485,15 @@ export default function Dashboard() {
           </button>
         </div>
       </div>
+
+      <ActiveScenesBar
+        activeScenes={activeScenes}
+        onChanged={async () => {
+          await refreshActive();
+          await refreshScenes();
+        }}
+        notify={(msg, kind) => toast.push(msg, kind)}
+      />
 
       {groupedLights.map(({ controller, lights: clights }) => (
         <section key={controller.id} className="space-y-3">
