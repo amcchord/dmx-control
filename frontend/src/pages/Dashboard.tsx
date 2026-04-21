@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
+  ActiveScene,
   Api,
   BulkTarget,
   Controller,
@@ -10,11 +11,14 @@ import {
   LightModelMode,
   Palette,
   PaletteSpread,
+  Scene,
 } from "../api";
 import { useToast } from "../toast";
 import ColorPicker from "../components/ColorPicker";
+import EffectPanel from "../components/EffectPanel";
 import Modal from "../components/Modal";
 import PaletteSwatch from "../components/PaletteSwatch";
+import ScenesSidebar from "../components/ScenesSidebar";
 import { hexToRgb, rgbToHex } from "../util";
 import {
   MOTION_AXES,
@@ -92,6 +96,8 @@ export default function Dashboard() {
   const [models, setModels] = useState<LightModel[]>([]);
   const [lights, setLights] = useState<Light[]>([]);
   const [palettes, setPalettes] = useState<Palette[]>([]);
+  const [scenes, setScenes] = useState<Scene[]>([]);
+  const [activeScenes, setActiveScenes] = useState<ActiveScene[]>([]);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<Selection>(new Map());
   const [pickerFor, setPickerFor] = useState<
@@ -102,22 +108,25 @@ export default function Dashboard() {
   >(null);
   const [pickerColor, setPickerColor] = useState("#FFFFFF");
   const [showPalettes, setShowPalettes] = useState(false);
+  const [showEffects, setShowEffects] = useState(false);
   const [paletteMode, setPaletteMode] = useState<Mode>("cycle");
   const [paletteSpread, setPaletteSpread] =
     useState<PaletteSpread>("across_lights");
 
   const refresh = async () => {
     try {
-      const [c, m, l, p] = await Promise.all([
+      const [c, m, l, p, s] = await Promise.all([
         Api.listControllers(),
         Api.listModels(),
         Api.listLights(),
         Api.listPalettes(),
+        Api.listScenes(),
       ]);
       setControllers(c);
       setModels(m);
       setLights(l);
       setPalettes(p);
+      setScenes(s);
     } catch (e) {
       toast.push(String(e), "error");
     } finally {
@@ -125,8 +134,33 @@ export default function Dashboard() {
     }
   };
 
+  const refreshActive = async () => {
+    try {
+      const a = await Api.activeScenes();
+      setActiveScenes(a);
+    } catch {
+      // Ignore — non-fatal background poll.
+    }
+  };
+
+  const refreshScenes = async () => {
+    try {
+      const s = await Api.listScenes();
+      setScenes(s);
+    } catch (e) {
+      toast.push(String(e), "error");
+    }
+  };
+
   useEffect(() => {
     refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    refreshActive();
+    const h = window.setInterval(refreshActive, 1000);
+    return () => window.clearInterval(h);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -408,6 +442,13 @@ export default function Dashboard() {
           >
             Apply palette
           </button>
+          <button
+            className="btn-primary"
+            onClick={() => setShowEffects(true)}
+            disabled={selected.size === 0}
+          >
+            Effects{activeScenes.length > 0 ? ` (${activeScenes.length} live)` : "..."}
+          </button>
         </div>
       </div>
 
@@ -451,6 +492,50 @@ export default function Dashboard() {
           </div>
         </section>
       ))}
+
+      <Modal
+        open={showEffects}
+        onClose={() => setShowEffects(false)}
+        title={`Effects — ${selected.size} light${selected.size === 1 ? "" : "s"} selected`}
+        size="lg"
+      >
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <EffectPanel
+            selection={selToBulkTargets(selected)}
+            palettes={palettes}
+            onActiveChanged={refreshActive}
+            onSaved={async () => {
+              await refreshScenes();
+              await refreshActive();
+            }}
+            notify={(msg, kind) => toast.push(msg, kind)}
+          />
+          <ScenesSidebar
+            scenes={scenes}
+            activeScenes={activeScenes}
+            palettes={palettes}
+            onSceneSelected={(s) => {
+              // Load this scene's targets into the Dashboard selection so
+              // the user can tweak it without manually reselecting lights.
+              const next: Selection = new Map();
+              for (const lid of s.light_ids) next.set(lid, "all");
+              for (const t of s.targets) {
+                const existing = next.get(t.light_id);
+                if (existing === "all") continue;
+                const set = existing ?? new Set<string>();
+                if (t.zone_id) set.add(t.zone_id);
+                next.set(t.light_id, set);
+              }
+              setSelected(next);
+            }}
+            onChanged={async () => {
+              await refreshScenes();
+              await refreshActive();
+            }}
+            notify={(msg, kind) => toast.push(msg, kind)}
+          />
+        </div>
+      </Modal>
 
       <Modal
         open={pickerFor !== null}

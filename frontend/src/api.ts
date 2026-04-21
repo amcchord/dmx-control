@@ -334,6 +334,74 @@ export type PaletteSpread =
   | "across_fixture"
   | "across_zones";
 
+export type EffectType =
+  | "static"
+  | "fade"
+  | "cycle"
+  | "chase"
+  | "pulse"
+  | "rainbow"
+  | "strobe"
+  | "sparkle"
+  | "wave";
+
+export type EffectDirection = "forward" | "reverse" | "pingpong";
+
+export type EffectParams = {
+  speed_hz: number;
+  direction: EffectDirection;
+  offset: number;
+  intensity: number;
+  size: number;
+  softness: number;
+  fade_in_s: number;
+  fade_out_s: number;
+};
+
+export const DEFAULT_EFFECT_PARAMS: EffectParams = {
+  speed_hz: 0.5,
+  direction: "forward",
+  offset: 0,
+  intensity: 1,
+  size: 1,
+  softness: 0.5,
+  fade_in_s: 0.25,
+  fade_out_s: 0.25,
+};
+
+export type Scene = {
+  id: number;
+  name: string;
+  effect_type: EffectType;
+  palette_id: number | null;
+  light_ids: number[];
+  targets: BulkTarget[];
+  spread: PaletteSpread;
+  params: EffectParams;
+  is_active: boolean;
+  builtin: boolean;
+};
+
+export type SceneInput = {
+  name: string;
+  effect_type: EffectType;
+  palette_id: number | null;
+  light_ids: number[];
+  targets: BulkTarget[];
+  spread: PaletteSpread;
+  params: EffectParams;
+};
+
+export type LiveSceneInput = Omit<SceneInput, "name"> & { name?: string };
+
+export type ActiveScene = {
+  id: number | null;
+  handle: string;
+  name: string;
+  effect_type: EffectType;
+  runtime_s: number;
+};
+
 export const Api = {
   login: (password: string) =>
     api.post<AuthStatus>("/api/auth/login", { password }),
@@ -410,6 +478,29 @@ export const Api = {
       mode,
       spread,
     }),
+
+  listScenes: () => api.get<Scene[]>("/api/scenes"),
+  createScene: (body: SceneInput) => api.post<Scene>("/api/scenes", body),
+  updateScene: (id: number, body: SceneInput) =>
+    api.patch<Scene>(`/api/scenes/${id}`, body),
+  deleteScene: (id: number) => api.del<void>(`/api/scenes/${id}`),
+  cloneScene: (id: number) => api.post<Scene>(`/api/scenes/${id}/clone`),
+  playScene: (id: number) =>
+    api.post<{ ok: boolean; handle: string }>(`/api/scenes/${id}/play`),
+  stopScene: (id: number) =>
+    api.post<{ ok: boolean; stopped: number }>(`/api/scenes/${id}/stop`),
+  stopAllScenes: () =>
+    api.post<{ ok: boolean; stopped: number }>(`/api/scenes/stop-all`),
+  activeScenes: () => api.get<ActiveScene[]>(`/api/scenes/active`),
+  playLive: (body: LiveSceneInput) =>
+    api.post<{ ok: boolean; handle: string; name: string }>(
+      `/api/scenes/live`,
+      body,
+    ),
+  stopLive: (handle: string) =>
+    api.post<{ ok: boolean }>(`/api/scenes/live/${handle}/stop`),
+  saveLive: (handle: string, name: string) =>
+    api.post<Scene>(`/api/scenes/live/${handle}/save`, { name }),
 
   aiStatus: () => api.get<AiStatus>("/api/ai/status"),
   parseManual: (

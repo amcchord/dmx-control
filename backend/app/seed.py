@@ -9,7 +9,7 @@ from __future__ import annotations
 from sqlmodel import Session, select
 
 from .db import engine, init_db
-from .models import LightModel, LightModelMode, Palette
+from .models import LightModel, LightModelMode, Palette, Scene
 
 BUILTIN_MODELS: list[tuple[str, list[str]]] = [
     ("RGB 3ch", ["r", "g", "b"]),
@@ -150,6 +150,109 @@ def _upsert_model(sess: Session, name: str, channels: list[str]) -> None:
     sess.add(default)
 
 
+# Built-in scenes. light_ids + targets are intentionally left empty so the
+# engine resolves them to "every light on the rig" at play time, which
+# means these scenes are immediately useful on any fixture configuration.
+BUILTIN_SCENES: list[dict] = [
+    {
+        "name": "Rainbow Wash",
+        "effect_type": "rainbow",
+        "palette_name": None,
+        "spread": "across_lights",
+        "params": {
+            "speed_hz": 0.15,
+            "direction": "forward",
+            "offset": 0.15,
+            "intensity": 1.0,
+            "size": 1.0,
+            "softness": 0.5,
+            "fade_in_s": 0.5,
+            "fade_out_s": 0.5,
+        },
+    },
+    {
+        "name": "Breathing Amber",
+        "effect_type": "pulse",
+        "palette_name": "Candlelight",
+        "spread": "across_lights",
+        "params": {
+            "speed_hz": 0.25,
+            "direction": "forward",
+            "offset": 0.0,
+            "intensity": 1.0,
+            "size": 1.0,
+            "softness": 0.5,
+            "fade_in_s": 1.0,
+            "fade_out_s": 1.0,
+        },
+    },
+    {
+        "name": "Cyberpunk Chase",
+        "effect_type": "chase",
+        "palette_name": "Cyberpunk Neon",
+        "spread": "across_lights",
+        "params": {
+            "speed_hz": 1.5,
+            "direction": "forward",
+            "offset": 0.15,
+            "intensity": 1.0,
+            "size": 1.5,
+            "softness": 0.6,
+            "fade_in_s": 0.3,
+            "fade_out_s": 0.3,
+        },
+    },
+    {
+        "name": "Aurora Fade",
+        "effect_type": "fade",
+        "palette_name": "Aurora Borealis",
+        "spread": "across_fixture",
+        "params": {
+            "speed_hz": 0.1,
+            "direction": "forward",
+            "offset": 0.05,
+            "intensity": 1.0,
+            "size": 1.0,
+            "softness": 0.5,
+            "fade_in_s": 1.0,
+            "fade_out_s": 1.0,
+        },
+    },
+    {
+        "name": "Halloween Strobe",
+        "effect_type": "strobe",
+        "palette_name": "Halloween",
+        "spread": "across_lights",
+        "params": {
+            "speed_hz": 6.0,
+            "direction": "forward",
+            "offset": 0.0,
+            "intensity": 1.0,
+            "size": 0.4,
+            "softness": 0.0,
+            "fade_in_s": 0.1,
+            "fade_out_s": 0.2,
+        },
+    },
+    {
+        "name": "Pastel Sparkle",
+        "effect_type": "sparkle",
+        "palette_name": "Pastel Dream",
+        "spread": "across_zones",
+        "params": {
+            "speed_hz": 2.0,
+            "direction": "forward",
+            "offset": 0.0,
+            "intensity": 1.0,
+            "size": 1.0,
+            "softness": 0.5,
+            "fade_in_s": 0.3,
+            "fade_out_s": 0.5,
+        },
+    },
+]
+
+
 def _upsert_palette(sess: Session, name: str, colors: list[str]) -> None:
     existing = sess.exec(select(Palette).where(Palette.name == name)).first()
     if existing is None:
@@ -160,6 +263,40 @@ def _upsert_palette(sess: Session, name: str, colors: list[str]) -> None:
         sess.add(existing)
 
 
+def _upsert_scene(sess: Session, spec: dict) -> None:
+    name = spec["name"]
+    palette_id: int | None = None
+    if spec.get("palette_name"):
+        pal = sess.exec(
+            select(Palette).where(Palette.name == spec["palette_name"])
+        ).first()
+        if pal is not None:
+            palette_id = pal.id
+    existing = sess.exec(select(Scene).where(Scene.name == name)).first()
+    if existing is None:
+        sess.add(
+            Scene(
+                name=name,
+                effect_type=spec["effect_type"],
+                palette_id=palette_id,
+                light_ids=[],
+                targets=[],
+                spread=spec["spread"],
+                params=dict(spec["params"]),
+                is_active=False,
+                builtin=True,
+            )
+        )
+        return
+    # Keep builtin scenes in sync with the canonical definition.
+    existing.effect_type = spec["effect_type"]
+    existing.palette_id = palette_id
+    existing.spread = spec["spread"]
+    existing.params = dict(spec["params"])
+    existing.builtin = True
+    sess.add(existing)
+
+
 def seed() -> None:
     init_db()
     with Session(engine) as sess:
@@ -167,6 +304,10 @@ def seed() -> None:
             _upsert_model(sess, name, chans)
         for name, colors in BUILTIN_PALETTES:
             _upsert_palette(sess, name, colors)
+        # Palettes must be present before scenes so palette_id resolves.
+        sess.commit()
+        for spec in BUILTIN_SCENES:
+            _upsert_scene(sess, spec)
         sess.commit()
 
 

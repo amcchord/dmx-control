@@ -27,7 +27,7 @@ import logging
 import socket
 import threading
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Optional
 
 from .models import Controller, Light, LightModel, LightModelMode
 
@@ -305,6 +305,8 @@ class ArtNetManager:
         self._controllers: dict[int, tuple[Controller, UniverseBuffer]] = {}
         # light_id -> controller_id, for quick routing on color updates
         self._light_to_controller: dict[int, int] = {}
+        # Controllers with pending writes awaiting flush_dirty().
+        self._dirty: set[int] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle / sync helpers
@@ -337,6 +339,7 @@ class ArtNetManager:
         with self._lock:
             self._controllers.clear()
             self._light_to_controller.clear()
+            self._dirty.clear()
             for ctrl in controllers:
                 buf = UniverseBuffer(ctrl.net, ctrl.subnet, ctrl.universe)
                 self._controllers[ctrl.id] = (ctrl, buf)
@@ -419,11 +422,65 @@ class ArtNetManager:
             if binding is None:
                 return False
             values = _render_binding(binding, state)
+            changed = False
             for i, v in enumerate(values):
-                buf.data[binding.start_index + i] = v
-            if ctrl.enabled:
+                if buf.data[binding.start_index + i] != v:
+                    buf.data[binding.start_index + i] = v
+                    changed = True
+            if changed and ctrl.enabled:
                 self._send_buffer(ctrl, buf)
+            self._dirty.discard(ctrl_id)
             return True
+
+    def set_light_state_deferred(self, light_id: int, state: dict) -> bool:
+        """Like :meth:`set_light_state` but does not send. The affected
+        controller is marked dirty and will be flushed by
+        :meth:`flush_dirty`. Used by the effect engine to coalesce many
+        per-frame writes into one UDP packet per controller per tick."""
+        with self._lock:
+            ctrl_id = self._light_to_controller.get(light_id)
+            if ctrl_id is None:
+                return False
+            ctrl, buf = self._controllers[ctrl_id]
+            binding = buf.bindings.get(light_id)
+            if binding is None:
+                return False
+            values = _render_binding(binding, state)
+            changed = False
+            for i, v in enumerate(values):
+                if buf.data[binding.start_index + i] != v:
+                    buf.data[binding.start_index + i] = v
+                    changed = True
+            if changed:
+                self._dirty.add(ctrl_id)
+            return True
+
+    def flush_dirty(self) -> int:
+        """Send one packet per controller whose buffer changed since the
+        last flush. Returns the number of packets sent."""
+        with self._lock:
+            sent = 0
+            for ctrl_id in list(self._dirty):
+                entry = self._controllers.get(ctrl_id)
+                if entry is None:
+                    self._dirty.discard(ctrl_id)
+                    continue
+                ctrl, buf = entry
+                if ctrl.enabled:
+                    self._send_buffer(ctrl, buf)
+                    sent += 1
+            self._dirty.clear()
+            return sent
+
+    def mark_dirty(self, controller_id: int) -> None:
+        """Force a flush-send of the given controller on next flush_dirty()."""
+        with self._lock:
+            if controller_id in self._controllers:
+                self._dirty.add(controller_id)
+
+    def controller_id_for_light(self, light_id: int) -> Optional[int]:
+        with self._lock:
+            return self._light_to_controller.get(light_id)
 
     def blackout(self, controller_id: int) -> bool:
         """Zero out every channel on a controller and send."""
@@ -434,6 +491,7 @@ class ArtNetManager:
             ctrl, buf = entry
             for i in range(UNIVERSE_SIZE):
                 buf.data[i] = 0
+            self._dirty.discard(controller_id)
             if ctrl.enabled:
                 self._send_buffer(ctrl, buf)
             return True
