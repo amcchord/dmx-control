@@ -8,6 +8,7 @@ import Controllers from "./pages/Controllers";
 import ControllerDetail from "./pages/ControllerDetail";
 import Models from "./pages/Models";
 import Palettes from "./pages/Palettes";
+import Scenes from "./pages/Scenes";
 import Nav from "./components/Nav";
 
 function Protected({ children }: { children: React.ReactNode }) {
@@ -89,6 +90,16 @@ export default function App() {
               <Protected>
                 <Layout>
                   <Palettes />
+                </Layout>
+              </Protected>
+            }
+          />
+          <Route
+            path="/scenes"
+            element={
+              <Protected>
+                <Layout>
+                  <Scenes />
                 </Layout>
               </Protected>
             }

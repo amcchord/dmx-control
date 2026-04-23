@@ -415,7 +415,7 @@ class EffectParams(BaseModel):
         return float(v)
 
 
-class SceneIn(BaseModel):
+class EffectIn(BaseModel):
     name: str
     effect_type: Literal[
         "static", "fade", "cycle", "chase", "pulse",
@@ -440,8 +440,8 @@ class SceneIn(BaseModel):
         return s
 
 
-class LiveSceneIn(BaseModel):
-    """Same as SceneIn but name is optional (generated server-side)."""
+class LiveEffectIn(BaseModel):
+    """Same as EffectIn but name is optional (generated server-side)."""
 
     name: Optional[str] = None
     effect_type: Literal[
@@ -471,7 +471,7 @@ class SaveLiveRequest(BaseModel):
         return s
 
 
-class SceneOut(BaseModel):
+class EffectOut(BaseModel):
     id: int
     name: str
     effect_type: str
@@ -484,18 +484,110 @@ class SceneOut(BaseModel):
     builtin: bool
 
 
-class ActiveScene(BaseModel):
-    """Entry in ``GET /api/scenes/active``.
+class ActiveEffect(BaseModel):
+    """Entry in ``GET /api/effects/active``.
 
-    ``id`` is null for live (transient) scenes that have not been promoted
+    ``id`` is null for live (transient) effects that have not been promoted
     to a saved preset yet. ``handle`` is a stable opaque id the client can
-    use to stop that exact scene."""
+    use to stop that exact effect."""
 
     id: Optional[int] = None
     handle: str
     name: str
     effect_type: str
     runtime_s: float
+
+
+class SceneLightState(BaseModel):
+    """Per-light state captured in a Scene snapshot.
+
+    Mirrors the writable fields on :class:`LightOut` so that a scene can
+    be applied by copying these values straight back onto the matching
+    Light row and pushing the result to Art-Net."""
+
+    model_config = _BASE_CONFIG
+
+    light_id: int
+    r: int = 0
+    g: int = 0
+    b: int = 0
+    w: int = 0
+    a: int = 0
+    uv: int = 0
+    dimmer: int = 255
+    on: bool = True
+    zone_state: dict = Field(default_factory=dict)
+    motion_state: dict = Field(default_factory=dict)
+
+
+class SceneCreate(BaseModel):
+    """Save the current state of one controller (or the whole rig)."""
+
+    name: str
+    controller_id: int
+    cross_controller: bool = False
+    # When provided, only these lights are captured. Otherwise the snapshot
+    # covers every light on ``controller_id`` (or every light at all when
+    # ``cross_controller`` is true).
+    light_ids: Optional[list[int]] = None
+    # When true the snapshot is built from the live rendered buffer
+    # (``ArtNetManager.snapshot_rendered()``) rather than the DB state.
+    # Useful when an effect is running and the user wants to freeze the
+    # visible output.
+    from_rendered: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("name must be non-empty")
+        if len(s) > 128:
+            raise ValueError("name too long")
+        return s
+
+
+class SceneUpdate(BaseModel):
+    """Rename, re-scope, or re-capture an existing scene."""
+
+    name: Optional[str] = None
+    controller_id: Optional[int] = None
+    cross_controller: Optional[bool] = None
+    # When true, re-capture the snapshot from current state (DB by default,
+    # or live-rendered when ``from_rendered`` is also set).
+    recapture: bool = False
+    from_rendered: bool = False
+    # Only consulted when ``recapture`` is true.
+    light_ids: Optional[list[int]] = None
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        s = v.strip()
+        if not s:
+            raise ValueError("name must be non-empty")
+        if len(s) > 128:
+            raise ValueError("name too long")
+        return s
+
+
+class SceneOut(BaseModel):
+    """Serialized scene.
+
+    ``id`` is nullable so that virtual built-ins (Blackout) can ride on the
+    same shape without a persisted row. Virtual entries always have
+    ``builtin=True``."""
+
+    model_config = _BASE_CONFIG
+
+    id: Optional[int] = None
+    name: str
+    controller_id: int
+    cross_controller: bool
+    lights: list[SceneLightState] = Field(default_factory=list)
+    builtin: bool = False
 
 
 class ApplyPaletteRequest(BaseModel):

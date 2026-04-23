@@ -12,10 +12,11 @@ from starlette.requests import Request
 from .artnet import manager, rebuild_manager_sync
 from .config import FRONTEND_DIST
 from .db import init_db
-from .engine import build_spec_from_scene, engine as effect_engine
+from .engine import build_spec_from_effect, engine as effect_engine
 from .routers import ai as ai_router
 from .routers import auth as auth_router
 from .routers import controllers as controllers_router
+from .routers import effects as effects_router
 from .routers import lights as lights_router
 from .routers import models as models_router
 from .routers import palettes as palettes_router
@@ -33,7 +34,7 @@ async def lifespan(app: FastAPI):
     seed()
     rebuild_manager_sync()
     await effect_engine.start()
-    _resume_active_scenes()
+    _resume_active_effects()
     log.info("dmx-control backend started")
     try:
         yield
@@ -42,25 +43,25 @@ async def lifespan(app: FastAPI):
         manager.close()
 
 
-def _resume_active_scenes() -> None:
-    """Re-play every scene marked ``is_active`` at process start."""
+def _resume_active_effects() -> None:
+    """Re-play every effect marked ``is_active`` at process start."""
     from sqlmodel import Session, select
 
     from .db import engine as db_engine
-    from .models import Palette, Scene
+    from .models import Effect, Palette
 
     with Session(db_engine) as sess:
-        rows = sess.exec(select(Scene).where(Scene.is_active == True)).all()  # noqa: E712
+        rows = sess.exec(select(Effect).where(Effect.is_active == True)).all()  # noqa: E712
         for row in rows:
             palette = None
             if row.palette_id is not None:
                 palette = sess.get(Palette, row.palette_id)
             try:
-                spec = build_spec_from_scene(row, palette)
+                spec = build_spec_from_effect(row, palette)
                 effect_engine.play(spec)
-                log.info("resumed scene %s (%s)", row.id, row.name)
+                log.info("resumed effect %s (%s)", row.id, row.name)
             except Exception:
-                log.exception("failed to resume scene %s", row.id)
+                log.exception("failed to resume effect %s", row.id)
 
 
 app = FastAPI(title="DMX Control", version="0.1.0", lifespan=lifespan)
@@ -70,6 +71,7 @@ app.include_router(controllers_router.router)
 app.include_router(models_router.router)
 app.include_router(lights_router.router)
 app.include_router(palettes_router.router)
+app.include_router(effects_router.router)
 app.include_router(scenes_router.router)
 app.include_router(state_router.router)
 app.include_router(ai_router.router)

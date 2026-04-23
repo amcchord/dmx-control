@@ -279,7 +279,7 @@ export type Light = {
 /** Live DMX snapshot for one light, decoded from the Art-Net buffer.
  *
  * Returned by `GET /api/lights/rendered`. The Dashboard polls this while
- * any scene is active so the on-screen light cards animate alongside the
+ * any effect is active so the on-screen light cards animate alongside the
  * physical fixtures. Unlike `Light`, this is ephemeral — the server
  * reconstructs it from the current universe buffer on every request. */
 export type RenderedLightZone = {
@@ -390,7 +390,7 @@ export const DEFAULT_EFFECT_PARAMS: EffectParams = {
   fade_out_s: 0.25,
 };
 
-export type Scene = {
+export type Effect = {
   id: number;
   name: string;
   effect_type: EffectType;
@@ -403,7 +403,7 @@ export type Scene = {
   builtin: boolean;
 };
 
-export type SceneInput = {
+export type EffectInput = {
   name: string;
   effect_type: EffectType;
   palette_id: number | null;
@@ -413,14 +413,66 @@ export type SceneInput = {
   params: EffectParams;
 };
 
-export type LiveSceneInput = Omit<SceneInput, "name"> & { name?: string };
+export type LiveEffectInput = Omit<EffectInput, "name"> & { name?: string };
 
-export type ActiveScene = {
+export type ActiveEffect = {
   id: number | null;
   handle: string;
   name: string;
   effect_type: EffectType;
   runtime_s: number;
+};
+
+/** Per-light snapshot inside a saved Scene. Mirrors the writable fields
+ * on `Light` plus the `light_id` key used to restore it. */
+export type SceneLightState = {
+  light_id: number;
+  r: number;
+  g: number;
+  b: number;
+  w: number;
+  a: number;
+  uv: number;
+  dimmer: number;
+  on: boolean;
+  zone_state: Record<string, ZoneColorState>;
+  motion_state: MotionState;
+};
+
+/** A saved (or virtual) state snapshot for a controller.
+ *
+ * `id` is null for virtual built-ins (currently just Blackout). `builtin`
+ * is true in that case. `cross_controller` means the captured state may
+ * cover lights on other controllers too. */
+export type Scene = {
+  id: number | null;
+  name: string;
+  controller_id: number;
+  cross_controller: boolean;
+  lights: SceneLightState[];
+  builtin: boolean;
+};
+
+export type SceneCreateInput = {
+  name: string;
+  controller_id: number;
+  cross_controller?: boolean;
+  /** Subset of lights to capture; omit to capture the controller's lights
+   * (or every light, if `cross_controller` is true). */
+  light_ids?: number[];
+  /** When true, capture from the live rendered DMX buffer instead of the
+   * DB state. Useful for freezing an effect's current output. */
+  from_rendered?: boolean;
+};
+
+export type SceneUpdateInput = {
+  name?: string;
+  controller_id?: number;
+  cross_controller?: boolean;
+  /** When true, re-capture the snapshot from the current state. */
+  recapture?: boolean;
+  from_rendered?: boolean;
+  light_ids?: number[];
 };
 
 export const Api = {
@@ -502,28 +554,46 @@ export const Api = {
       spread,
     }),
 
-  listScenes: () => api.get<Scene[]>("/api/scenes"),
-  createScene: (body: SceneInput) => api.post<Scene>("/api/scenes", body),
-  updateScene: (id: number, body: SceneInput) =>
-    api.patch<Scene>(`/api/scenes/${id}`, body),
-  deleteScene: (id: number) => api.del<void>(`/api/scenes/${id}`),
-  cloneScene: (id: number) => api.post<Scene>(`/api/scenes/${id}/clone`),
-  playScene: (id: number) =>
-    api.post<{ ok: boolean; handle: string }>(`/api/scenes/${id}/play`),
-  stopScene: (id: number) =>
-    api.post<{ ok: boolean; stopped: number }>(`/api/scenes/${id}/stop`),
-  stopAllScenes: () =>
-    api.post<{ ok: boolean; stopped: number }>(`/api/scenes/stop-all`),
-  activeScenes: () => api.get<ActiveScene[]>(`/api/scenes/active`),
-  playLive: (body: LiveSceneInput) =>
+  listEffects: () => api.get<Effect[]>("/api/effects"),
+  createEffect: (body: EffectInput) => api.post<Effect>("/api/effects", body),
+  updateEffect: (id: number, body: EffectInput) =>
+    api.patch<Effect>(`/api/effects/${id}`, body),
+  deleteEffect: (id: number) => api.del<void>(`/api/effects/${id}`),
+  cloneEffect: (id: number) => api.post<Effect>(`/api/effects/${id}/clone`),
+  playEffect: (id: number) =>
+    api.post<{ ok: boolean; handle: string }>(`/api/effects/${id}/play`),
+  stopEffect: (id: number) =>
+    api.post<{ ok: boolean; stopped: number }>(`/api/effects/${id}/stop`),
+  stopAllEffects: () =>
+    api.post<{ ok: boolean; stopped: number }>(`/api/effects/stop-all`),
+  activeEffects: () => api.get<ActiveEffect[]>(`/api/effects/active`),
+  playLive: (body: LiveEffectInput) =>
     api.post<{ ok: boolean; handle: string; name: string }>(
-      `/api/scenes/live`,
+      `/api/effects/live`,
       body,
     ),
   stopLive: (handle: string) =>
-    api.post<{ ok: boolean }>(`/api/scenes/live/${handle}/stop`),
+    api.post<{ ok: boolean }>(`/api/effects/live/${handle}/stop`),
   saveLive: (handle: string, name: string) =>
-    api.post<Scene>(`/api/scenes/live/${handle}/save`, { name }),
+    api.post<Effect>(`/api/effects/live/${handle}/save`, { name }),
+
+  listScenes: (controllerId?: number) =>
+    api.get<Scene[]>(
+      controllerId !== undefined
+        ? `/api/scenes?controller_id=${controllerId}`
+        : `/api/scenes`,
+    ),
+  createScene: (body: SceneCreateInput) =>
+    api.post<Scene>(`/api/scenes`, body),
+  updateScene: (id: number, body: SceneUpdateInput) =>
+    api.patch<Scene>(`/api/scenes/${id}`, body),
+  deleteScene: (id: number) => api.del<void>(`/api/scenes/${id}`),
+  applyScene: (id: number) =>
+    api.post<{ ok: boolean; applied: number }>(`/api/scenes/${id}/apply`),
+  applyBlackoutScene: (controllerId: number) =>
+    api.post<{ ok: boolean; applied: number }>(
+      `/api/scenes/blackout/${controllerId}/apply`,
+    ),
 
   aiStatus: () => api.get<AiStatus>("/api/ai/status"),
   parseManual: (

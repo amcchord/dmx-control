@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from "react";
-import { ActiveScene, Api } from "../api";
+import { ActiveEffect, Api } from "../api";
 
 type Props = {
-  activeScenes: ActiveScene[];
+  activeEffects: ActiveEffect[];
   onChanged?: () => void;
   notify?: (msg: string, kind?: "success" | "error" | "info") => void;
 };
@@ -19,8 +19,8 @@ const EFFECT_ICONS: Record<string, string> = {
   wave: "\u223F",
 };
 
-export default function ActiveScenesBar({
-  activeScenes,
+export default function ActiveEffectsBar({
+  activeEffects,
   onChanged,
   notify,
 }: Props) {
@@ -29,18 +29,18 @@ export default function ActiveScenesBar({
 
   // Advance the runtime display once per second without re-polling.
   useEffect(() => {
-    if (activeScenes.length === 0) return;
+    if (activeEffects.length === 0) return;
     const h = window.setInterval(() => setTick((t) => t + 1), 1000);
     return () => window.clearInterval(h);
-  }, [activeScenes.length]);
+  }, [activeEffects.length]);
 
-  if (activeScenes.length === 0) return null;
+  if (activeEffects.length === 0) return null;
 
-  async function stopOne(a: ActiveScene) {
+  async function stopOne(a: ActiveEffect) {
     setBusy(a.handle);
     try {
       if (a.id != null) {
-        await Api.stopScene(a.id);
+        await Api.stopEffect(a.id);
       } else {
         await Api.stopLive(a.handle);
       }
@@ -55,7 +55,7 @@ export default function ActiveScenesBar({
   async function stopAll() {
     setBusy("all");
     try {
-      await Api.stopAllScenes();
+      await Api.stopAllEffects();
       onChanged?.();
     } catch (e) {
       notify?.(String(e), "error");
@@ -72,11 +72,11 @@ export default function ActiveScenesBar({
           <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-400" />
         </span>
         <span className="text-xs font-semibold text-emerald-200">
-          {activeScenes.length} running
+          {activeEffects.length} running
         </span>
       </div>
       <div className="flex flex-1 flex-wrap gap-1.5">
-        {activeScenes.map((a) => {
+        {activeEffects.map((a) => {
           const icon = EFFECT_ICONS[a.effect_type] ?? "\u25CF";
           const isBusy = busy === a.handle;
           return (
@@ -115,7 +115,7 @@ export default function ActiveScenesBar({
           );
         })}
       </div>
-      {activeScenes.length > 1 && (
+      {activeEffects.length > 1 && (
         <button
           onClick={stopAll}
           disabled={busy === "all"}

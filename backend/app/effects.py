@@ -1,6 +1,6 @@
 """Pure-math layer for the effect engine.
 
-This module contains no asyncio, no DB, and no sockets. It takes in a scene
+This module contains no asyncio, no DB, and no sockets. It takes in an effect
 definition + current `t` + the materialized light/mode snapshot and returns
 a per-light color overlay that the engine merges with each fixture's base
 state before rendering to DMX.
@@ -12,7 +12,7 @@ Every effect is a special case of one formula:
     bri_i   = envelope(phase_i, size, softness)    # brightness shaping
     out_i   = mix(base_i, color_i * bri_i, intensity)
 
-The ``i`` axis comes from the scene's ``spread``:
+The ``i`` axis comes from the effect's ``spread``:
 
 * ``across_lights`` - one index per fixture
 * ``across_fixture`` - per-fixture, indices = zones of that fixture
@@ -165,7 +165,7 @@ def envelope_wave(phase: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Scene expansion: spread -> list of (light_id, zone_id | None) tuples
+# Effect expansion: spread -> list of (light_id, zone_id | None) tuples
 # ---------------------------------------------------------------------------
 @dataclass
 class TargetSlot:
@@ -218,8 +218,8 @@ def expand_slots(
     if empty the fixture's full zone list is used.
 
     As a convenience, when ``light_ids`` *and* ``targets`` are both empty,
-    the scene is treated as covering every light currently known to the
-    engine. This makes built-in and API-created live scenes "just work"
+    the effect is treated as covering every light currently known to the
+    engine. This makes built-in and API-created live effects "just work"
     on any rig without the caller having to enumerate the fixtures.
     """
     if not light_ids and not targets:
@@ -313,15 +313,15 @@ def _palette_colors(
 
 
 def _sparkle_on(
-    scene_id_seed: int, slot_key: tuple[int, Optional[str]], t: float, rate_hz: float
+    effect_id_seed: int, slot_key: tuple[int, Optional[str]], t: float, rate_hz: float
 ) -> tuple[bool, float]:
     """Deterministic-ish per-slot sparkle gating.
 
-    Uses a hashed seed so concurrent scenes don't all flash at the same
+    Uses a hashed seed so concurrent effects don't all flash at the same
     moments. Returns (is_on, phase_within_flash) - the phase is used to
     shape a small decay envelope."""
     bucket = int(t * max(0.1, rate_hz))
-    key = f"{scene_id_seed}:{slot_key[0]}:{slot_key[1]}:{bucket}"
+    key = f"{effect_id_seed}:{slot_key[0]}:{slot_key[1]}:{bucket}"
     h = int(hashlib.sha1(key.encode("utf-8")).hexdigest()[:8], 16)
     on = (h & 0xFF) < 96  # ~38% chance per bucket
     phase_in_bucket = _fract(t * max(0.1, rate_hz))
@@ -334,7 +334,7 @@ def compute_effect_outputs(
     params: dict,
     group: list[TargetSlot],
     t: float,
-    scene_seed: int,
+    effect_seed: int,
 ) -> list[IndexOutput]:
     """Return one IndexOutput per slot in ``group``."""
     speed_hz = float(params.get("speed_hz", 0.5))
@@ -412,7 +412,7 @@ def compute_effect_outputs(
 
         if effect_type == "sparkle":
             on, flash_phase = _sparkle_on(
-                scene_seed, (slot.light_id, slot.zone_id), t, max(0.5, speed_hz * 4.0)
+                effect_seed, (slot.light_id, slot.zone_id), t, max(0.5, speed_hz * 4.0)
             )
             if not on:
                 out.append(IndexOutput(rgb=(0, 0, 0), brightness=0.0, active=False))
@@ -421,7 +421,7 @@ def compute_effect_outputs(
             decay = max(0.0, 1.0 - flash_phase)
             # Random-ish palette pick per bucket.
             bucket = int(t * max(0.5, speed_hz * 4.0))
-            rr = random.Random(f"{scene_seed}:{slot.light_id}:{slot.zone_id}:{bucket}")
+            rr = random.Random(f"{effect_seed}:{slot.light_id}:{slot.zone_id}:{bucket}")
             if palette_colors:
                 rgb = hex_to_rgb(palette_colors[rr.randrange(len(palette_colors))])
             else:
@@ -443,7 +443,7 @@ def compute_effect_outputs(
 
 
 # ---------------------------------------------------------------------------
-# Overlay assembly: scene -> {light_id: overlay}
+# Overlay assembly: effect -> {light_id: overlay}
 # ---------------------------------------------------------------------------
 @dataclass
 class LightOverlay:
@@ -463,8 +463,8 @@ class LightOverlay:
             self.zones = {}
 
 
-def compute_scene_overlays(
-    scene_id: int,
+def compute_effect_overlays(
+    effect_id: int,
     effect_type: str,
     palette_colors: list[str],
     params: dict,
@@ -475,7 +475,7 @@ def compute_scene_overlays(
     lights_by_id: dict[int, Light],
     modes_by_id: dict[int, LightModelMode],
 ) -> dict[int, LightOverlay]:
-    """Compute per-light overlays for a single scene at time ``t``."""
+    """Compute per-light overlays for a single effect at time ``t``."""
     groups = expand_slots(
         spread, light_ids, targets, lights_by_id, modes_by_id
     )
@@ -485,7 +485,7 @@ def compute_scene_overlays(
 
     for group in groups:
         outs = compute_effect_outputs(
-            effect_type, palette_colors, params, group, t, scene_id
+            effect_type, palette_colors, params, group, t, effect_id
         )
         for slot, result in zip(group, outs):
             if not result.active:
@@ -515,7 +515,7 @@ def merge_overlay_into_state(
     """Produce a rendered state dict for one light.
 
     ``base_state`` is the light's current DB-backed state (flat r/g/b/w/a/uv
-    + zone_state + motion_state). ``fade_weight`` is the scene's current
+    + zone_state + motion_state). ``fade_weight`` is the effect's current
     fade-in/out envelope in [0, 1]. The result has the same shape the
     ArtNet renderer expects."""
     out = dict(base_state)

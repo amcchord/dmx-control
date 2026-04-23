@@ -23,6 +23,19 @@ a Caddy + systemd deployment that fronts everything at
 - Apply a palette to a selection of lights in **cycle**, **gradient**, or
   **random** mode.
 - Turn lights on/off, set individual colors, and bulk-blackout a controller.
+- Run a real-time **effect engine** (static, fade, cycle, chase, pulse,
+  rainbow, strobe, sparkle, wave) with per-effect fade-in/out, spread
+  (across lights / across fixture / across zones), and six curated
+  built-in effects. Effects are non-destructive: stopping one cleanly
+  restores whatever base color was in place.
+- Save and recall named **scenes** — snapshots of every light's current
+  color/dimmer/on state, scoped per-controller or spanning the whole rig.
+  Each controller's header on the Lights page gets a `Restore scene`
+  dropdown (with a built-in `Blackout` entry), an `Apply` button, and a
+  `Save scene` button; a dedicated `/scenes` page covers rename,
+  re-capture, delete, and cross-controller management. Applying a scene
+  stops any running effect that covers the affected lights so the
+  restored state actually sticks.
 - Single shared password ("secretsauce" by default) via a signed session
   cookie.
 - Everything persists to SQLite and is restored to the physical rig on
@@ -143,6 +156,59 @@ Channel roles: `r, g, b, w, a, uv, dimmer, strobe, macro, speed, pan, tilt, othe
 | POST | `/api/palettes/{id}/apply` | `{light_ids[], mode}` | `{updated: n}` |
 
 `mode` is one of `"cycle"`, `"gradient"`, or `"random"`. Colors are `#RRGGBB`.
+
+### Effects (`/api/effects`)
+
+Saved animated presets (cycle/fade/rainbow/etc) plus a transient "live"
+playback path used by the Effects dialog on the Lights page.
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/effects` | — | `Effect[]` |
+| POST | `/api/effects` | `EffectIn` | `Effect` |
+| PATCH | `/api/effects/{id}` | `EffectIn` | `Effect` |
+| DELETE | `/api/effects/{id}` | — | 204 |
+| POST | `/api/effects/{id}/clone` | — | `Effect` |
+| POST | `/api/effects/{id}/play` | — | `{ok, handle}` |
+| POST | `/api/effects/{id}/stop` | — | `{ok, stopped}` |
+| POST | `/api/effects/stop-all` | — | `{ok, stopped}` |
+| GET | `/api/effects/active` | — | `ActiveEffect[]` |
+| POST | `/api/effects/live` | `LiveEffectIn` | `{ok, handle, name}` |
+| POST | `/api/effects/live/{handle}/stop` | — | `{ok}` |
+| POST | `/api/effects/live/{handle}/save` | `{name}` | `Effect` |
+
+### Scenes (`/api/scenes`)
+
+State snapshots you can save once and replay later. Each scene belongs
+to a primary `controller_id`; set `cross_controller=true` to cover every
+light on the rig. A virtual `Blackout` entry is synthesized per
+controller in `GET /api/scenes` so the UI can render one uniform list.
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/scenes?controller_id=<int>` | — | `Scene[]` |
+| POST | `/api/scenes` | `SceneCreate` | `Scene` |
+| PATCH | `/api/scenes/{id}` | `SceneUpdate` | `Scene` |
+| DELETE | `/api/scenes/{id}` | — | 204 |
+| POST | `/api/scenes/{id}/apply` | — | `{ok, applied}` |
+| POST | `/api/scenes/blackout/{cid}/apply` | — | `{ok, applied}` |
+
+```json
+// SceneCreate
+{
+  "name": "Evening wash",
+  "controller_id": 1,
+  "cross_controller": false,
+  "light_ids": [1, 2, 3],
+  "from_rendered": false
+}
+
+// SceneUpdate (all fields optional)
+{ "name": "Renamed", "recapture": true, "from_rendered": false }
+```
+
+`from_rendered=true` captures the live DMX output (useful for freezing a
+running effect) instead of the DB base state.
 
 ### State (`/api/state`)
 

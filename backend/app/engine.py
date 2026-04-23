@@ -4,16 +4,16 @@ The engine owns a monotonic clock and ticks at ``TICK_HZ`` in a background
 asyncio task. On each tick it:
 
 1. Loads the base state of every light that is currently driven by any
-   active scene (reading the DB snapshot we cache between ticks).
-2. Computes per-scene overlays via :mod:`.effects`.
+   active effect (reading the DB snapshot we cache between ticks).
+2. Computes per-effect overlays via :mod:`.effects`.
 3. Merges overlays into base state (with fade-in/out weighting) and writes
    the result into the ArtNet buffer via the deferred path, coalescing all
    updates into one UDP packet per controller per tick.
-4. When a scene stops, re-renders the affected lights with pure base state
-   so the rig returns cleanly to the manually-set colour.
+4. When an effect stops, re-renders the affected lights with pure base
+   state so the rig returns cleanly to the manually-set colour.
 
-Scenes are non-destructive. The DB ``Light`` rows are never written by the
-engine; users remain free to change base colours while a scene is playing
+Effects are non-destructive. The DB ``Light`` rows are never written by the
+engine; users remain free to change base colours while an effect is playing
 and the effect will ride on top of the new base.
 """
 
@@ -33,11 +33,11 @@ from .artnet import manager
 from .db import engine as db_engine
 from .effects import (
     LightOverlay,
-    compute_scene_overlays,
+    compute_effect_overlays,
     merge_overlay_into_state,
     zone_ids_for_light,
 )
-from .models import Light, LightModelMode, Palette, Scene
+from .models import Effect, Light, LightModelMode, Palette
 
 log = logging.getLogger(__name__)
 
@@ -46,15 +46,15 @@ TICK_INTERVAL = 1.0 / TICK_HZ
 
 
 @dataclass
-class SceneSpec:
-    """Immutable snapshot of a scene as the engine runs it.
+class EffectSpec:
+    """Immutable snapshot of an effect as the engine runs it.
 
-    We copy scene rows into SceneSpec so that callers editing the DB don't
-    mutate a running scene mid-frame. To apply edits, stop + re-play the
-    scene (the router does this automatically on update)."""
+    We copy effect rows into EffectSpec so that callers editing the DB don't
+    mutate a running effect mid-frame. To apply edits, stop + re-play the
+    effect (the router does this automatically on update)."""
 
     handle: str
-    scene_id: Optional[int]  # None for transient live scenes
+    effect_id: Optional[int]  # None for transient live effects
     name: str
     effect_type: str
     palette_colors: list[str]
@@ -66,17 +66,17 @@ class SceneSpec:
 
 @dataclass
 class RunState:
-    spec: SceneSpec
+    spec: EffectSpec
     started_at: float
-    # Seconds-since-start where the scene should be fading out; None while
+    # Seconds-since-start where the effect should be fading out; None while
     # still running normally.
     fade_out_start: Optional[float] = None
-    # Set of light ids currently covered by the scene (recomputed each tick).
+    # Set of light ids currently covered by the effect (recomputed each tick).
     touched: set[int] = field(default_factory=set)
 
 
 class EffectEngine:
-    """Asyncio tick loop driving all active scenes.
+    """Asyncio tick loop driving all active effects.
 
     Thread-safety model: public methods are safe from any thread. They
     mutate ``_pending_commands`` behind a lock and the tick loop drains it
@@ -90,8 +90,8 @@ class EffectEngine:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         self._active: dict[str, RunState] = {}
-        # handle -> RunState; also includes scenes currently fading out.
-        self._pending_starts: list[SceneSpec] = []
+        # handle -> RunState; also includes effects currently fading out.
+        self._pending_starts: list[EffectSpec] = []
         self._pending_stops: list[str] = []
         self._pending_stop_all: bool = False
 
@@ -129,13 +129,13 @@ class EffectEngine:
     # ------------------------------------------------------------------
     # Public API (thread-safe)
     # ------------------------------------------------------------------
-    def play(self, spec: SceneSpec) -> str:
+    def play(self, spec: EffectSpec) -> str:
         with self._lock:
-            # If a saved scene with this id is already playing, replace it.
-            if spec.scene_id is not None:
+            # If a saved effect with this id is already playing, replace it.
+            if spec.effect_id is not None:
                 for handle, rs in list(self._active.items()):
                     if (
-                        rs.spec.scene_id == spec.scene_id
+                        rs.spec.effect_id == spec.effect_id
                         and rs.fade_out_start is None
                     ):
                         self._pending_stops.append(handle)
@@ -149,12 +149,12 @@ class EffectEngine:
                 return True
             return False
 
-    def stop_by_scene_id(self, scene_id: int) -> int:
+    def stop_by_effect_id(self, effect_id: int) -> int:
         with self._lock:
             hits = [
                 h
                 for h, rs in self._active.items()
-                if rs.spec.scene_id == scene_id
+                if rs.spec.effect_id == effect_id
                 and rs.fade_out_start is None
             ]
             self._pending_stops.extend(hits)
@@ -169,13 +169,41 @@ class EffectEngine:
             self._pending_stop_all = True
             return n
 
+    def stop_affecting(self, light_ids: set[int]) -> int:
+        """Stop every active effect whose targets intersect ``light_ids``.
+
+        Used when something (e.g. restoring a Scene snapshot) wants to take
+        over the lights that effects are currently driving. Returns the
+        number of effects marked for stop."""
+        if not light_ids:
+            return 0
+        targets = set(light_ids)
+        with self._lock:
+            hits: list[str] = []
+            for handle, rs in self._active.items():
+                if rs.fade_out_start is not None:
+                    continue
+                covers: set[int] = set(rs.spec.light_ids or [])
+                for t in rs.spec.targets or []:
+                    lid = t.get("light_id")
+                    if isinstance(lid, int):
+                        covers.add(lid)
+                if rs.touched:
+                    covers |= rs.touched
+                # An effect with no explicit targets resolves to "all lights"
+                # at play time, so it always intersects any non-empty set.
+                if not covers or covers & targets:
+                    hits.append(handle)
+            self._pending_stops.extend(hits)
+            return len(hits)
+
     def active_snapshot(self) -> list[dict]:
-        """Snapshot of currently-playing scenes (including fading-out)."""
+        """Snapshot of currently-playing effects (including fading-out)."""
         now = time.monotonic()
         with self._lock:
             return [
                 {
-                    "id": rs.spec.scene_id,
+                    "id": rs.spec.effect_id,
                     "handle": handle,
                     "name": rs.spec.name,
                     "effect_type": rs.spec.effect_type,
@@ -184,10 +212,10 @@ class EffectEngine:
                 for handle, rs in self._active.items()
             ]
 
-    def is_scene_active(self, scene_id: int) -> bool:
+    def is_effect_active(self, effect_id: int) -> bool:
         with self._lock:
             return any(
-                rs.spec.scene_id == scene_id
+                rs.spec.effect_id == effect_id
                 and rs.fade_out_start is None
                 for rs in self._active.values()
             )
@@ -247,11 +275,11 @@ class EffectEngine:
         if not self._active:
             return
 
-        # Refresh DB snapshots (base state can change while scenes play).
+        # Refresh DB snapshots (base state can change while effects play).
         self._refresh_snapshots()
 
-        # Collect which lights every scene wants to touch this frame so
-        # that when a scene stops we know which lights to restore.
+        # Collect which lights every effect wants to touch this frame so
+        # that when an effect stops we know which lights to restore.
         all_touched: set[int] = set()
         # per-light: list of (overlay, fade_weight) to merge
         per_light: dict[int, list[tuple[LightOverlay, float]]] = {}
@@ -281,8 +309,8 @@ class EffectEngine:
 
             t = age  # effect time reference is seconds since start
 
-            overlays = compute_scene_overlays(
-                scene_id=spec.scene_id or hash(spec.handle) & 0x7FFFFFFF,
+            overlays = compute_effect_overlays(
+                effect_id=spec.effect_id or hash(spec.handle) & 0x7FFFFFFF,
                 effect_type=spec.effect_type,
                 palette_colors=spec.palette_colors,
                 params=params,
@@ -314,8 +342,8 @@ class EffectEngine:
                 )
             manager.set_light_state_deferred(lid, state)
 
-        # Remove scenes that finished fading out; restore any lights they
-        # covered that are no longer covered by any other active scene.
+        # Remove effects that finished fading out; restore any lights they
+        # covered that are no longer covered by any other active effect.
         if completed_handles:
             still_covered: set[int] = set()
             for handle, rs in self._active.items():
@@ -396,15 +424,15 @@ def new_handle() -> str:
     return uuid.uuid4().hex
 
 
-def build_spec_from_scene(
-    scene: Scene, palette: Optional[Palette]
-) -> SceneSpec:
+def build_spec_from_effect(
+    effect: Effect, palette: Optional[Palette]
+) -> EffectSpec:
     colors = list(palette.colors) if palette and palette.colors else []
     if not colors:
         colors = ["#FFFFFF"]
-    light_ids = list(scene.light_ids or [])
-    targets = list(scene.targets or [])
-    # Built-in scenes ship without a fixed target list so they can be
+    light_ids = list(effect.light_ids or [])
+    targets = list(effect.targets or [])
+    # Built-in effects ship without a fixed target list so they can be
     # played on any rig. When both target lists are empty we resolve to
     # every known light at play time.
     if not light_ids and not targets:
@@ -413,15 +441,17 @@ def build_spec_from_scene(
                 rows = sess.exec(select(Light.id)).all()
                 light_ids = [r for r in rows if r is not None]
         except Exception:
-            log.exception("failed to resolve 'all lights' for scene %s", scene.id)
-    return SceneSpec(
+            log.exception(
+                "failed to resolve 'all lights' for effect %s", effect.id
+            )
+    return EffectSpec(
         handle=new_handle(),
-        scene_id=scene.id,
-        name=scene.name,
-        effect_type=scene.effect_type,
+        effect_id=effect.id,
+        name=effect.name,
+        effect_type=effect.effect_type,
         palette_colors=colors,
         light_ids=light_ids,
         targets=targets,
-        spread=scene.spread,
-        params=dict(scene.params or {}),
+        spread=effect.spread,
+        params=dict(effect.params or {}),
     )

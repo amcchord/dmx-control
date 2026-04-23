@@ -1,10 +1,11 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
-  ActiveScene,
+  ActiveEffect,
   Api,
   BulkTarget,
   Controller,
+  Effect,
   FixtureLayout,
   Light,
   LightModel,
@@ -15,12 +16,12 @@ import {
   Scene,
 } from "../api";
 import { useToast } from "../toast";
-import ActiveScenesBar from "../components/ActiveScenesBar";
+import ActiveEffectsBar from "../components/ActiveEffectsBar";
 import ColorPicker from "../components/ColorPicker";
 import EffectPanel from "../components/EffectPanel";
 import Modal from "../components/Modal";
 import PaletteSwatch from "../components/PaletteSwatch";
-import ScenesSidebar from "../components/ScenesSidebar";
+import EffectsSidebar from "../components/EffectsSidebar";
 import { hexToRgb, rgbToHex } from "../util";
 import {
   MOTION_AXES,
@@ -98,8 +99,19 @@ export default function Dashboard() {
   const [models, setModels] = useState<LightModel[]>([]);
   const [lights, setLights] = useState<Light[]>([]);
   const [palettes, setPalettes] = useState<Palette[]>([]);
+  const [effects, setEffects] = useState<Effect[]>([]);
+  const [activeEffects, setActiveEffects] = useState<ActiveEffect[]>([]);
   const [scenes, setScenes] = useState<Scene[]>([]);
-  const [activeScenes, setActiveScenes] = useState<ActiveScene[]>([]);
+  const [saveScenePrompt, setSaveScenePrompt] = useState<Controller | null>(
+    null,
+  );
+  const [saveSceneName, setSaveSceneName] = useState("");
+  // Per-controller dropdown selection for the "Restore scene" picker.
+  // Values are scene ids as strings, or "__blackout__" for the virtual
+  // Blackout entry. Empty string = nothing selected yet.
+  const [sceneSelection, setSceneSelection] = useState<Record<number, string>>(
+    {},
+  );
   const [rendered, setRendered] = useState<Record<number, RenderedLight>>({});
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<Selection>(new Map());
@@ -118,18 +130,20 @@ export default function Dashboard() {
 
   const refresh = async () => {
     try {
-      const [c, m, l, p, s] = await Promise.all([
+      const [c, m, l, p, e, sc] = await Promise.all([
         Api.listControllers(),
         Api.listModels(),
         Api.listLights(),
         Api.listPalettes(),
+        Api.listEffects(),
         Api.listScenes(),
       ]);
       setControllers(c);
       setModels(m);
       setLights(l);
       setPalettes(p);
-      setScenes(s);
+      setEffects(e);
+      setScenes(sc);
     } catch (e) {
       toast.push(String(e), "error");
     } finally {
@@ -137,21 +151,30 @@ export default function Dashboard() {
     }
   };
 
+  const refreshScenes = async () => {
+    try {
+      const sc = await Api.listScenes();
+      setScenes(sc);
+    } catch (e) {
+      toast.push(String(e), "error");
+    }
+  };
+
   const refreshActive = async () => {
     try {
-      const a = await Api.activeScenes();
-      setActiveScenes(a);
+      const a = await Api.activeEffects();
+      setActiveEffects(a);
     } catch {
       // Ignore — non-fatal background poll.
     }
   };
 
-  const refreshScenes = async () => {
+  const refreshEffects = async () => {
     try {
-      const s = await Api.listScenes();
-      setScenes(s);
-    } catch (e) {
-      toast.push(String(e), "error");
+      const e = await Api.listEffects();
+      setEffects(e);
+    } catch (err) {
+      toast.push(String(err), "error");
     }
   };
 
@@ -167,11 +190,11 @@ export default function Dashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // When any scene is running, poll the rendered DMX snapshot at 10 Hz so
+  // When any effect is running, poll the rendered DMX snapshot at 10 Hz so
   // the on-screen cards visibly animate. Clear the snapshot when nothing
   // is running so the cards fall back to the DB base state cleanly.
   useEffect(() => {
-    if (activeScenes.length === 0) {
+    if (activeEffects.length === 0) {
       if (Object.keys(rendered).length > 0) setRendered({});
       return;
     }
@@ -196,7 +219,7 @@ export default function Dashboard() {
       window.clearInterval(h);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeScenes.length]);
+  }, [activeEffects.length]);
 
   const modelById = useMemo(() => {
     const m = new Map<number, LightModel>();
@@ -241,6 +264,20 @@ export default function Dashboard() {
       ),
     }));
   }, [lights, controllers]);
+
+  const scenesByController = useMemo(() => {
+    const byCtrl = new Map<number, Scene[]>();
+    for (const s of scenes) {
+      if (s.id === null) continue; // virtual entries rendered per-controller
+      const list = byCtrl.get(s.controller_id) ?? [];
+      list.push(s);
+      byCtrl.set(s.controller_id, list);
+    }
+    for (const list of byCtrl.values()) {
+      list.sort((a, b) => a.name.localeCompare(b.name));
+    }
+    return byCtrl;
+  }, [scenes]);
 
   const toggleLight = (id: number, additive: boolean) => {
     setSelected((prev) => {
@@ -372,11 +409,44 @@ export default function Dashboard() {
     }
   };
 
-  const blackoutController = async (c: Controller) => {
-    if (!confirm(`Blackout ${c.name}? All lights on this controller will be turned off.`)) return;
+  const openSaveScene = (c: Controller) => {
+    setSaveSceneName("");
+    setSaveScenePrompt(c);
+  };
+
+  const saveScene = async () => {
+    if (saveScenePrompt === null) return;
+    const name = saveSceneName.trim();
+    if (!name) return;
     try {
-      await Api.blackoutController(c.id);
-      toast.push(`${c.name} blacked out`, "success");
+      await Api.createScene({
+        name,
+        controller_id: saveScenePrompt.id,
+      });
+      toast.push(`Saved "${name}"`, "success");
+      setSaveScenePrompt(null);
+      setSaveSceneName("");
+      await refreshScenes();
+    } catch (e) {
+      toast.push(String(e), "error");
+    }
+  };
+
+  const applySelectedScene = async (c: Controller) => {
+    const value = sceneSelection[c.id] ?? "";
+    if (!value) return;
+    try {
+      if (value === "__blackout__") {
+        await Api.applyBlackoutScene(c.id);
+        toast.push(`${c.name} blacked out`, "success");
+      } else {
+        const id = Number(value);
+        if (!Number.isFinite(id)) return;
+        const scene = scenes.find((s) => s.id === id);
+        const label = scene?.name ?? `scene ${id}`;
+        await Api.applyScene(id);
+        toast.push(`Applied "${label}"`, "success");
+      }
       await refresh();
     } catch (e) {
       toast.push(String(e), "error");
@@ -481,21 +551,23 @@ export default function Dashboard() {
             onClick={() => setShowEffects(true)}
             disabled={selected.size === 0}
           >
-            Effects{activeScenes.length > 0 ? ` (${activeScenes.length} live)` : "..."}
+            Effects{activeEffects.length > 0 ? ` (${activeEffects.length} live)` : "..."}
           </button>
         </div>
       </div>
 
-      <ActiveScenesBar
-        activeScenes={activeScenes}
+      <ActiveEffectsBar
+        activeEffects={activeEffects}
         onChanged={async () => {
           await refreshActive();
-          await refreshScenes();
+          await refreshEffects();
         }}
         notify={(msg, kind) => toast.push(msg, kind)}
       />
 
-      {groupedLights.map(({ controller, lights: clights }) => (
+      {groupedLights.map(({ controller, lights: clights }) => {
+        const savedScenes = scenesByController.get(controller.id) ?? [];
+        return (
         <section key={controller.id} className="space-y-3">
           <header className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2">
@@ -508,12 +580,49 @@ export default function Dashboard() {
                 </span>
               )}
             </div>
-            <button
-              className="btn-ghost text-rose-300 hover:bg-rose-950 hover:text-rose-200"
-              onClick={() => blackoutController(controller)}
-            >
-              Blackout
-            </button>
+            <div className="flex flex-nowrap items-center gap-2">
+              <select
+                className="input !h-8 w-36 !py-1 !text-xs"
+                value={sceneSelection[controller.id] ?? ""}
+                onChange={(e) =>
+                  setSceneSelection((prev) => ({
+                    ...prev,
+                    [controller.id]: e.target.value,
+                  }))
+                }
+                title="Pick a saved scene to restore to this controller"
+              >
+                <option value="" disabled>
+                  Restore scene…
+                </option>
+                <option value="__blackout__">Blackout</option>
+                {savedScenes.length > 0 && (
+                  <optgroup label="Saved">
+                    {savedScenes.map((s) => (
+                      <option key={s.id ?? `x-${s.name}`} value={String(s.id)}>
+                        {s.name}
+                        {s.cross_controller ? " (multi)" : ""}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+              </select>
+              <button
+                className="btn-primary text-xs"
+                onClick={() => applySelectedScene(controller)}
+                disabled={!sceneSelection[controller.id]}
+                title="Apply the selected scene to this controller"
+              >
+                Apply
+              </button>
+              <button
+                className="btn-ghost text-xs"
+                onClick={() => openSaveScene(controller)}
+                title="Capture the current state of this controller as a scene"
+              >
+                Save scene
+              </button>
+            </div>
           </header>
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
             {clights.map((light) => (
@@ -535,7 +644,8 @@ export default function Dashboard() {
             ))}
           </div>
         </section>
-      ))}
+        );
+      })}
 
       <Modal
         open={showEffects}
@@ -549,21 +659,21 @@ export default function Dashboard() {
             palettes={palettes}
             onActiveChanged={refreshActive}
             onSaved={async () => {
-              await refreshScenes();
+              await refreshEffects();
               await refreshActive();
             }}
             notify={(msg, kind) => toast.push(msg, kind)}
           />
-          <ScenesSidebar
-            scenes={scenes}
-            activeScenes={activeScenes}
+          <EffectsSidebar
+            effects={effects}
+            activeEffects={activeEffects}
             palettes={palettes}
-            onSceneSelected={(s) => {
-              // Load this scene's targets into the Dashboard selection so
+            onEffectSelected={(e) => {
+              // Load this effect's targets into the Dashboard selection so
               // the user can tweak it without manually reselecting lights.
               const next: Selection = new Map();
-              for (const lid of s.light_ids) next.set(lid, "all");
-              for (const t of s.targets) {
+              for (const lid of e.light_ids) next.set(lid, "all");
+              for (const t of e.targets) {
                 const existing = next.get(t.light_id);
                 if (existing === "all") continue;
                 const set = existing ?? new Set<string>();
@@ -573,7 +683,7 @@ export default function Dashboard() {
               setSelected(next);
             }}
             onChanged={async () => {
-              await refreshScenes();
+              await refreshEffects();
               await refreshActive();
             }}
             notify={(msg, kind) => toast.push(msg, kind)}
@@ -684,6 +794,57 @@ export default function Dashboard() {
             </button>
           ))}
         </div>
+      </Modal>
+
+      <Modal
+        open={saveScenePrompt !== null}
+        onClose={() => setSaveScenePrompt(null)}
+        title={
+          saveScenePrompt
+            ? `Save scene for ${saveScenePrompt.name}`
+            : "Save scene"
+        }
+        footer={
+          <>
+            <button
+              className="btn-ghost"
+              onClick={() => setSaveScenePrompt(null)}
+            >
+              Cancel
+            </button>
+            <button
+              className="btn-primary"
+              onClick={saveScene}
+              disabled={!saveSceneName.trim()}
+            >
+              Save
+            </button>
+          </>
+        }
+      >
+        <p className="mb-3 text-sm text-muted">
+          Captures the current color, dimmer, and on/off state of every light
+          on{" "}
+          <span className="font-medium text-slate-100">
+            {saveScenePrompt?.name}
+          </span>
+          .
+        </p>
+        <label className="label mb-1 block !text-xs normal-case tracking-normal">
+          Name
+        </label>
+        <input
+          className="input w-full"
+          value={saveSceneName}
+          autoFocus
+          placeholder="Evening wash"
+          onChange={(e) => setSaveSceneName(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && saveSceneName.trim()) {
+              void saveScene();
+            }
+          }}
+        />
       </Modal>
     </div>
   );

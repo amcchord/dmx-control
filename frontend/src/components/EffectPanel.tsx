@@ -20,11 +20,11 @@ type Props = {
   selection: Selection;
   palettes: Palette[];
   onLiveStateChange?: (live: LiveInfo | null) => void;
-  /** Called after a live scene is promoted to a saved Scene, so the parent
-   * can refresh its scenes list. */
+  /** Called after a live effect is promoted to a saved Effect, so the parent
+   * can refresh its effects list. */
   onSaved?: () => void;
-  /** Called whenever the panel starts or stops a live scene so the parent
-   * can refresh the active-scenes indicator. */
+  /** Called whenever the panel starts or stops a live effect so the parent
+   * can refresh the active-effects indicator. */
   onActiveChanged?: () => void;
   notify?: (msg: string, kind?: "success" | "error" | "info") => void;
 };
@@ -215,7 +215,7 @@ export default function EffectPanel({
   const hasSelection =
     selection.light_ids.length + selection.targets.length > 0;
 
-  // Auto-restart live scene on param/selection change, debounced so that
+  // Auto-restart live effect on param/selection change, debounced so that
   // drag-scrubbing a slider does not hammer the engine.
   const debounceRef = useRef<number | null>(null);
   useEffect(() => {
@@ -314,7 +314,7 @@ export default function EffectPanel({
     if (!name) return;
     try {
       await Api.saveLive(live.handle, name);
-      notify?.(`Saved "${name}" to scenes`, "success");
+      notify?.(`Saved "${name}" to effects`, "success");
       setSavePromptOpen(false);
       setSaveName("");
       onSaved?.();
@@ -569,7 +569,7 @@ export default function EffectPanel({
               className="input"
               value={saveName}
               onChange={(e) => setSaveName(e.target.value)}
-              placeholder="My scene"
+              placeholder="My effect"
               autoFocus
             />
             <button

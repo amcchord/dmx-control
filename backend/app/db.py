@@ -13,8 +13,42 @@ def init_db() -> None:
     # Import models so SQLModel knows about them before create_all.
     from . import models  # noqa: F401
 
+    # Rename the legacy `scene` table to `effect` BEFORE create_all so
+    # SQLModel doesn't create an empty second table alongside the one we
+    # want to keep (see _rename_scene_to_effect). Idempotent.
+    _rename_scene_to_effect()
     SQLModel.metadata.create_all(engine)
     _migrate()
+
+
+def _rename_scene_to_effect() -> None:
+    """Rename the pre-existing ``scene`` table to ``effect`` if needed.
+
+    Historical name: the animated effect presets lived in a table called
+    ``scene``. That concept was renamed to ``Effect`` in code; rename the
+    table to match so existing DBs keep their data instead of quietly
+    starting over with an empty ``effect`` table. Safe to re-run."""
+    is_sqlite = DATABASE_URL.startswith("sqlite")
+    with engine.begin() as conn:
+        if is_sqlite:
+            rows = conn.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('scene', 'effect')"
+            ).fetchall()
+            tables = {r[0] for r in rows}
+        else:
+            try:
+                rows = conn.execute(
+                    text(
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_name IN ('scene', 'effect')"
+                    )
+                ).fetchall()
+                tables = {r[0] for r in rows}
+            except Exception:
+                tables = set()
+        if "scene" in tables and "effect" not in tables:
+            conn.exec_driver_sql("ALTER TABLE scene RENAME TO effect")
 
 
 def _table_columns(conn, table: str) -> set[str]:

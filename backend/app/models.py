@@ -87,7 +87,7 @@ class Palette(SQLModel, table=True):
     builtin: bool = False
 
 
-class Scene(SQLModel, table=True):
+class Effect(SQLModel, table=True):
     """A named animated effect over a set of targets.
 
     Targets mirror the shape of :class:`BulkColorRequest`: whole-fixture
@@ -109,3 +109,21 @@ class Scene(SQLModel, table=True):
     params: dict = Field(default_factory=dict, sa_column=Column(JSON))
     is_active: bool = False
     builtin: bool = False
+
+
+class Scene(SQLModel, table=True):
+    """A snapshot of light state that can be saved and re-applied.
+
+    Scenes belong to a primary ``controller_id`` (used when listing scenes
+    in the per-controller dropdown on the Lights page). When
+    ``cross_controller`` is true, the snapshot may cover lights on other
+    controllers as well. ``lights`` is a list of per-light state dicts
+    captured at save time; each dict mirrors the writable fields on
+    :class:`Light` (r/g/b/w/a/uv/dimmer/on + zone_state + motion_state)
+    plus the ``light_id`` key used to restore."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    controller_id: int = Field(foreign_key="controller.id", index=True)
+    cross_controller: bool = False
+    lights: list[dict] = Field(default_factory=list, sa_column=Column(JSON))

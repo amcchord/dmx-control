@@ -1,21 +1,21 @@
 import React, { useEffect, useState } from "react";
-import { Api, ActiveScene, Palette, Scene } from "../api";
+import { Api, ActiveEffect, Effect, Palette } from "../api";
 import PaletteSwatch from "./PaletteSwatch";
 
 type Props = {
-  scenes: Scene[];
-  activeScenes: ActiveScene[];
+  effects: Effect[];
+  activeEffects: ActiveEffect[];
   palettes: Palette[];
-  onSceneSelected?: (scene: Scene) => void;
+  onEffectSelected?: (effect: Effect) => void;
   onChanged?: () => void;
   notify?: (msg: string, kind?: "success" | "error" | "info") => void;
 };
 
-export default function ScenesSidebar({
-  scenes,
-  activeScenes,
+export default function EffectsSidebar({
+  effects,
+  activeEffects,
   palettes,
-  onSceneSelected,
+  onEffectSelected,
   onChanged,
   notify,
 }: Props) {
@@ -29,53 +29,53 @@ export default function ScenesSidebar({
   }, []);
 
   const palettesById = new Map(palettes.map((p) => [p.id, p]));
-  const activeByScene = new Map<number, ActiveScene>();
-  for (const a of activeScenes) {
-    if (a.id != null) activeByScene.set(a.id, a);
+  const activeByEffect = new Map<number, ActiveEffect>();
+  for (const a of activeEffects) {
+    if (a.id != null) activeByEffect.set(a.id, a);
   }
-  const liveOnlyCount = activeScenes.filter((a) => a.id == null).length;
-  const hasAnyActive = activeScenes.length > 0;
+  const liveOnlyCount = activeEffects.filter((a) => a.id == null).length;
+  const hasAnyActive = activeEffects.length > 0;
 
-  async function play(s: Scene) {
-    setBusy(s.id);
+  async function play(e: Effect) {
+    setBusy(e.id);
     try {
-      await Api.playScene(s.id);
+      await Api.playEffect(e.id);
       onChanged?.();
-    } catch (e) {
-      notify?.(String(e), "error");
+    } catch (err) {
+      notify?.(String(err), "error");
     } finally {
       setBusy(null);
     }
   }
 
-  async function stop(s: Scene) {
-    setBusy(s.id);
+  async function stop(e: Effect) {
+    setBusy(e.id);
     try {
-      await Api.stopScene(s.id);
+      await Api.stopEffect(e.id);
       onChanged?.();
-    } catch (e) {
-      notify?.(String(e), "error");
+    } catch (err) {
+      notify?.(String(err), "error");
     } finally {
       setBusy(null);
     }
   }
 
-  async function remove(s: Scene) {
-    if (!confirm(`Delete scene "${s.name}"?`)) return;
+  async function remove(e: Effect) {
+    if (!confirm(`Delete effect "${e.name}"?`)) return;
     try {
-      await Api.deleteScene(s.id);
+      await Api.deleteEffect(e.id);
       onChanged?.();
-    } catch (e) {
-      notify?.(String(e), "error");
+    } catch (err) {
+      notify?.(String(err), "error");
     }
   }
 
   async function stopAll() {
     try {
-      await Api.stopAllScenes();
+      await Api.stopAllEffects();
       onChanged?.();
-    } catch (e) {
-      notify?.(String(e), "error");
+    } catch (err) {
+      notify?.(String(err), "error");
     }
   }
 
@@ -83,10 +83,10 @@ export default function ScenesSidebar({
     <div className="card flex h-full flex-col p-3">
       <div className="mb-2 flex items-center justify-between">
         <div>
-          <div className="text-sm font-semibold">Scenes</div>
+          <div className="text-sm font-semibold">Effects</div>
           <div className="text-[11px] text-muted">
-            {scenes.length} preset{scenes.length === 1 ? "" : "s"}
-            {hasAnyActive ? ` \u2022 ${activeScenes.length} running` : ""}
+            {effects.length} preset{effects.length === 1 ? "" : "s"}
+            {hasAnyActive ? ` \u2022 ${activeEffects.length} running` : ""}
             {liveOnlyCount > 0 ? ` (${liveOnlyCount} live)` : ""}
           </div>
         </div>
@@ -94,27 +94,27 @@ export default function ScenesSidebar({
           className="btn-ghost text-xs"
           onClick={stopAll}
           disabled={!hasAnyActive}
-          title="Stop every running scene"
+          title="Stop every running effect"
         >
           Stop all
         </button>
       </div>
 
-      {scenes.length === 0 ? (
+      {effects.length === 0 ? (
         <div className="rounded-md bg-bg-elev p-3 text-center text-xs text-muted">
-          No saved scenes yet. Play a live effect and hit "Save as preset" to
+          No saved effects yet. Play a live effect and hit "Save as preset" to
           pin it here.
         </div>
       ) : (
         <div className="flex-1 space-y-1.5 overflow-y-auto pr-1">
-          {scenes.map((s) => {
-            const active = activeByScene.get(s.id);
-            const palette = s.palette_id
-              ? palettesById.get(s.palette_id)
+          {effects.map((e) => {
+            const active = activeByEffect.get(e.id);
+            const palette = e.palette_id
+              ? palettesById.get(e.palette_id)
               : undefined;
             return (
               <div
-                key={s.id}
+                key={e.id}
                 className={
                   "flex items-center gap-2 rounded-md p-1.5 text-xs ring-1 " +
                   (active
@@ -125,11 +125,11 @@ export default function ScenesSidebar({
                 <div className="min-w-0 flex-1">
                   <button
                     className="block w-full truncate text-left font-medium hover:underline"
-                    onClick={() => onSceneSelected?.(s)}
-                    title="Load this scene into the editor"
+                    onClick={() => onEffectSelected?.(e)}
+                    title="Load this effect into the editor"
                   >
-                    {s.name}
-                    {s.builtin && (
+                    {e.name}
+                    {e.builtin && (
                       <span className="ml-1 text-[10px] text-muted">
                         built-in
                       </span>
@@ -137,7 +137,7 @@ export default function ScenesSidebar({
                   </button>
                   <div className="mt-0.5 flex items-center gap-1.5">
                     <span className="text-[10px] uppercase tracking-wide text-muted">
-                      {s.effect_type}
+                      {e.effect_type}
                     </span>
                     {palette && (
                       <div className="max-w-[100px] flex-1">
@@ -154,8 +154,8 @@ export default function ScenesSidebar({
                 {active ? (
                   <button
                     className="btn-ghost text-rose-300"
-                    onClick={() => stop(s)}
-                    disabled={busy === s.id}
+                    onClick={() => stop(e)}
+                    disabled={busy === e.id}
                     title="Stop"
                   >
                     {"\u25A0"}
@@ -163,17 +163,17 @@ export default function ScenesSidebar({
                 ) : (
                   <button
                     className="btn-ghost text-emerald-300"
-                    onClick={() => play(s)}
-                    disabled={busy === s.id}
+                    onClick={() => play(e)}
+                    disabled={busy === e.id}
                     title="Play"
                   >
                     {"\u25B6"}
                   </button>
                 )}
-                {!s.builtin && (
+                {!e.builtin && (
                   <button
                     className="btn-ghost text-muted hover:text-rose-300"
-                    onClick={() => remove(s)}
+                    onClick={() => remove(e)}
                     title="Delete"
                   >
                     {"\u00D7"}

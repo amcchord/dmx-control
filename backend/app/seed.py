@@ -9,7 +9,7 @@ from __future__ import annotations
 from sqlmodel import Session, select
 
 from .db import engine, init_db
-from .models import LightModel, LightModelMode, Palette, Scene
+from .models import Effect, LightModel, LightModelMode, Palette
 
 BUILTIN_MODELS: list[tuple[str, list[str]]] = [
     ("RGB 3ch", ["r", "g", "b"]),
@@ -150,10 +150,10 @@ def _upsert_model(sess: Session, name: str, channels: list[str]) -> None:
     sess.add(default)
 
 
-# Built-in scenes. light_ids + targets are intentionally left empty so the
+# Built-in effects. light_ids + targets are intentionally left empty so the
 # engine resolves them to "every light on the rig" at play time, which
-# means these scenes are immediately useful on any fixture configuration.
-BUILTIN_SCENES: list[dict] = [
+# means these effects are immediately useful on any fixture configuration.
+BUILTIN_EFFECTS: list[dict] = [
     {
         "name": "Rainbow Wash",
         "effect_type": "rainbow",
@@ -263,7 +263,7 @@ def _upsert_palette(sess: Session, name: str, colors: list[str]) -> None:
         sess.add(existing)
 
 
-def _upsert_scene(sess: Session, spec: dict) -> None:
+def _upsert_effect(sess: Session, spec: dict) -> None:
     name = spec["name"]
     palette_id: int | None = None
     if spec.get("palette_name"):
@@ -272,10 +272,10 @@ def _upsert_scene(sess: Session, spec: dict) -> None:
         ).first()
         if pal is not None:
             palette_id = pal.id
-    existing = sess.exec(select(Scene).where(Scene.name == name)).first()
+    existing = sess.exec(select(Effect).where(Effect.name == name)).first()
     if existing is None:
         sess.add(
-            Scene(
+            Effect(
                 name=name,
                 effect_type=spec["effect_type"],
                 palette_id=palette_id,
@@ -288,7 +288,7 @@ def _upsert_scene(sess: Session, spec: dict) -> None:
             )
         )
         return
-    # Keep builtin scenes in sync with the canonical definition.
+    # Keep builtin effects in sync with the canonical definition.
     existing.effect_type = spec["effect_type"]
     existing.palette_id = palette_id
     existing.spread = spec["spread"]
@@ -304,10 +304,10 @@ def seed() -> None:
             _upsert_model(sess, name, chans)
         for name, colors in BUILTIN_PALETTES:
             _upsert_palette(sess, name, colors)
-        # Palettes must be present before scenes so palette_id resolves.
+        # Palettes must be present before effects so palette_id resolves.
         sess.commit()
-        for spec in BUILTIN_SCENES:
-            _upsert_scene(sess, spec)
+        for spec in BUILTIN_EFFECTS:
+            _upsert_effect(sess, spec)
         sess.commit()
 
 

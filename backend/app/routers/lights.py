@@ -177,7 +177,7 @@ def list_rendered_lights() -> dict:
     """Live snapshot of what the rig is outputting right now.
 
     Returns ``{light_id: {r, g, b, on, zone_state: {zone_id: {r,g,b,on}}}}``.
-    The Dashboard polls this at a high rate while a scene is running so
+    The Dashboard polls this at a high rate while an effect is running so
     the light cards visibly animate alongside the physical fixtures."""
     return manager.snapshot_rendered()
 
