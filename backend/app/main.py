@@ -22,6 +22,7 @@ from .routers import models as models_router
 from .routers import palettes as palettes_router
 from .routers import scenes as scenes_router
 from .routers import state as state_router
+from .routers import states as states_router
 from .seed import seed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -73,6 +74,7 @@ app.include_router(lights_router.router)
 app.include_router(palettes_router.router)
 app.include_router(effects_router.router)
 app.include_router(scenes_router.router)
+app.include_router(states_router.router)
 app.include_router(state_router.router)
 app.include_router(ai_router.router)
 

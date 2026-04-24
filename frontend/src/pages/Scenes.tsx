@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { Api, Controller, Scene } from "../api";
+import { Api, Controller, Scene, State } from "../api";
 import Modal from "../components/Modal";
 import { useToast } from "../toast";
 
@@ -18,10 +18,21 @@ const EMPTY_FORM: CreateForm = {
   fromRendered: false,
 };
 
+type StateCreateForm = {
+  name: string;
+  fromRendered: boolean;
+};
+
+const EMPTY_STATE_FORM: StateCreateForm = {
+  name: "",
+  fromRendered: false,
+};
+
 export default function Scenes() {
   const toast = useToast();
   const [controllers, setControllers] = useState<Controller[]>([]);
   const [scenes, setScenes] = useState<Scene[]>([]);
+  const [states, setStates] = useState<State[]>([]);
   const [loading, setLoading] = useState(true);
   const [createOpen, setCreateOpen] = useState(false);
   const [createForm, setCreateForm] = useState<CreateForm>({ ...EMPTY_FORM });
@@ -29,12 +40,23 @@ export default function Scenes() {
   const [editName, setEditName] = useState("");
   const [editController, setEditController] = useState<number | null>(null);
   const [editCross, setEditCross] = useState(false);
+  const [createStateOpen, setCreateStateOpen] = useState(false);
+  const [createStateForm, setCreateStateForm] = useState<StateCreateForm>({
+    ...EMPTY_STATE_FORM,
+  });
+  const [editingState, setEditingState] = useState<State | null>(null);
+  const [editStateName, setEditStateName] = useState("");
 
   const refresh = async () => {
     try {
-      const [c, s] = await Promise.all([Api.listControllers(), Api.listScenes()]);
+      const [c, s, st] = await Promise.all([
+        Api.listControllers(),
+        Api.listScenes(),
+        Api.listStates(),
+      ]);
       setControllers(c);
       setScenes(s);
+      setStates(st);
     } catch (e) {
       toast.push(String(e), "error");
     } finally {
@@ -171,6 +193,89 @@ export default function Scenes() {
     }
   };
 
+  // ---------------------------------------------------------------------
+  // State (rig-wide) handlers
+  // ---------------------------------------------------------------------
+  const openCreateState = () => {
+    setCreateStateForm({ ...EMPTY_STATE_FORM });
+    setCreateStateOpen(true);
+  };
+
+  const submitCreateState = async () => {
+    const name = createStateForm.name.trim();
+    if (!name) return;
+    try {
+      await Api.createState({
+        name,
+        from_rendered: createStateForm.fromRendered,
+      });
+      toast.push(`Saved state "${name}"`, "success");
+      setCreateStateOpen(false);
+      await refresh();
+    } catch (e) {
+      toast.push(String(e), "error");
+    }
+  };
+
+  const openEditState = (s: State) => {
+    if (s.id === null) return;
+    setEditingState(s);
+    setEditStateName(s.name);
+  };
+
+  const submitEditState = async () => {
+    if (editingState === null || editingState.id === null) return;
+    const name = editStateName.trim();
+    if (!name) return;
+    try {
+      await Api.updateState(editingState.id, { name });
+      toast.push("State updated", "success");
+      setEditingState(null);
+      await refresh();
+    } catch (e) {
+      toast.push(String(e), "error");
+    }
+  };
+
+  const recaptureState = async (s: State) => {
+    if (s.id === null) return;
+    if (!confirm(`Replace "${s.name}" with the current rig state?`)) return;
+    try {
+      await Api.updateState(s.id, { recapture: true });
+      toast.push(`Re-captured "${s.name}"`, "success");
+      await refresh();
+    } catch (e) {
+      toast.push(String(e), "error");
+    }
+  };
+
+  const removeState = async (s: State) => {
+    if (s.id === null) return;
+    if (!confirm(`Delete state "${s.name}"?`)) return;
+    try {
+      await Api.deleteState(s.id);
+      await refresh();
+    } catch (e) {
+      toast.push(String(e), "error");
+    }
+  };
+
+  const applyState = async (s: State) => {
+    if (!confirm(`Apply "${s.name}" to every light on every controller?`))
+      return;
+    try {
+      if (s.id === null) {
+        await Api.applyBlackoutState();
+      } else {
+        await Api.applyState(s.id);
+      }
+      toast.push(`Applied "${s.name}"`, "success");
+      await refresh();
+    } catch (e) {
+      toast.push(String(e), "error");
+    }
+  };
+
   if (loading) {
     return <div className="text-muted">Loading...</div>;
   }
@@ -193,14 +298,93 @@ export default function Scenes() {
     <div className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-xl font-semibold">Scenes</h1>
+          <h1 className="text-xl font-semibold">Scenes &amp; States</h1>
           <p className="text-sm text-muted">
-            Snapshots of light state you can recall from the Lights page.
+            Rig-wide <span className="font-medium text-slate-100">States</span>{" "}
+            cover every light on every controller. Per-controller{" "}
+            <span className="font-medium text-slate-100">Scenes</span> live
+            under each controller below.
           </p>
         </div>
-        <button className="btn-primary" onClick={openCreate}>
-          Save current state…
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <button className="btn-secondary" onClick={openCreate}>
+            Save scene…
+          </button>
+          <button className="btn-primary" onClick={openCreateState}>
+            Save rig state…
+          </button>
+        </div>
+      </div>
+
+      <section className="space-y-2">
+        <header className="flex flex-wrap items-center gap-2">
+          <h2 className="text-sm font-semibold">Rig-wide states</h2>
+          <span className="pill">
+            {states.filter((s) => !s.builtin).length} saved
+          </span>
+        </header>
+        <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+          {states.length === 0 && (
+            <div className="card p-3 text-xs text-muted">
+              No states yet.
+            </div>
+          )}
+          {states.map((s) => (
+            <div
+              key={s.id === null ? "state-blackout" : `state-${s.id}`}
+              className="card flex items-center justify-between gap-2 p-3"
+            >
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="truncate font-medium">{s.name}</span>
+                  {s.builtin && (
+                    <span className="pill text-[10px]">built-in</span>
+                  )}
+                  <span className="pill text-[10px]">rig-wide</span>
+                </div>
+                <div className="mt-0.5 text-[11px] text-muted">
+                  {s.lights.length} light
+                  {s.lights.length === 1 ? "" : "s"} captured
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  className="btn-primary text-xs"
+                  onClick={() => applyState(s)}
+                >
+                  Apply
+                </button>
+                {!s.builtin && (
+                  <>
+                    <button
+                      className="btn-ghost text-xs"
+                      onClick={() => recaptureState(s)}
+                      title="Replace the snapshot with the current state"
+                    >
+                      Re-capture
+                    </button>
+                    <button
+                      className="btn-ghost text-xs"
+                      onClick={() => openEditState(s)}
+                    >
+                      Rename
+                    </button>
+                    <button
+                      className="btn-ghost text-xs text-rose-300 hover:bg-rose-950"
+                      onClick={() => removeState(s)}
+                    >
+                      Delete
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <div className="pt-2">
+        <h2 className="text-sm font-semibold">Per-controller scenes</h2>
       </div>
 
       {controllers.map((c) => {
@@ -426,6 +610,101 @@ export default function Scenes() {
             />
             Multi-controller scene
           </label>
+        </div>
+      </Modal>
+
+      <Modal
+        open={createStateOpen}
+        onClose={() => setCreateStateOpen(false)}
+        title="Save rig state"
+        footer={
+          <>
+            <button
+              className="btn-ghost"
+              onClick={() => setCreateStateOpen(false)}
+            >
+              Cancel
+            </button>
+            <button
+              className="btn-primary"
+              onClick={submitCreateState}
+              disabled={!createStateForm.name.trim()}
+            >
+              Save
+            </button>
+          </>
+        }
+      >
+        <p className="mb-3 text-sm text-muted">
+          Captures the current color, dimmer, and on/off state of{" "}
+          <span className="font-medium text-slate-100">every light</span> on
+          every controller.
+        </p>
+        <div className="space-y-3">
+          <div>
+            <label className="label mb-1 block !text-xs normal-case tracking-normal">
+              Name
+            </label>
+            <input
+              className="input w-full"
+              value={createStateForm.name}
+              autoFocus
+              placeholder="Showtime"
+              onChange={(e) =>
+                setCreateStateForm((f) => ({ ...f, name: e.target.value }))
+              }
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && createStateForm.name.trim()) {
+                  void submitCreateState();
+                }
+              }}
+            />
+          </div>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={createStateForm.fromRendered}
+              onChange={(e) =>
+                setCreateStateForm((f) => ({
+                  ...f,
+                  fromRendered: e.target.checked,
+                }))
+              }
+            />
+            Capture the live rendered output (freezes running effects)
+          </label>
+        </div>
+      </Modal>
+
+      <Modal
+        open={editingState !== null}
+        onClose={() => setEditingState(null)}
+        title={editingState ? `Rename "${editingState.name}"` : "Rename state"}
+        footer={
+          <>
+            <button className="btn-ghost" onClick={() => setEditingState(null)}>
+              Cancel
+            </button>
+            <button
+              className="btn-primary"
+              onClick={submitEditState}
+              disabled={!editStateName.trim()}
+            >
+              Save
+            </button>
+          </>
+        }
+      >
+        <div>
+          <label className="label mb-1 block !text-xs normal-case tracking-normal">
+            Name
+          </label>
+          <input
+            className="input w-full"
+            value={editStateName}
+            autoFocus
+            onChange={(e) => setEditStateName(e.target.value)}
+          />
         </div>
       </Modal>
     </div>

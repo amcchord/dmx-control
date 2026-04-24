@@ -8,6 +8,7 @@ const links = [
   { to: "/scenes", label: "Scenes" },
   { to: "/models", label: "Models" },
   { to: "/palettes", label: "Palettes" },
+  { to: "/api-docs", label: "API" },
 ];
 
 export default function Nav() {

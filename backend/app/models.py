@@ -127,3 +127,18 @@ class Scene(SQLModel, table=True):
     controller_id: int = Field(foreign_key="controller.id", index=True)
     cross_controller: bool = False
     lights: list[dict] = Field(default_factory=list, sa_column=Column(JSON))
+
+
+class State(SQLModel, table=True):
+    """A rig-wide snapshot of light state covering every controller.
+
+    States are conceptually similar to :class:`Scene` but are always
+    rig-wide: they capture every :class:`Light` in the system regardless
+    of which controller it lives on, and have no primary ``controller_id``.
+    ``lights`` has the same shape as ``Scene.lights`` - a list of dicts
+    mirroring the writable fields on :class:`Light` plus the ``light_id``
+    key used to restore."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    lights: list[dict] = Field(default_factory=list, sa_column=Column(JSON))

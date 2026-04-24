@@ -65,7 +65,7 @@ export default function ActiveEffectsBar({
   }
 
   return (
-    <div className="sticky top-0 z-20 -mx-2 flex flex-wrap items-center gap-2 rounded-lg bg-emerald-950/40 p-2 ring-1 ring-emerald-900/60 backdrop-blur sm:mx-0">
+    <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 rounded-lg bg-emerald-950/40 px-2 py-1.5 ring-1 ring-emerald-900/60">
       <div className="flex items-center gap-1.5 pl-1">
         <span className="relative inline-flex h-2 w-2">
           <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />

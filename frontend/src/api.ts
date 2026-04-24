@@ -475,6 +475,32 @@ export type SceneUpdateInput = {
   light_ids?: number[];
 };
 
+/** A rig-wide snapshot covering every light on every controller.
+ *
+ * Unlike `Scene`, a `State` has no primary `controller_id` - it always
+ * applies to the whole rig. `id` is null for the virtual Blackout entry
+ * (which always has `builtin: true`). */
+export type State = {
+  id: number | null;
+  name: string;
+  lights: SceneLightState[];
+  builtin: boolean;
+};
+
+export type StateCreateInput = {
+  name: string;
+  /** When true, capture from the live rendered DMX buffer instead of the
+   * DB state. Useful for freezing an effect's current output. */
+  from_rendered?: boolean;
+};
+
+export type StateUpdateInput = {
+  name?: string;
+  /** When true, re-capture the snapshot from the current state. */
+  recapture?: boolean;
+  from_rendered?: boolean;
+};
+
 export const Api = {
   login: (password: string) =>
     api.post<AuthStatus>("/api/auth/login", { password }),
@@ -594,6 +620,17 @@ export const Api = {
     api.post<{ ok: boolean; applied: number }>(
       `/api/scenes/blackout/${controllerId}/apply`,
     ),
+
+  listStates: () => api.get<State[]>(`/api/states`),
+  createState: (body: StateCreateInput) =>
+    api.post<State>(`/api/states`, body),
+  updateState: (id: number, body: StateUpdateInput) =>
+    api.patch<State>(`/api/states/${id}`, body),
+  deleteState: (id: number) => api.del<void>(`/api/states/${id}`),
+  applyState: (id: number) =>
+    api.post<{ ok: boolean; applied: number }>(`/api/states/${id}/apply`),
+  applyBlackoutState: () =>
+    api.post<{ ok: boolean; applied: number }>(`/api/states/blackout/apply`),
 
   aiStatus: () => api.get<AiStatus>("/api/ai/status"),
   parseManual: (

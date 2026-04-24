@@ -14,6 +14,7 @@ import {
   PaletteSpread,
   RenderedLight,
   Scene,
+  State,
 } from "../api";
 import { useToast } from "../toast";
 import ActiveEffectsBar from "../components/ActiveEffectsBar";
@@ -102,6 +103,7 @@ export default function Dashboard() {
   const [effects, setEffects] = useState<Effect[]>([]);
   const [activeEffects, setActiveEffects] = useState<ActiveEffect[]>([]);
   const [scenes, setScenes] = useState<Scene[]>([]);
+  const [states, setStates] = useState<State[]>([]);
   const [saveScenePrompt, setSaveScenePrompt] = useState<Controller | null>(
     null,
   );
@@ -112,6 +114,11 @@ export default function Dashboard() {
   const [sceneSelection, setSceneSelection] = useState<Record<number, string>>(
     {},
   );
+  // Global dropdown selection for the rig-wide "State" picker. Values are
+  // state ids as strings, or "__blackout__" for rig-wide blackout.
+  const [stateSelection, setStateSelection] = useState<string>("");
+  const [saveStateOpen, setSaveStateOpen] = useState(false);
+  const [saveStateName, setSaveStateName] = useState("");
   const [rendered, setRendered] = useState<Record<number, RenderedLight>>({});
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<Selection>(new Map());
@@ -130,13 +137,14 @@ export default function Dashboard() {
 
   const refresh = async () => {
     try {
-      const [c, m, l, p, e, sc] = await Promise.all([
+      const [c, m, l, p, e, sc, st] = await Promise.all([
         Api.listControllers(),
         Api.listModels(),
         Api.listLights(),
         Api.listPalettes(),
         Api.listEffects(),
         Api.listScenes(),
+        Api.listStates(),
       ]);
       setControllers(c);
       setModels(m);
@@ -144,6 +152,7 @@ export default function Dashboard() {
       setPalettes(p);
       setEffects(e);
       setScenes(sc);
+      setStates(st);
     } catch (e) {
       toast.push(String(e), "error");
     } finally {
@@ -153,8 +162,9 @@ export default function Dashboard() {
 
   const refreshScenes = async () => {
     try {
-      const sc = await Api.listScenes();
+      const [sc, st] = await Promise.all([Api.listScenes(), Api.listStates()]);
       setScenes(sc);
+      setStates(st);
     } catch (e) {
       toast.push(String(e), "error");
     }
@@ -338,6 +348,13 @@ export default function Dashboard() {
     for (const l of lights) next.set(l.id, "all");
     setSelected(next);
   };
+  const selectAllOnController = (controllerId: number) => {
+    const next: Selection = new Map();
+    for (const l of lights) {
+      if (l.controller_id === controllerId) next.set(l.id, "all");
+    }
+    setSelected(next);
+  };
   const clearSelection = () => setSelected(new Map());
 
   const openPickerFor = (light: Light) => {
@@ -453,6 +470,45 @@ export default function Dashboard() {
     }
   };
 
+  const applySelectedState = async () => {
+    if (!stateSelection) return;
+    try {
+      if (stateSelection === "__blackout__") {
+        await Api.applyBlackoutState();
+        toast.push("All controllers blacked out", "success");
+      } else {
+        const id = Number(stateSelection);
+        if (!Number.isFinite(id)) return;
+        const state = states.find((s) => s.id === id);
+        const label = state?.name ?? `state ${id}`;
+        await Api.applyState(id);
+        toast.push(`Applied "${label}"`, "success");
+      }
+      await refresh();
+    } catch (e) {
+      toast.push(String(e), "error");
+    }
+  };
+
+  const openSaveState = () => {
+    setSaveStateName("");
+    setSaveStateOpen(true);
+  };
+
+  const saveState = async () => {
+    const name = saveStateName.trim();
+    if (!name) return;
+    try {
+      await Api.createState({ name });
+      toast.push(`Saved state "${name}"`, "success");
+      setSaveStateOpen(false);
+      setSaveStateName("");
+      await refreshScenes();
+    } catch (e) {
+      toast.push(String(e), "error");
+    }
+  };
+
   const applyPalette = async (p: Palette) => {
     const ids = selLightIds(selected);
     if (ids.length === 0) {
@@ -486,6 +542,16 @@ export default function Dashboard() {
   const bulkLabel = selectionPartial
     ? `Set color (${selectedLights}L • ${selectedZones}z)`
     : `Set color (${selectedLights})`;
+  let selectionSummary = "none selected";
+  if (selected.size > 0) {
+    const lightWord = `${selectedLights} light${selectedLights === 1 ? "" : "s"}`;
+    if (selectionPartial) {
+      const zoneWord = `${selectedZones} zone${selectedZones === 1 ? "" : "s"}`;
+      selectionSummary = `${lightWord} · ${zoneWord}`;
+    } else {
+      selectionSummary = lightWord;
+    }
+  }
 
   if (loading) {
     return <div className="text-muted">Loading...</div>;
@@ -513,57 +579,114 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h1 className="text-xl font-semibold">Lights</h1>
-          <p className="text-sm text-muted">
-            {lights.length} lights across {controllers.length} controller
-            {controllers.length === 1 ? "" : "s"}.
-          </p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <button className="btn-secondary" onClick={selectAll}>
+      <div>
+        <h1 className="text-xl font-semibold">Lights</h1>
+        <p className="text-sm text-muted">
+          {lights.length} lights across {controllers.length} controller
+          {controllers.length === 1 ? "" : "s"}.
+        </p>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="flex items-center gap-2 rounded-lg bg-bg-elev px-2 py-1.5 ring-1 ring-line">
+          <span className="pl-1 text-[10px] uppercase tracking-wider text-muted">
+            Selection
+          </span>
+          <button className="btn-secondary text-xs" onClick={selectAll}>
             Select all
           </button>
           <button
-            className="btn-secondary"
+            className="btn-secondary text-xs"
             onClick={clearSelection}
             disabled={selected.size === 0}
           >
-            Clear selection
+            Clear
           </button>
+          <span className="px-1 text-xs text-muted">{selectionSummary}</span>
           <button
-            className="btn-primary"
+            className="btn-primary text-xs"
             onClick={openBulkPicker}
             disabled={selected.size === 0}
+            title="Set a single color on the current selection"
           >
             {bulkLabel}
           </button>
           <button
-            className="btn-secondary"
+            className="btn-secondary text-xs"
             onClick={() => setShowPalettes(true)}
             disabled={selected.size === 0}
+            title="Spread a palette across the current selection"
           >
             Apply palette
           </button>
-          <button
-            className="btn-primary"
-            onClick={() => setShowEffects(true)}
-            disabled={selected.size === 0}
+        </div>
+
+        <div className="flex items-center gap-2 rounded-lg bg-bg-elev px-2 py-1.5 ring-1 ring-line sm:ml-auto">
+          <span className="pl-1 text-[10px] uppercase tracking-wider text-muted">
+            Rig state
+          </span>
+          <select
+            className="input !h-7 w-40 !py-0.5 !text-xs"
+            value={stateSelection}
+            onChange={(e) => setStateSelection(e.target.value)}
+            title="Pick a rig-wide state to apply to every light on every controller"
           >
-            Effects{activeEffects.length > 0 ? ` (${activeEffects.length} live)` : "..."}
+            <option value="" disabled>
+              Select…
+            </option>
+            {states.map((s) => {
+              const value = s.id === null ? "__blackout__" : String(s.id);
+              return (
+                <option
+                  key={s.id === null ? "blackout" : `state-${s.id}`}
+                  value={value}
+                >
+                  {s.name}
+                </option>
+              );
+            })}
+          </select>
+          <button
+            className="btn-primary text-xs"
+            onClick={applySelectedState}
+            disabled={!stateSelection}
+            title="Apply the selected rig state"
+          >
+            Apply
+          </button>
+          <button
+            className="btn-ghost text-xs"
+            onClick={openSaveState}
+            title="Capture the current state of every light as a rig-wide state"
+          >
+            Save
           </button>
         </div>
       </div>
 
-      <ActiveEffectsBar
-        activeEffects={activeEffects}
-        onChanged={async () => {
-          await refreshActive();
-          await refreshEffects();
-        }}
-        notify={(msg, kind) => toast.push(msg, kind)}
-      />
+      <div className="flex flex-wrap items-stretch gap-3">
+        <div className="flex items-center gap-2 rounded-lg bg-bg-elev px-2 py-1.5 ring-1 ring-line">
+          <span className="pl-1 text-[10px] uppercase tracking-wider text-muted">
+            Effect controls
+          </span>
+          <button
+            className="btn-primary text-xs"
+            onClick={() => setShowEffects(true)}
+            disabled={selected.size === 0}
+            title="Run a dynamic effect on the current selection"
+          >
+            Effects{activeEffects.length > 0 ? ` (${activeEffects.length} live)` : "..."}
+          </button>
+        </div>
+        <ActiveEffectsBar
+          activeEffects={activeEffects}
+          onChanged={async () => {
+            await refreshActive();
+            await refreshEffects();
+          }}
+          notify={(msg, kind) => toast.push(msg, kind)}
+        />
+      </div>
 
       {groupedLights.map(({ controller, lights: clights }) => {
         const savedScenes = scenesByController.get(controller.id) ?? [];
@@ -581,6 +704,13 @@ export default function Dashboard() {
               )}
             </div>
             <div className="flex flex-nowrap items-center gap-2">
+              <button
+                className="btn-ghost text-xs"
+                onClick={() => selectAllOnController(controller.id)}
+                title={`Select every light on ${controller.name}`}
+              >
+                Select all
+              </button>
               <select
                 className="input !h-8 w-36 !py-1 !text-xs"
                 value={sceneSelection[controller.id] ?? ""}
@@ -842,6 +972,50 @@ export default function Dashboard() {
           onKeyDown={(e) => {
             if (e.key === "Enter" && saveSceneName.trim()) {
               void saveScene();
+            }
+          }}
+        />
+      </Modal>
+
+      <Modal
+        open={saveStateOpen}
+        onClose={() => setSaveStateOpen(false)}
+        title="Save rig state"
+        footer={
+          <>
+            <button
+              className="btn-ghost"
+              onClick={() => setSaveStateOpen(false)}
+            >
+              Cancel
+            </button>
+            <button
+              className="btn-primary"
+              onClick={saveState}
+              disabled={!saveStateName.trim()}
+            >
+              Save
+            </button>
+          </>
+        }
+      >
+        <p className="mb-3 text-sm text-muted">
+          Captures the current color, dimmer, and on/off state of{" "}
+          <span className="font-medium text-slate-100">every light</span> on
+          every controller.
+        </p>
+        <label className="label mb-1 block !text-xs normal-case tracking-normal">
+          Name
+        </label>
+        <input
+          className="input w-full"
+          value={saveStateName}
+          autoFocus
+          placeholder="Showtime"
+          onChange={(e) => setSaveStateName(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && saveStateName.trim()) {
+              void saveState();
             }
           }}
         />

@@ -36,6 +36,19 @@ a Caddy + systemd deployment that fronts everything at
   re-capture, delete, and cross-controller management. Applying a scene
   stops any running effect that covers the affected lights so the
   restored state actually sticks.
+- Save and recall named **rig states** — always rig-wide snapshots
+  covering every light on every controller. The Lights page toolbar has
+  a dedicated `Rig state` picker (with a built-in `Blackout all` entry)
+  plus an inline `Save` button to capture the whole rig in one click,
+  and the `/scenes` page has a sibling section for rename, re-capture,
+  and delete.
+- The **Lights page toolbar** is organized into three labeled groups
+  — `Selection` (select all / clear / counter / set color / apply
+  palette), `Rig state` (right-floated picker + apply/save), and
+  `Effect controls` (the Effects dialog trigger, with any currently
+  running effects shown inline on the same row). Each controller's
+  header also has a `Select all` button for grabbing every light on
+  that one controller.
 - Single shared password ("secretsauce" by default) via a signed session
   cookie.
 - Everything persists to SQLite and is restored to the physical rig on
@@ -209,6 +222,30 @@ controller in `GET /api/scenes` so the UI can render one uniform list.
 
 `from_rendered=true` captures the live DMX output (useful for freezing a
 running effect) instead of the DB base state.
+
+### Rig states (`/api/states`)
+
+Rig-wide snapshots covering every light on every controller. Unlike
+Scenes, States have no primary `controller_id` — applying one always
+touches the whole rig. A virtual `Blackout all` entry is synthesized in
+`GET /api/states` so the UI can render one uniform list.
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/states` | — | `State[]` |
+| POST | `/api/states` | `StateCreate` | `State` |
+| PATCH | `/api/states/{id}` | `StateUpdate` | `State` |
+| DELETE | `/api/states/{id}` | — | 204 |
+| POST | `/api/states/{id}/apply` | — | `{ok, applied}` |
+| POST | `/api/states/blackout/apply` | — | `{ok, applied}` |
+
+```json
+// StateCreate
+{ "name": "Showtime", "from_rendered": false }
+
+// StateUpdate (all fields optional)
+{ "name": "Renamed", "recapture": true, "from_rendered": false }
+```
 
 ### State (`/api/state`)
 

@@ -28,6 +28,12 @@ from ..schemas import (
     SceneOut,
     SceneUpdate,
 )
+from ._capture import (
+    apply_state_to_light,
+    capture_lights,
+    push_light,
+    select_scene_lights,
+)
 
 router = APIRouter(prefix="/api/scenes", tags=["scenes"], dependencies=[AuthDep])
 
@@ -35,52 +41,6 @@ router = APIRouter(prefix="/api/scenes", tags=["scenes"], dependencies=[AuthDep]
 # ---------------------------------------------------------------------------
 # Serialization helpers
 # ---------------------------------------------------------------------------
-def _light_to_state(light: Light) -> SceneLightState:
-    return SceneLightState(
-        light_id=light.id,
-        r=int(light.r or 0),
-        g=int(light.g or 0),
-        b=int(light.b or 0),
-        w=int(light.w or 0),
-        a=int(light.a or 0),
-        uv=int(light.uv or 0),
-        dimmer=int(light.dimmer if light.dimmer is not None else 255),
-        on=bool(light.on),
-        zone_state=dict(light.zone_state or {}),
-        motion_state=dict(light.motion_state or {}),
-    )
-
-
-def _state_from_rendered(light: Light, rendered: dict) -> SceneLightState:
-    """Merge the live rendered RGB+on with the light's DB w/a/uv/dimmer.
-
-    The rendered snapshot is decoded from the universe buffer, so it only
-    includes r/g/b/on (flat + per-zone). We keep the white/amber/uv/dimmer
-    fields from the DB since they aren't reconstructable from the wire."""
-    info = rendered.get(light.id) or {}
-    zs_out: dict[str, dict] = {}
-    for zid, z in (info.get("zone_state") or {}).items():
-        zs_out[zid] = {
-            "r": int(z.get("r", 0)),
-            "g": int(z.get("g", 0)),
-            "b": int(z.get("b", 0)),
-            "on": bool(z.get("on", True)),
-        }
-    return SceneLightState(
-        light_id=light.id,
-        r=int(info.get("r", light.r or 0)),
-        g=int(info.get("g", light.g or 0)),
-        b=int(info.get("b", light.b or 0)),
-        w=int(light.w or 0),
-        a=int(light.a or 0),
-        uv=int(light.uv or 0),
-        dimmer=int(light.dimmer if light.dimmer is not None else 255),
-        on=bool(info.get("on", light.on)),
-        zone_state=zs_out or dict(light.zone_state or {}),
-        motion_state=dict(light.motion_state or {}),
-    )
-
-
 def _row_to_out(row: Scene) -> SceneOut:
     return SceneOut(
         id=row.id,
@@ -111,23 +71,6 @@ def _virtual_blackout(controller: Controller) -> SceneOut:
 # ---------------------------------------------------------------------------
 # Capture helpers
 # ---------------------------------------------------------------------------
-def _select_lights(
-    sess: Session,
-    *,
-    controller_id: int,
-    cross_controller: bool,
-    light_ids: Optional[list[int]],
-) -> list[Light]:
-    """Resolve the set of Light rows to capture for a scene."""
-    stmt = select(Light)
-    if light_ids is not None and len(light_ids) > 0:
-        stmt = stmt.where(Light.id.in_(light_ids))
-    elif not cross_controller:
-        stmt = stmt.where(Light.controller_id == controller_id)
-    # else: every light at all
-    return list(sess.exec(stmt).all())
-
-
 def _capture(
     sess: Session,
     *,
@@ -136,49 +79,13 @@ def _capture(
     light_ids: Optional[list[int]],
     from_rendered: bool,
 ) -> list[dict]:
-    lights = _select_lights(
+    lights = select_scene_lights(
         sess,
         controller_id=controller_id,
         cross_controller=cross_controller,
         light_ids=light_ids,
     )
-    if from_rendered:
-        rendered = manager.snapshot_rendered()
-        states = [_state_from_rendered(l, rendered) for l in lights]
-    else:
-        states = [_light_to_state(l) for l in lights]
-    return [s.model_dump() for s in states]
-
-
-def _apply_state_to_light(light: Light, state: dict) -> None:
-    light.r = int(state.get("r", 0))
-    light.g = int(state.get("g", 0))
-    light.b = int(state.get("b", 0))
-    light.w = int(state.get("w", 0))
-    light.a = int(state.get("a", 0))
-    light.uv = int(state.get("uv", 0))
-    light.dimmer = int(state.get("dimmer", 255))
-    light.on = bool(state.get("on", True))
-    light.zone_state = dict(state.get("zone_state") or {})
-    light.motion_state = dict(state.get("motion_state") or {})
-
-
-def _push_light(light: Light) -> None:
-    manager.set_light_state(
-        light.id,
-        {
-            "r": light.r,
-            "g": light.g,
-            "b": light.b,
-            "w": light.w,
-            "a": light.a,
-            "uv": light.uv,
-            "dimmer": light.dimmer,
-            "on": light.on,
-            "zone_state": dict(light.zone_state or {}),
-            "motion_state": dict(light.motion_state or {}),
-        },
-    )
+    return capture_lights(lights, from_rendered=from_rendered)
 
 
 # ---------------------------------------------------------------------------
@@ -316,12 +223,12 @@ def apply_scene(sid: int, sess: Session = Depends(get_session)) -> dict:
         entry = by_id.get(light.id)
         if entry is None:
             continue
-        _apply_state_to_light(light, entry)
+        apply_state_to_light(light, entry)
         sess.add(light)
         applied += 1
     sess.commit()
     for light in lights:
-        _push_light(light)
+        push_light(light)
     return {"ok": True, "applied": applied}
 
 

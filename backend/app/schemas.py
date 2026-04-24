@@ -590,6 +590,63 @@ class SceneOut(BaseModel):
     builtin: bool = False
 
 
+class StateCreate(BaseModel):
+    """Save the current state of the entire rig.
+
+    A State is a snapshot of every light on every controller. When
+    ``from_rendered`` is true, the snapshot is built from the live
+    rendered Art-Net buffer rather than the DB (useful when an effect is
+    running and the user wants to freeze the visible output)."""
+
+    name: str
+    from_rendered: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("name must be non-empty")
+        if len(s) > 128:
+            raise ValueError("name too long")
+        return s
+
+
+class StateUpdate(BaseModel):
+    """Rename or re-capture an existing rig-wide state."""
+
+    name: Optional[str] = None
+    recapture: bool = False
+    from_rendered: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        s = v.strip()
+        if not s:
+            raise ValueError("name must be non-empty")
+        if len(s) > 128:
+            raise ValueError("name too long")
+        return s
+
+
+class StateOut(BaseModel):
+    """Serialized rig-wide state.
+
+    ``id`` is nullable so that virtual built-ins (Blackout all) can ride
+    on the same shape without a persisted row. Virtual entries always
+    have ``builtin=True``."""
+
+    model_config = _BASE_CONFIG
+
+    id: Optional[int] = None
+    name: str
+    lights: list[SceneLightState] = Field(default_factory=list)
+    builtin: bool = False
+
+
 class ApplyPaletteRequest(BaseModel):
     light_ids: list[int]
     mode: Literal["cycle", "random", "gradient"] = "cycle"
