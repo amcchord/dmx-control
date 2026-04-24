@@ -52,6 +52,14 @@ class LightModelMode(SQLModel, table=True):
     layout: Optional[dict] = Field(
         default=None, sa_column=Column(JSON, nullable=True)
     )
+    # Per-role policy for the auxiliary color channels W / A / UV.
+    # Keys are a subset of {"w","a","uv"} and values are either "mix" (the
+    # channel's value is derived from RGB by the renderer when unspecified,
+    # matching the historical default) or "direct" (the channel is treated
+    # as an independent fader — never auto-derived, never overwritten by
+    # palette painting or effect RGB blending). Missing keys imply "mix"
+    # so existing rows behave identically after the migration.
+    color_policy: dict = Field(default_factory=dict, sa_column=Column(JSON))
 
 
 class Light(SQLModel, table=True):

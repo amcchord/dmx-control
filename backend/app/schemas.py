@@ -28,6 +28,46 @@ CHANNEL_ROLES = {
     "other",
 }
 
+# Roles whose W/A/UV "mix vs direct" behavior can be configured per mode.
+# "mix" (default) = derive the channel's value from RGB when the state
+# dict omits it (today's behavior: w = min(r,g,b), a = min(r,g)//2,
+# uv = 0). "direct" = never auto-derive; the channel is an independent
+# fader controllable via the API / Dashboard sliders and must be set
+# explicitly (defaults to 0 otherwise). Palette paint and effect RGB
+# blending also skip "direct" roles so the user's explicit value is
+# preserved.
+POLICY_ROLES = {"w", "a", "uv"}
+CHANNEL_POLICIES = {"mix", "direct"}
+
+
+def _normalize_color_policy(
+    policy: Optional[dict], channels: list[str]
+) -> dict[str, str]:
+    """Validate and clamp a color_policy dict to the modes it applies to.
+
+    Keys not in :data:`POLICY_ROLES` and keys whose role isn't present in
+    the mode's channel list are silently dropped (they'd have no effect at
+    render time anyway). Unknown values raise :class:`ValueError`.
+    """
+    if not policy:
+        return {}
+    if not isinstance(policy, dict):
+        raise ValueError("color_policy must be a dict")
+    present = set(channels)
+    out: dict[str, str] = {}
+    for role, mode in policy.items():
+        if role not in POLICY_ROLES:
+            continue
+        if role not in present:
+            continue
+        if mode not in CHANNEL_POLICIES:
+            raise ValueError(
+                f"invalid color_policy for '{role}': {mode!r} "
+                f"(expected one of {sorted(CHANNEL_POLICIES)})"
+            )
+        out[role] = mode
+    return out
+
 
 def _validate_channel_list(v: list[str]) -> list[str]:
     if not v:
@@ -114,6 +154,8 @@ class LightModelModeIn(BaseModel):
     is_default: bool = False
     # Optional compound-fixture overlay. Stored as-is in the mode row.
     layout: Optional[dict] = None
+    # Per-role W/A/UV policy — see :func:`_normalize_color_policy`.
+    color_policy: Optional[dict] = None
 
     @field_validator("name")
     @classmethod
@@ -130,6 +172,13 @@ class LightModelModeIn(BaseModel):
     def _channels(cls, v: list[str]) -> list[str]:
         return _validate_channel_list(v)
 
+    @model_validator(mode="after")
+    def _normalize_policy(self) -> "LightModelModeIn":
+        self.color_policy = _normalize_color_policy(
+            self.color_policy, self.channels
+        )
+        return self
+
 
 class LightModelModeOut(BaseModel):
     id: int
@@ -138,6 +187,7 @@ class LightModelModeOut(BaseModel):
     channel_count: int
     is_default: bool
     layout: Optional[dict] = None
+    color_policy: dict[str, str] = Field(default_factory=dict)
 
 
 class LightModelIn(BaseModel):

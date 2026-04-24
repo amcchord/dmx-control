@@ -7,6 +7,7 @@ import Dashboard from "./pages/Dashboard";
 import Controllers from "./pages/Controllers";
 import ControllerDetail from "./pages/ControllerDetail";
 import Models from "./pages/Models";
+import ModelEditor from "./pages/ModelEditor";
 import Palettes from "./pages/Palettes";
 import Scenes from "./pages/Scenes";
 import Designer from "./pages/Designer";
@@ -82,6 +83,26 @@ export default function App() {
               <Protected>
                 <Layout>
                   <Models />
+                </Layout>
+              </Protected>
+            }
+          />
+          <Route
+            path="/models/new"
+            element={
+              <Protected>
+                <Layout>
+                  <ModelEditor />
+                </Layout>
+              </Protected>
+            }
+          />
+          <Route
+            path="/models/:id/edit"
+            element={
+              <Protected>
+                <Layout>
+                  <ModelEditor />
                 </Layout>
               </Protected>
             }

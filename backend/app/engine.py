@@ -336,9 +336,10 @@ class EffectEngine:
             zone_ids = set(
                 zone_ids_for_light(light, self._modes_by_id)
             )
+            policy = self._policy_for_light(light)
             for overlay, fade_weight in contributions:
                 state = merge_overlay_into_state(
-                    state, overlay, zone_ids, fade_weight
+                    state, overlay, zone_ids, fade_weight, policy
                 )
             manager.set_light_state_deferred(lid, state)
 
@@ -398,6 +399,20 @@ class EffectEngine:
             "zone_state": dict(light.zone_state or {}),
             "motion_state": dict(light.motion_state or {}),
         }
+
+    def _policy_for_light(self, light: Light) -> dict:
+        """Resolve the W/A/UV ``color_policy`` from the light's mode.
+
+        Returns an empty dict when the mode is missing or has no policy
+        set, matching the "mix" default."""
+        if light.mode_id is None:
+            return {}
+        mode = self._modes_by_id.get(light.mode_id)
+        if mode is None:
+            return {}
+        if isinstance(mode.color_policy, dict):
+            return dict(mode.color_policy)
+        return {}
 
     def _restore_all_and_flush(self) -> None:
         """Engine shutdown: push base state for every light we ever touched."""

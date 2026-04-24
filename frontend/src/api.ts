@@ -212,6 +212,14 @@ export type FixtureLayout = {
   globals?: FixtureGlobals | null;
 };
 
+/** W/A/UV channel policy — "mix" (derive from RGB when unspecified) or
+ * "direct" (independent fader; never auto-derived and not overwritten by
+ * palette paint / effect RGB blending). Roles not present in the mode's
+ * channel list are silently dropped server-side. */
+export type PolicyRole = "w" | "a" | "uv";
+export type ChannelPolicy = "mix" | "direct";
+export type ColorPolicy = Partial<Record<PolicyRole, ChannelPolicy>>;
+
 export type LightModelMode = {
   id: number;
   name: string;
@@ -219,6 +227,7 @@ export type LightModelMode = {
   channel_count: number;
   is_default: boolean;
   layout?: FixtureLayout | null;
+  color_policy?: ColorPolicy;
 };
 
 export type LightModelModeInput = {
@@ -227,6 +236,7 @@ export type LightModelModeInput = {
   channels: string[];
   is_default: boolean;
   layout?: FixtureLayout | null;
+  color_policy?: ColorPolicy;
 };
 
 export type LightModel = {

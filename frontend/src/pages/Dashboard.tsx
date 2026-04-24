@@ -12,6 +12,7 @@ import {
   LightModelMode,
   Palette,
   PaletteSpread,
+  PolicyRole,
   RenderedLight,
   Scene,
   State,
@@ -243,8 +244,8 @@ export default function Dashboard() {
     return m;
   }, [controllers]);
 
-  const layoutByLightId = useMemo(() => {
-    const map = new Map<number, FixtureLayout | null>();
+  const modeByLightId = useMemo(() => {
+    const map = new Map<number, LightModelMode | undefined>();
     for (const l of lights) {
       const m = modelById.get(l.model_id);
       let mode: LightModelMode | undefined;
@@ -253,12 +254,35 @@ export default function Dashboard() {
         if (!mode) mode = m.modes.find((x) => x.is_default);
         if (!mode) mode = m.modes[0];
       }
-      map.set(l.id, mode?.layout ?? null);
+      map.set(l.id, mode);
     }
     return map;
   }, [lights, modelById]);
 
+  const layoutByLightId = useMemo(() => {
+    const map = new Map<number, FixtureLayout | null>();
+    for (const l of lights) {
+      map.set(l.id, modeByLightId.get(l.id)?.layout ?? null);
+    }
+    return map;
+  }, [lights, modeByLightId]);
+
   const layoutOf = (lightId: number) => layoutByLightId.get(lightId) ?? null;
+
+  /** Roles marked "direct" on this light's mode *and* actually present in
+   * the channel list. For "direct" roles we expose a Dashboard slider so
+   * the user can drive W / A / UV independently of the RGB mix. */
+  const directRolesFor = (lightId: number): PolicyRole[] => {
+    const mode = modeByLightId.get(lightId);
+    if (!mode) return [];
+    const policy = mode.color_policy ?? {};
+    const channels = new Set(mode.channels);
+    const out: PolicyRole[] = [];
+    for (const role of ["w", "a", "uv"] as PolicyRole[]) {
+      if (channels.has(role) && policy[role] === "direct") out.push(role);
+    }
+    return out;
+  };
 
   const groupedLights = useMemo(() => {
     const byCtrl = new Map<number, Light[]>();
@@ -840,6 +864,24 @@ export default function Dashboard() {
             commitColor(hex);
           }}
         />
+        <DirectChannelSliders
+          pickerFor={pickerFor}
+          lights={lights}
+          directRolesFor={directRolesFor}
+          onCommit={async (lightId, patch, zoneId) => {
+            try {
+              const updated = await Api.setColor(lightId, {
+                ...patch,
+                zone_id: zoneId ?? null,
+              });
+              setLights((prev) =>
+                prev.map((l) => (l.id === lightId ? updated : l)),
+              );
+            } catch (e) {
+              toast.push(String(e), "error");
+            }
+          }}
+        />
       </Modal>
 
       <Modal
@@ -1041,6 +1083,136 @@ function pickerTitle(
   }
   if (picker.kind === "zone") return `Set zone color — ${picker.zoneId}`;
   return "Set light color";
+}
+
+const DIRECT_ROLE_META: Record<
+  PolicyRole,
+  { label: string; swatch: string; help: string }
+> = {
+  w: {
+    label: "White",
+    swatch: "#f5f5f5",
+    help: "White LED fader (not mixed from RGB).",
+  },
+  a: {
+    label: "Amber",
+    swatch: "#ffb23d",
+    help: "Amber LED fader (not mixed from RGB).",
+  },
+  uv: {
+    label: "UV",
+    swatch: "#b44dff",
+    help: "Ultraviolet LED fader.",
+  },
+};
+
+/** Extra sliders rendered inside the color picker modal for any W/A/UV
+ * role that the light's mode marks as "direct". For zone pickers we
+ * edit the current zone_state entry; for single-light pickers we edit
+ * the flat fields on the light. Bulk selections are skipped since the
+ * lights may not share a compatible policy.
+ *
+ * Props are all pulled up from the parent rather than hooking into it
+ * directly so the picker modal stays a dumb, stateless consumer. */
+function DirectChannelSliders({
+  pickerFor,
+  lights,
+  directRolesFor,
+  onCommit,
+}: {
+  pickerFor:
+    | { kind: "light"; id: number }
+    | { kind: "zone"; lightId: number; zoneId: string }
+    | { kind: "bulk" }
+    | null;
+  lights: Light[];
+  directRolesFor: (lightId: number) => PolicyRole[];
+  onCommit: (
+    lightId: number,
+    patch: { r: number; g: number; b: number; w?: number; a?: number; uv?: number },
+    zoneId?: string,
+  ) => void | Promise<void>;
+}) {
+  if (!pickerFor || pickerFor.kind === "bulk") return null;
+
+  const lightId =
+    pickerFor.kind === "light" ? pickerFor.id : pickerFor.lightId;
+  const zoneId =
+    pickerFor.kind === "zone" ? pickerFor.zoneId : undefined;
+
+  const light = lights.find((l) => l.id === lightId);
+  if (!light) return null;
+
+  const roles = directRolesFor(lightId);
+  if (roles.length === 0) return null;
+
+  // Resolve the current value for a role from the right source: the zone
+  // state for zone pickers, the flat fields for light pickers.
+  const readValue = (role: PolicyRole): number => {
+    if (zoneId) {
+      const zs = (light.zone_state ?? {})[zoneId] ?? {};
+      const v = zs[role];
+      if (typeof v === "number") return v;
+      return light[role];
+    }
+    return light[role];
+  };
+
+  // Build the RGB basis to send with the partial update. Palette / zone
+  // RGB falls back to the flat RGB exactly the way the backend does.
+  const readRgb = (): { r: number; g: number; b: number } => {
+    if (zoneId) {
+      const zs = (light.zone_state ?? {})[zoneId] ?? {};
+      return {
+        r: typeof zs.r === "number" ? zs.r : light.r,
+        g: typeof zs.g === "number" ? zs.g : light.g,
+        b: typeof zs.b === "number" ? zs.b : light.b,
+      };
+    }
+    return { r: light.r, g: light.g, b: light.b };
+  };
+
+  return (
+    <div className="mt-3 space-y-2 rounded-md bg-bg-elev p-2 ring-1 ring-line">
+      <div className="flex items-center justify-between text-[11px] uppercase tracking-wider text-muted">
+        <span>Direct channels</span>
+        <span>
+          {zoneId ? "zone" : "light"} ·{" "}
+          {roles.map((r) => r.toUpperCase()).join(" / ")}
+        </span>
+      </div>
+      {roles.map((role) => {
+        const meta = DIRECT_ROLE_META[role];
+        const value = readValue(role);
+        return (
+          <label key={role} className="flex items-center gap-2 text-sm">
+            <span
+              className="h-3 w-3 rounded-full ring-1 ring-line"
+              style={{ background: meta.swatch }}
+            />
+            <span className="w-16 text-xs text-slate-300" title={meta.help}>
+              {meta.label}
+            </span>
+            <input
+              type="range"
+              min={0}
+              max={255}
+              value={value}
+              onChange={(e) => {
+                const next = Number(e.target.value);
+                const rgb = readRgb();
+                onCommit(lightId, { ...rgb, [role]: next }, zoneId);
+              }}
+              className="flex-1 accent-accent"
+            />
+            <span className="w-10 text-right font-mono text-xs tabular-nums text-muted">
+              {value}
+            </span>
+          </label>
+        );
+      })}
+    </div>
+  );
 }
 
 function LightCard({

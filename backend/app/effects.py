@@ -511,15 +511,20 @@ def merge_overlay_into_state(
     overlay: LightOverlay,
     zone_ids: Iterable[str],
     fade_weight: float,
+    color_policy: dict | None = None,
 ) -> dict:
     """Produce a rendered state dict for one light.
 
     ``base_state`` is the light's current DB-backed state (flat r/g/b/w/a/uv
     + zone_state + motion_state). ``fade_weight`` is the effect's current
     fade-in/out envelope in [0, 1]. The result has the same shape the
-    ArtNet renderer expects."""
+    ArtNet renderer expects. ``color_policy`` is the mode's W/A/UV policy:
+    roles marked ``"direct"`` are treated as independent faders and the
+    effect RGB is NOT blended into them so the user's explicit W/A/UV
+    value is preserved through the effect."""
     out = dict(base_state)
     zone_state = dict(base_state.get("zone_state") or {})
+    policy = color_policy or {}
 
     def _mix(a: int, b: int, w: float) -> int:
         w = max(0.0, min(1.0, w))
@@ -534,10 +539,11 @@ def merge_overlay_into_state(
         out["r"] = _mix(int(base_state.get("r", 0)), int(r * 1.0), eff)
         out["g"] = _mix(int(base_state.get("g", 0)), int(g * 1.0), eff)
         out["b"] = _mix(int(base_state.get("b", 0)), int(b * 1.0), eff)
-        # Derive w/a if not explicitly held by base.
-        if base_state.get("w") is not None:
+        # Derive w/a if not explicitly held by base (and not marked as a
+        # direct, user-controlled channel).
+        if base_state.get("w") is not None and policy.get("w") != "direct":
             out["w"] = _mix(int(base_state.get("w", 0)), min(r, g, b), eff)
-        if base_state.get("a") is not None:
+        if base_state.get("a") is not None and policy.get("a") != "direct":
             out["a"] = _mix(int(base_state.get("a", 0)), min(r, g) // 2, eff)
         # Also propagate to every zone that isn't overridden by a zone
         # overlay below - this makes "across_lights" actually colour every

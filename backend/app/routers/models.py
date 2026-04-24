@@ -44,6 +44,7 @@ def _mode_out(row: LightModelMode) -> LightModelModeOut:
         channel_count=row.channel_count,
         is_default=row.is_default,
         layout=row.layout,
+        color_policy=dict(row.color_policy or {}),
     )
 
 
@@ -101,6 +102,7 @@ def _create_modes(
             channel_count=len(mode.channels),
             is_default=mode.is_default,
             layout=mode.layout if isinstance(mode.layout, dict) else None,
+            color_policy=dict(mode.color_policy or {}),
         )
         sess.add(row)
         created.append(row)
@@ -155,6 +157,7 @@ def update_model(
             row.channel_count = len(mode_in.channels)
             row.is_default = mode_in.is_default
             row.layout = layout
+            row.color_policy = dict(mode_in.color_policy or {})
             sess.add(row)
             seen_ids.add(mode_in.id)
         else:
@@ -165,6 +168,7 @@ def update_model(
                 channel_count=len(mode_in.channels),
                 is_default=mode_in.is_default,
                 layout=layout,
+                color_policy=dict(mode_in.color_policy or {}),
             )
             sess.add(row)
 
@@ -236,6 +240,7 @@ def clone_model(mid: int, sess: Session = Depends(get_session)) -> LightModelOut
                 channel_count=mode.channel_count,
                 is_default=mode.is_default,
                 layout=mode.layout if isinstance(mode.layout, dict) else None,
+                color_policy=dict(mode.color_policy or {}),
             )
         )
     sess.commit()
@@ -274,6 +279,7 @@ def add_mode(
         channel_count=len(payload.channels),
         is_default=payload.is_default,
         layout=payload.layout if isinstance(payload.layout, dict) else None,
+        color_policy=dict(payload.color_policy or {}),
     )
     sess.add(row)
     sess.flush()
@@ -313,6 +319,7 @@ def update_mode(
     row.channels = list(payload.channels)
     row.channel_count = len(payload.channels)
     row.layout = payload.layout if isinstance(payload.layout, dict) else None
+    row.color_policy = dict(payload.color_policy or {})
     if payload.is_default and not row.is_default:
         for r in _modes_for(sess, mid):
             if r.id != mode_id and r.is_default:

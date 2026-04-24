@@ -61,6 +61,9 @@ class LightBinding:
     start_index: int  # 0-based position in the 512-byte DMX buffer
     channels: list[str]  # role per channel, e.g. ["r","g","b","w"]
     layout: dict | None = None  # compound zone/motion overlay (see docs)
+    # W/A/UV policy ({"w":"direct", ...}). Missing keys default to "mix"
+    # which preserves the historical "derive from RGB" renderer behavior.
+    color_policy: dict | None = None
 
 
 class UniverseBuffer:
@@ -76,18 +79,60 @@ class UniverseBuffer:
         return (self.net, self.subnet, self.universe)
 
 
-def _compute_channel_values(channels: list[str], state: dict) -> list[int]:
+def _policy_for(policy: dict | None, role: str) -> str:
+    """Return the resolved policy ("mix" or "direct") for one W/A/UV role.
+
+    Any value other than "direct" resolves to "mix" so that missing or
+    unknown entries behave like today's default."""
+    if not policy:
+        return "mix"
+    v = policy.get(role)
+    if v == "direct":
+        return "direct"
+    return "mix"
+
+
+def _resolve_aux(
+    role: str,
+    raw: object,
+    r: int,
+    g: int,
+    b: int,
+    policy: dict | None,
+) -> int:
+    """Resolve one of W / A / UV, honoring the per-role policy.
+
+    For "direct" roles we never auto-derive from RGB: a ``None`` state
+    value becomes 0 so the channel acts like an independent fader. For
+    "mix" roles we preserve the historical derivations when unspecified.
+    """
+    if raw is not None:
+        return int(raw)
+    if _policy_for(policy, role) == "direct":
+        return 0
+    if role == "w":
+        return min(r, g, b)
+    if role == "a":
+        return min(r, g) // 2
+    return 0
+
+
+def _compute_channel_values(
+    channels: list[str], state: dict, policy: dict | None = None
+) -> list[int]:
     """Map a light's logical state dict into DMX channel values ordered by role.
 
     Flat (non-compound) path: iterates ``channels`` and emits one byte per
     slot. For compound fixtures use :func:`_compute_layout_values` instead.
+    ``policy`` is an optional {role: "mix"|"direct"} map from the mode;
+    see :func:`_resolve_aux`.
     """
     r = int(state.get("r", 0))
     g = int(state.get("g", 0))
     b = int(state.get("b", 0))
-    w = state.get("w")
-    a = state.get("a")
-    uv = state.get("uv")
+    w = _resolve_aux("w", state.get("w"), r, g, b, policy)
+    a = _resolve_aux("a", state.get("a"), r, g, b, policy)
+    uv = _resolve_aux("uv", state.get("uv"), r, g, b, policy)
     dimmer = int(state.get("dimmer", 255))
     on = bool(state.get("on", True))
     if not on:
@@ -96,14 +141,6 @@ def _compute_channel_values(channels: list[str], state: dict) -> list[int]:
     # If the model has no dedicated dimmer channel, bake brightness into RGB.
     has_dimmer = "dimmer" in channels
     scale = 1.0 if has_dimmer else max(0, min(255, dimmer)) / 255.0
-
-    # Reasonable defaults for white/amber/uv derived from RGB if unspecified.
-    if w is None:
-        w = min(r, g, b)
-    if a is None:
-        a = min(r, g) // 2
-    if uv is None:
-        uv = 0
 
     # Motion defaults (floats in [0, 1]; default centered).
     motion = state.get("motion") or {}
@@ -159,28 +196,22 @@ def _compute_channel_values(channels: list[str], state: dict) -> list[int]:
 
 
 def _derive_zone_defaults(
-    zs: dict, global_dimmer: int
+    zs: dict, global_dimmer: int, policy: dict | None = None
 ) -> tuple[int, int, int, int, int, int, int, bool]:
     """Return (r, g, b, w, a, uv, dimmer, on) with fallback derivation."""
     r = int(zs.get("r", 0))
     g = int(zs.get("g", 0))
     b = int(zs.get("b", 0))
-    w = zs.get("w")
-    a = zs.get("a")
-    uv = zs.get("uv")
+    w = _resolve_aux("w", zs.get("w"), r, g, b, policy)
+    a = _resolve_aux("a", zs.get("a"), r, g, b, policy)
+    uv = _resolve_aux("uv", zs.get("uv"), r, g, b, policy)
     dim = int(zs.get("dimmer", global_dimmer))
     on = bool(zs.get("on", True))
-    if w is None:
-        w = min(r, g, b)
-    if a is None:
-        a = min(r, g) // 2
-    if uv is None:
-        uv = 0
-    return r, g, b, int(w), int(a), int(uv), dim, on
+    return r, g, b, w, a, uv, dim, on
 
 
 def _compute_layout_values(
-    channels: list[str], layout: dict, state: dict
+    channels: list[str], layout: dict, state: dict, policy: dict | None = None
 ) -> list[int]:
     """Compound-fixture renderer: writes zone/motion/global values into a
     bytes-like list sized to the mode's channel count."""
@@ -222,7 +253,7 @@ def _compute_layout_values(
             zs = fallback
 
         zr, zg, zb, zw, za, zuv, zdim, zon = _derive_zone_defaults(
-            zs, global_dimmer
+            zs, global_dimmer, policy
         )
         if not zon:
             if _in_range(dimmer_off):
@@ -285,8 +316,12 @@ def _render_binding(binding: LightBinding, state: dict) -> list[int]:
     """Top-level dispatch: layout-aware renderer if a layout is present,
     otherwise fall back to the flat channel emission."""
     if binding.layout:
-        return _compute_layout_values(binding.channels, binding.layout, state)
-    return _compute_channel_values(binding.channels, state)
+        return _compute_layout_values(
+            binding.channels, binding.layout, state, binding.color_policy
+        )
+    return _compute_channel_values(
+        binding.channels, state, binding.color_policy
+    )
 
 
 def _decode_binding(binding: "LightBinding", buf: bytearray) -> dict:
@@ -465,10 +500,16 @@ class ArtNetManager:
                     channels = list(mode.channels)
                     channel_count = mode.channel_count
                     layout = mode.layout if isinstance(mode.layout, dict) else None
+                    policy = (
+                        dict(mode.color_policy)
+                        if isinstance(mode.color_policy, dict)
+                        else {}
+                    )
                 else:
                     channels = list(model.channels)
                     channel_count = model.channel_count
                     layout = None
+                    policy = {}
                 ctrl, buf = self._controllers[light.controller_id]
                 start = light.start_address - 1  # DMX is 1-indexed; buffer is 0-indexed
                 if start < 0 or start + channel_count > UNIVERSE_SIZE:
@@ -484,6 +525,7 @@ class ArtNetManager:
                     start_index=start,
                     channels=channels,
                     layout=layout,
+                    color_policy=policy,
                 )
                 buf.bindings[light.id] = binding
                 self._light_to_controller[light.id] = ctrl.id

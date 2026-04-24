@@ -106,6 +106,11 @@ def _migrate() -> None:
                 conn.exec_driver_sql(
                     "ALTER TABLE lightmodelmode ADD COLUMN layout JSON"
                 )
+            # lightmodelmode.color_policy (per-role W/A/UV mix vs direct)
+            if "color_policy" not in mode_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE lightmodelmode ADD COLUMN color_policy JSON"
+                )
         else:
             # Best-effort for other backends; swallow errors if column already exists.
             for stmt in (
@@ -116,6 +121,7 @@ def _migrate() -> None:
                 "ALTER TABLE light ADD COLUMN notes TEXT",
                 "ALTER TABLE controller ADD COLUMN notes TEXT",
                 "ALTER TABLE lightmodelmode ADD COLUMN layout JSON",
+                "ALTER TABLE lightmodelmode ADD COLUMN color_policy JSON",
             ):
                 try:
                     conn.execute(text(stmt))

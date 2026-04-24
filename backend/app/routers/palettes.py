@@ -106,27 +106,49 @@ def _pick_colors(colors: list[str], n: int, mode: str) -> list[str]:
     return [colors[i % len(colors)] for i in range(n)]
 
 
-def _paint_light_flat(light: Light, hex_color: str) -> None:
+def _policy_for(mode: LightModelMode | None) -> dict:
+    """Return the mode's color_policy dict, or {} when unset."""
+    if mode is None:
+        return {}
+    if isinstance(mode.color_policy, dict):
+        return dict(mode.color_policy)
+    return {}
+
+
+def _paint_light_flat(
+    light: Light, hex_color: str, policy: dict | None = None
+) -> None:
     r, g, b = _hex_to_rgb(hex_color)
+    policy = policy or {}
     light.r = r
     light.g = g
     light.b = b
-    light.w = min(r, g, b)
-    light.a = min(r, g) // 2
+    # Preserve user-owned "direct" W/A values — palette paint only touches
+    # channels that still behave as RGB-derived mixes.
+    if policy.get("w") != "direct":
+        light.w = min(r, g, b)
+    if policy.get("a") != "direct":
+        light.a = min(r, g) // 2
     light.on = True
     light.zone_state = {}
 
 
 def _paint_zone(
-    zone_state_map: dict, zone_id: str, hex_color: str
+    zone_state_map: dict,
+    zone_id: str,
+    hex_color: str,
+    policy: dict | None = None,
 ) -> None:
     r, g, b = _hex_to_rgb(hex_color)
+    policy = policy or {}
     zs = dict(zone_state_map.get(zone_id) or {})
     zs["r"] = r
     zs["g"] = g
     zs["b"] = b
-    zs["w"] = min(r, g, b)
-    zs["a"] = min(r, g) // 2
+    if policy.get("w") != "direct":
+        zs["w"] = min(r, g, b)
+    if policy.get("a") != "direct":
+        zs["a"] = min(r, g) // 2
     zs["on"] = True
     zone_state_map[zone_id] = zs
 
@@ -184,20 +206,24 @@ def apply_palette(
 
     colors = p.colors
 
+    def _policy(light: Light) -> dict:
+        return _policy_for(mode_by_id.get(light.mode_id) if light.mode_id else None)
+
     if req.spread == "across_fixture":
         # Each fixture gets the palette rolled across its own zones.
         for light in lights:
             zone_ids = _zone_ids_for_light(light, mode_by_id)
+            policy = _policy(light)
             if not zone_ids:
                 # Single-zone fixture: behave like across_lights with one
                 # fixture — pick the first color.
                 picks = _pick_colors(colors, 1, req.mode)
-                _paint_light_flat(light, picks[0])
+                _paint_light_flat(light, picks[0], policy)
             else:
                 picks = _pick_colors(colors, len(zone_ids), req.mode)
                 zs_map = dict(light.zone_state or {})
                 for zid, hex_color in zip(zone_ids, picks):
-                    _paint_zone(zs_map, zid, hex_color)
+                    _paint_zone(zs_map, zid, hex_color, policy)
                 light.zone_state = zs_map
                 light.on = True
             sess.add(light)
@@ -218,11 +244,12 @@ def apply_palette(
         # per-zone overrides from a previous spread.
         mutable_maps: dict[int, dict] = {l.id: {} for l in lights}
         for (light, zid), hex_color in zip(pairs, picks):
+            policy = _policy(light)
             if zid is None:
-                _paint_light_flat(light, hex_color)
+                _paint_light_flat(light, hex_color, policy)
                 mutable_maps[light.id] = {}
             else:
-                _paint_zone(mutable_maps[light.id], zid, hex_color)
+                _paint_zone(mutable_maps[light.id], zid, hex_color, policy)
                 light.on = True
         for light in lights:
             if mutable_maps[light.id]:
@@ -232,7 +259,7 @@ def apply_palette(
     else:  # across_lights (default, preserves today's behavior)
         picks = _pick_colors(colors, len(lights), req.mode)
         for light, hex_color in zip(lights, picks):
-            _paint_light_flat(light, hex_color)
+            _paint_light_flat(light, hex_color, _policy(light))
             sess.add(light)
 
     sess.commit()
