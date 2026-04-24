@@ -16,8 +16,13 @@ from __future__ import annotations
 import pytest
 
 from app.artnet import _compute_channel_values
-from app.routers.palettes import _paint_light_flat, _paint_zone
-from app.schemas import _normalize_color_policy
+from app.routers.palettes import (
+    _apply_entry_flat,
+    _apply_entry_zone,
+    _paint_light_flat,
+    _paint_zone,
+)
+from app.schemas import PaletteEntry, _normalize_color_policy
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +130,53 @@ def test_paint_light_direct_preserves_w_and_a():
     # User-owned direct channels must be left alone.
     assert light.w == 42
     assert light.a == 11
+
+
+def test_palette_entry_sets_explicit_uv_on_mix_policy():
+    """The migration removed the old UV gap: a palette entry that supplies
+    an explicit UV value must be written through even when the mode is
+    ``mix`` (the historical default). Previously ``_paint_light_flat``
+    never touched UV at all."""
+    light = _FakeLight()
+    entry = PaletteEntry(r=0, g=0, b=0, uv=255)
+    _apply_entry_flat(light, entry)
+    assert light.uv == 255, "explicit UV must be written"
+
+
+def test_palette_entry_respects_direct_policy_with_explicit_value():
+    """When the mode marks UV as ``direct``, an explicit entry still
+    wins (palette authors can opt in to overriding the user's fader)."""
+    light = _FakeLight()
+    light.uv = 10
+    entry = PaletteEntry(r=10, g=20, b=30, uv=200)
+    _apply_entry_flat(light, entry, {"uv": "direct"})
+    assert light.uv == 200
+
+
+def test_palette_entry_direct_uv_without_explicit_preserves_fader():
+    """Direct UV with no entry value must leave the user's fader alone."""
+    light = _FakeLight()
+    light.uv = 77
+    entry = PaletteEntry(r=10, g=20, b=30)  # no uv
+    _apply_entry_flat(light, entry, {"uv": "direct"})
+    assert light.uv == 77
+
+
+def test_palette_entry_explicit_w_and_a_override_derivation():
+    """Explicit aux values always win over RGB-derived ones."""
+    light = _FakeLight()
+    entry = PaletteEntry(r=200, g=150, b=100, w=33, a=77)
+    _apply_entry_flat(light, entry)
+    assert light.w == 33
+    assert light.a == 77
+
+
+def test_palette_entry_zone_sets_uv_on_mix():
+    zs_map: dict = {}
+    entry = PaletteEntry(r=0, g=0, b=0, uv=180)
+    _apply_entry_zone(zs_map, "z1", entry)
+    zs = zs_map["z1"]
+    assert zs["uv"] == 180
 
 
 def test_paint_zone_direct_preserves_existing_w():

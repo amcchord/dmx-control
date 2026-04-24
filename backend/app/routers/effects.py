@@ -51,6 +51,7 @@ def _to_out(e: Effect) -> EffectOut:
         targets=[BulkTarget(**t) for t in (e.targets or [])],
         spread=e.spread,
         params=EffectParams(**(e.params or {})),
+        target_channels=list(e.target_channels or ["rgb"]),
         is_active=engine.is_effect_active(e.id) if e.id is not None else False,
         builtin=e.builtin,
     )
@@ -96,6 +97,7 @@ def create_effect(
         targets=_targets_to_dicts(payload.targets),
         spread=payload.spread,
         params=payload.params.model_dump(),
+        target_channels=list(payload.target_channels or ["rgb"]),
         is_active=False,
         builtin=False,
     )
@@ -121,6 +123,7 @@ def update_effect(
     row.targets = _targets_to_dicts(payload.targets)
     row.spread = payload.spread
     row.params = payload.params.model_dump()
+    row.target_channels = list(payload.target_channels or ["rgb"])
     sess.add(row)
     sess.commit()
     sess.refresh(row)
@@ -161,6 +164,7 @@ def clone_effect(eid: int, sess: Session = Depends(get_session)) -> EffectOut:
         targets=list(src.targets or []),
         spread=src.spread,
         params=dict(src.params or {}),
+        target_channels=list(src.target_channels or ["rgb"]),
         is_active=False,
         builtin=False,
     )
@@ -247,6 +251,7 @@ def play_live(
         targets=_targets_to_dicts(payload.targets),
         spread=payload.spread,
         params=payload.params.model_dump(),
+        target_channels=list(payload.target_channels or ["rgb"]),
     )
     # Stash palette_id + ancillary data so "save" can persist the same
     # effect later.
@@ -288,6 +293,7 @@ def save_live(
         targets=list(spec.targets),
         spread=spec.spread,
         params=dict(spec.params),
+        target_channels=list(spec.target_channels or ["rgb"]),
         is_active=False,
         builtin=False,
     )

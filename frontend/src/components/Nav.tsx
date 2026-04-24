@@ -11,6 +11,7 @@ const BASE_LINKS: LinkDef[] = [
   { to: "/scenes", label: "Scenes" },
   { to: "/models", label: "Models" },
   { to: "/palettes", label: "Palettes" },
+  { to: "/effects", label: "Effects" },
   { to: "/api-docs", label: "API" },
 ];
 

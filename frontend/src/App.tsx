@@ -9,6 +9,7 @@ import ControllerDetail from "./pages/ControllerDetail";
 import Models from "./pages/Models";
 import ModelEditor from "./pages/ModelEditor";
 import Palettes from "./pages/Palettes";
+import Effects from "./pages/Effects";
 import Scenes from "./pages/Scenes";
 import Designer from "./pages/Designer";
 import ApiDocs from "./pages/ApiDocs";
@@ -113,6 +114,16 @@ export default function App() {
               <Protected>
                 <Layout>
                   <Palettes />
+                </Layout>
+              </Protected>
+            }
+          />
+          <Route
+            path="/effects"
+            element={
+              <Protected>
+                <Layout>
+                  <Effects />
                 </Layout>
               </Protected>
             }

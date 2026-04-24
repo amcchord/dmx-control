@@ -400,34 +400,117 @@ class ReorderLightsRequest(BaseModel):
     light_ids: list[int] = Field(default_factory=list)
 
 
+class PaletteEntry(BaseModel):
+    """One color slot in a palette.
+
+    ``r``/``g``/``b`` are required 0-255 ints. ``w``/``a``/``uv`` are
+    optional: when set, palette paint writes them directly (honoring the
+    mode's policy); when omitted, W/A are derived from RGB under ``mix``
+    policy and UV is left alone. UV is also referred to as "V" in some
+    UI labels — they are the same channel role."""
+
+    r: int
+    g: int
+    b: int
+    w: Optional[int] = None
+    a: Optional[int] = None
+    uv: Optional[int] = None
+
+    @field_validator("r", "g", "b")
+    @classmethod
+    def _byte(cls, v: int) -> int:
+        if not (0 <= v <= 255):
+            raise ValueError("must be 0..255")
+        return v
+
+    @field_validator("w", "a", "uv")
+    @classmethod
+    def _aux_byte(cls, v: Optional[int]) -> Optional[int]:
+        if v is None:
+            return None
+        if not (0 <= v <= 255):
+            raise ValueError("aux channel must be 0..255")
+        return int(v)
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    s = hex_color.strip().lstrip("#")
+    if len(s) != 6:
+        raise ValueError(f"invalid hex color: {hex_color}")
+    try:
+        return int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+    except ValueError as e:
+        raise ValueError(f"invalid hex color: {hex_color}") from e
+
+
+def _rgb_to_hex(r: int, g: int, b: int) -> str:
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def _normalize_palette_payload(
+    *,
+    colors: Optional[list[str]],
+    entries: Optional[list[PaletteEntry | dict]],
+) -> tuple[list[str], list[PaletteEntry]]:
+    """Resolve the two accepted input shapes into a consistent pair.
+
+    Callers may supply either ``colors`` (legacy hex list) or ``entries``
+    (full per-channel payload); when both are supplied, ``entries`` wins
+    and ``colors`` is regenerated from the RGB portion. At least one of
+    the two must be non-empty."""
+    # Normalize ``entries`` to a list of PaletteEntry.
+    entry_models: list[PaletteEntry] = []
+    if entries:
+        for item in entries:
+            if isinstance(item, PaletteEntry):
+                entry_models.append(item)
+            elif isinstance(item, dict):
+                entry_models.append(PaletteEntry(**item))
+            else:
+                raise ValueError("entries must be PaletteEntry dicts")
+    if not entry_models and colors:
+        for c in colors:
+            r, g, b = _hex_to_rgb(c)
+            entry_models.append(PaletteEntry(r=r, g=g, b=b))
+    if not entry_models:
+        raise ValueError("palette must have at least one color/entry")
+    derived_colors = [_rgb_to_hex(e.r, e.g, e.b) for e in entry_models]
+    return derived_colors, entry_models
+
+
 class PaletteIn(BaseModel):
     name: str
-    colors: list[str]
+    # Either legacy ``colors`` OR the richer ``entries`` list may be
+    # provided. If both are provided, ``entries`` wins and ``colors`` is
+    # re-derived from the RGB portion so the stored pair stays in sync.
+    colors: Optional[list[str]] = None
+    entries: Optional[list[PaletteEntry]] = None
 
-    @field_validator("colors")
+    @field_validator("name")
     @classmethod
-    def _hex(cls, v: list[str]) -> list[str]:
-        if not v:
-            raise ValueError("colors must be non-empty")
-        out: list[str] = []
-        for c in v:
-            s = c.strip()
-            if not s.startswith("#"):
-                s = "#" + s
-            if len(s) != 7:
-                raise ValueError(f"invalid hex color: {c}")
-            try:
-                int(s[1:], 16)
-            except ValueError as e:
-                raise ValueError(f"invalid hex color: {c}") from e
-            out.append(s.upper())
-        return out
+    def _name(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("name must be non-empty")
+        if len(s) > 128:
+            raise ValueError("name too long")
+        return s
+
+    @model_validator(mode="after")
+    def _coerce(self) -> "PaletteIn":
+        colors, entries = _normalize_palette_payload(
+            colors=self.colors, entries=self.entries
+        )
+        self.colors = colors
+        self.entries = entries
+        return self
 
 
 class PaletteOut(BaseModel):
     id: int
     name: str
     colors: list[str]
+    entries: list[PaletteEntry] = Field(default_factory=list)
     builtin: bool
 
 
@@ -446,6 +529,20 @@ EFFECT_TYPES = {
 SPREAD_MODES = {"across_lights", "across_fixture", "across_zones"}
 
 DIRECTIONS = {"forward", "reverse", "pingpong"}
+
+# Logical "channel groups" an effect overlay may drive. "rgb" is the
+# classic path (color animates across the fixture's RGB inputs); the
+# others animate a scalar brightness on a single aux channel while
+# leaving the base color untouched. Keep this list in sync with the
+# merge logic in ``effects.merge_overlay_into_state``.
+EFFECT_TARGET_CHANNELS = {"rgb", "w", "a", "uv", "dimmer", "strobe"}
+
+# Slider caps tightened from the overly-generous original ranges. These
+# match the UI so the two stay in sync. Raise cautiously — values beyond
+# these caps rarely model anything physical.
+EFFECT_SPEED_HZ_MAX = 25.0
+EFFECT_SIZE_MAX = 16.0
+EFFECT_FADE_MAX_S = 30.0
 
 
 class EffectParams(BaseModel):
@@ -466,8 +563,10 @@ class EffectParams(BaseModel):
     @field_validator("speed_hz")
     @classmethod
     def _speed(cls, v: float) -> float:
-        if not (0.0 <= v <= 60.0):
-            raise ValueError("speed_hz must be in [0, 60]")
+        if not (0.0 <= v <= EFFECT_SPEED_HZ_MAX):
+            raise ValueError(
+                f"speed_hz must be in [0, {EFFECT_SPEED_HZ_MAX:g}]"
+            )
         return float(v)
 
     @field_validator("offset", "intensity", "softness")
@@ -480,16 +579,36 @@ class EffectParams(BaseModel):
     @field_validator("size")
     @classmethod
     def _size(cls, v: float) -> float:
-        if not (0.0 <= v <= 64.0):
-            raise ValueError("size must be in [0, 64]")
+        if not (0.0 <= v <= EFFECT_SIZE_MAX):
+            raise ValueError(f"size must be in [0, {EFFECT_SIZE_MAX:g}]")
         return float(v)
 
     @field_validator("fade_in_s", "fade_out_s")
     @classmethod
     def _fade(cls, v: float) -> float:
-        if not (0.0 <= v <= 60.0):
-            raise ValueError("fade must be in [0, 60] seconds")
+        if not (0.0 <= v <= EFFECT_FADE_MAX_S):
+            raise ValueError(
+                f"fade must be in [0, {EFFECT_FADE_MAX_S:g}] seconds"
+            )
         return float(v)
+
+
+def _validate_target_channels(v: Optional[list[str]]) -> list[str]:
+    if not v:
+        return ["rgb"]
+    seen: list[str] = []
+    for entry in v:
+        if not isinstance(entry, str):
+            raise ValueError("target_channels must be strings")
+        key = entry.strip().lower()
+        if key not in EFFECT_TARGET_CHANNELS:
+            raise ValueError(
+                f"unknown target channel {entry!r}; expected one of "
+                f"{sorted(EFFECT_TARGET_CHANNELS)}"
+            )
+        if key not in seen:
+            seen.append(key)
+    return seen
 
 
 class EffectIn(BaseModel):
@@ -505,6 +624,7 @@ class EffectIn(BaseModel):
         "across_lights"
     )
     params: EffectParams = Field(default_factory=EffectParams)
+    target_channels: list[str] = Field(default_factory=lambda: ["rgb"])
 
     @field_validator("name")
     @classmethod
@@ -515,6 +635,11 @@ class EffectIn(BaseModel):
         if len(s) > 128:
             raise ValueError("name too long")
         return s
+
+    @field_validator("target_channels")
+    @classmethod
+    def _channels(cls, v: list[str]) -> list[str]:
+        return _validate_target_channels(v)
 
 
 class LiveEffectIn(BaseModel):
@@ -532,6 +657,12 @@ class LiveEffectIn(BaseModel):
         "across_lights"
     )
     params: EffectParams = Field(default_factory=EffectParams)
+    target_channels: list[str] = Field(default_factory=lambda: ["rgb"])
+
+    @field_validator("target_channels")
+    @classmethod
+    def _channels(cls, v: list[str]) -> list[str]:
+        return _validate_target_channels(v)
 
 
 class SaveLiveRequest(BaseModel):
@@ -557,6 +688,7 @@ class EffectOut(BaseModel):
     targets: list[BulkTarget]
     spread: str
     params: EffectParams
+    target_channels: list[str] = Field(default_factory=lambda: ["rgb"])
     is_active: bool
     builtin: bool
 
@@ -777,18 +909,46 @@ class DesignerProposalLight(BaseModel):
     motion_state: dict = Field(default_factory=dict)
 
 
+class DesignerEffectProposalBody(BaseModel):
+    """Claude-facing shape for an effect proposal in the designer chat.
+
+    Mirrors :class:`EffectIn` except ``light_ids`` / ``targets`` are always
+    resolved client-side against the user's current selection (the rig
+    snapshot does not know what the user has selected)."""
+
+    effect_type: Literal[
+        "static", "fade", "cycle", "chase", "pulse",
+        "rainbow", "strobe", "sparkle", "wave",
+    ]
+    palette_id: Optional[int] = None
+    spread: Literal["across_lights", "across_fixture", "across_zones"] = (
+        "across_lights"
+    )
+    params: "EffectParams" = Field(default_factory=lambda: EffectParams())
+    target_channels: list[str] = Field(default_factory=lambda: ["rgb"])
+    light_ids: list[int] = Field(default_factory=list)
+    targets: list[BulkTarget] = Field(default_factory=list)
+
+
 class DesignerProposal(BaseModel):
     """A named rig design Claude proposes.
 
     ``kind='state'`` is a rig-wide snapshot (every addressed light);
-    ``kind='scene'`` targets one ``controller_id``."""
+    ``kind='scene'`` targets one ``controller_id``;
+    ``kind='palette'`` is a new palette draft (saveable to /api/palettes);
+    ``kind='effect'`` is a new effect spec (saveable to /api/effects and
+    playable on the user's current selection)."""
 
     proposal_id: str
-    kind: Literal["state", "scene"]
+    kind: Literal["state", "scene", "palette", "effect"]
     name: str
     controller_id: Optional[int] = None
     notes: Optional[str] = None
     lights: list[DesignerProposalLight] = Field(default_factory=list)
+    # Only set when kind='palette'.
+    palette_entries: Optional[list[PaletteEntry]] = None
+    # Only set when kind='effect'.
+    effect: Optional[DesignerEffectProposalBody] = None
 
 
 class DesignerMessageOut(BaseModel):
@@ -840,3 +1000,125 @@ class DesignerApplyRequest(BaseModel):
 class DesignerSaveRequest(BaseModel):
     proposal_id: str
     name: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Claude palette generator (one-shot) + effects chat (multi-turn)
+# ---------------------------------------------------------------------------
+
+
+class PaletteGenerateRequest(BaseModel):
+    """One-shot palette generation from a free-text prompt."""
+
+    prompt: str
+    num_colors: Optional[int] = None
+    include_aux: Optional[bool] = None
+
+    @field_validator("prompt")
+    @classmethod
+    def _p(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("prompt must be non-empty")
+        if len(s) > 2000:
+            raise ValueError("prompt too long (max 2000 chars)")
+        return s
+
+    @field_validator("num_colors")
+    @classmethod
+    def _n(cls, v: Optional[int]) -> Optional[int]:
+        if v is None:
+            return None
+        if not (2 <= v <= 16):
+            raise ValueError("num_colors must be in [2, 16]")
+        return v
+
+
+class PaletteGenerateResponse(BaseModel):
+    name: str
+    entries: list[PaletteEntry]
+    summary: Optional[str] = None
+
+
+class EffectMessageIn(BaseModel):
+    message: str
+
+    @field_validator("message")
+    @classmethod
+    def _msg(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("message must be non-empty")
+        if len(s) > 10_000:
+            raise ValueError("message too long (max 10000 chars)")
+        return s
+
+
+class EffectProposal(BaseModel):
+    """One effect Claude has proposed in a chat.
+
+    The shape mirrors :class:`EffectIn` so the UI can drop it straight
+    into the live editor, but ``light_ids`` / ``targets`` are optional
+    because Claude typically describes an effect that should run on the
+    user's current selection (resolved client-side)."""
+
+    proposal_id: str
+    summary: Optional[str] = None
+    name: str
+    effect_type: Literal[
+        "static", "fade", "cycle", "chase", "pulse",
+        "rainbow", "strobe", "sparkle", "wave",
+    ]
+    palette_id: Optional[int] = None
+    spread: Literal["across_lights", "across_fixture", "across_zones"] = (
+        "across_lights"
+    )
+    params: EffectParams = Field(default_factory=EffectParams)
+    target_channels: list[str] = Field(default_factory=lambda: ["rgb"])
+    light_ids: list[int] = Field(default_factory=list)
+    targets: list[BulkTarget] = Field(default_factory=list)
+
+    @field_validator("target_channels")
+    @classmethod
+    def _channels(cls, v: list[str]) -> list[str]:
+        return _validate_target_channels(v)
+
+
+class EffectChatMessageOut(BaseModel):
+    role: Literal["user", "assistant"]
+    text: str = ""
+    proposal: Optional[EffectProposal] = None
+
+
+class EffectConversationSummary(BaseModel):
+    id: int
+    name: str
+    message_count: int
+    updated_at: str
+
+
+class EffectConversationOut(BaseModel):
+    id: int
+    name: str
+    created_at: str
+    updated_at: str
+    messages: list[EffectChatMessageOut] = Field(default_factory=list)
+    last_proposal: Optional[EffectProposal] = None
+
+
+class EffectConversationCreate(BaseModel):
+    name: Optional[str] = None
+
+
+class EffectConversationRename(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("name must be non-empty")
+        if len(s) > 128:
+            raise ValueError("name too long")
+        return s

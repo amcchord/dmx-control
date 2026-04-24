@@ -56,6 +56,19 @@ def _table_columns(conn, table: str) -> set[str]:
     return {r[1] for r in rows}
 
 
+def _hex_to_rgb_triplet(hex_color: str) -> tuple[int, int, int] | None:
+    """Parse ``#RRGGBB`` (or ``RRGGBB``) into an (r,g,b) triplet."""
+    if not isinstance(hex_color, str):
+        return None
+    s = hex_color.strip().lstrip("#")
+    if len(s) != 6:
+        return None
+    try:
+        return int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+    except ValueError:
+        return None
+
+
 def _migrate() -> None:
     """Idempotent migrations for pre-existing SQLite databases.
 
@@ -64,7 +77,7 @@ def _migrate() -> None:
     and safe to re-run."""
     from sqlmodel import select
 
-    from .models import Light, LightModel, LightModelMode
+    from .models import Effect, Light, LightModel, LightModelMode, Palette
 
     is_sqlite = DATABASE_URL.startswith("sqlite")
 
@@ -111,6 +124,18 @@ def _migrate() -> None:
                 conn.exec_driver_sql(
                     "ALTER TABLE lightmodelmode ADD COLUMN color_policy JSON"
                 )
+            # palette.entries (per-color {r,g,b,w?,a?,uv?} payload).
+            pal_cols = _table_columns(conn, "palette")
+            if "entries" not in pal_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE palette ADD COLUMN entries JSON"
+                )
+            # effect.target_channels (which channels the overlay drives).
+            eff_cols = _table_columns(conn, "effect")
+            if "target_channels" not in eff_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE effect ADD COLUMN target_channels JSON"
+                )
         else:
             # Best-effort for other backends; swallow errors if column already exists.
             for stmt in (
@@ -122,6 +147,8 @@ def _migrate() -> None:
                 "ALTER TABLE controller ADD COLUMN notes TEXT",
                 "ALTER TABLE lightmodelmode ADD COLUMN layout JSON",
                 "ALTER TABLE lightmodelmode ADD COLUMN color_policy JSON",
+                "ALTER TABLE palette ADD COLUMN entries JSON",
+                "ALTER TABLE effect ADD COLUMN target_channels JSON",
             ):
                 try:
                     conn.execute(text(stmt))
@@ -148,6 +175,31 @@ def _migrate() -> None:
                     is_default=True,
                 )
             )
+        sess.commit()
+
+        # Backfill Palette.entries from the legacy `colors` hex list so older
+        # rows carry the structured shape the new palette paint logic reads.
+        palettes = sess.exec(select(Palette)).all()
+        for pal in palettes:
+            if pal.entries:
+                continue
+            backfilled: list[dict] = []
+            for hex_color in list(pal.colors or []):
+                rgb = _hex_to_rgb_triplet(hex_color)
+                if rgb is None:
+                    continue
+                r, g, b = rgb
+                backfilled.append({"r": r, "g": g, "b": b})
+            if backfilled:
+                pal.entries = backfilled
+                sess.add(pal)
+        # Backfill Effect.target_channels so pre-migration rows keep the
+        # historical behavior of animating only RGB.
+        effects = sess.exec(select(Effect)).all()
+        for eff in effects:
+            if not eff.target_channels:
+                eff.target_channels = ["rgb"]
+                sess.add(eff)
         sess.commit()
 
         unmapped = sess.exec(select(Light).where(Light.mode_id.is_(None))).all()

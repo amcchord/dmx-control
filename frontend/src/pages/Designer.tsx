@@ -320,16 +320,21 @@ export default function Designer() {
         activeId,
         proposal.proposal_id,
       );
-      toast.push(
-        `Applied "${proposal.name}" (${res.applied} light${
-          res.applied === 1 ? "" : "s"
-        })`,
-        "success",
-      );
-      // Refresh light snapshot so swatches in the rig reflect the new state.
-      Api.listLights()
-        .then(setLights)
-        .catch(() => {});
+      if (proposal.kind === "palette") {
+        toast.push(`Saved palette "${proposal.name}"`, "success");
+      } else if (proposal.kind === "effect") {
+        toast.push(`Playing "${proposal.name}"`, "success");
+      } else {
+        const n = res.applied ?? 0;
+        toast.push(
+          `Applied "${proposal.name}" (${n} light${n === 1 ? "" : "s"})`,
+          "success",
+        );
+        // Refresh light snapshot so swatches in the rig reflect the new state.
+        Api.listLights()
+          .then(setLights)
+          .catch(() => {});
+      }
     } catch (e) {
       toast.push(String(e), "error");
     }
@@ -349,13 +354,17 @@ export default function Designer() {
     const name = savePrompt.name.trim();
     if (!name) return;
     try {
-      const res = await Api.designer.saveProposal(
+      const res = (await Api.designer.saveProposal(
         savePrompt.cid,
         savePrompt.proposal.proposal_id,
         name,
-      );
-      let label = "state";
-      if (res.kind === "scene") label = "scene";
+      )) as {
+        ok: boolean;
+        kind: "state" | "scene" | "palette" | "effect";
+        id: number;
+        name: string;
+      };
+      const label = res.kind;
       toast.push(`Saved ${label} "${res.name}"`, "success");
       setSavePrompt(null);
     } catch (e) {
@@ -697,9 +706,17 @@ function ProposalCard({
     const ctrl = proposal.controller_id
       ? controllerById.get(proposal.controller_id)
       : null;
-    if (ctrl) scopeLabel = `scene · ${ctrl.name}`;
-    else scopeLabel = "scene";
+    scopeLabel = ctrl ? `scene · ${ctrl.name}` : "scene";
+  } else if (proposal.kind === "palette") {
+    scopeLabel = "palette";
+  } else if (proposal.kind === "effect") {
+    scopeLabel = "effect";
   }
+
+  let applyLabel = "Apply";
+  if (proposal.kind === "palette") applyLabel = "Save as palette";
+  else if (proposal.kind === "effect") applyLabel = "Play";
+
   return (
     <div className="rounded-lg bg-bg-card p-3 text-slate-100 ring-1 ring-line">
       <div className="flex items-center justify-between gap-2">
@@ -707,10 +724,17 @@ function ProposalCard({
           <div className="flex items-center gap-2">
             <span className="truncate font-semibold">{proposal.name}</span>
             <span className="pill text-[10px]">{scopeLabel}</span>
-            <span className="pill text-[10px]">
-              {proposal.lights.length} light
-              {proposal.lights.length === 1 ? "" : "s"}
-            </span>
+            {(proposal.kind === "state" || proposal.kind === "scene") && (
+              <span className="pill text-[10px]">
+                {proposal.lights.length} light
+                {proposal.lights.length === 1 ? "" : "s"}
+              </span>
+            )}
+            {proposal.kind === "effect" && proposal.effect && (
+              <span className="pill text-[10px]">
+                {proposal.effect.effect_type}
+              </span>
+            )}
           </div>
           {proposal.notes && (
             <div className="mt-0.5 text-[11px] text-muted">
@@ -729,24 +753,47 @@ function ProposalCard({
             className="btn-primary !px-2 !py-1 text-xs"
             onClick={onApply}
           >
-            Apply
+            {applyLabel}
           </button>
         </div>
       </div>
-      <div className="mt-2 flex flex-wrap gap-1.5">
-        {proposal.lights.slice(0, 64).map((pl) => (
-          <ProposalLightSwatch
-            key={pl.light_id}
-            pl={pl}
-            lightById={lightById}
-          />
-        ))}
-        {proposal.lights.length > 64 && (
-          <span className="text-[10px] text-muted">
-            +{proposal.lights.length - 64} more
-          </span>
+      {(proposal.kind === "state" || proposal.kind === "scene") && (
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {proposal.lights.slice(0, 64).map((pl) => (
+            <ProposalLightSwatch
+              key={pl.light_id}
+              pl={pl}
+              lightById={lightById}
+            />
+          ))}
+          {proposal.lights.length > 64 && (
+            <span className="text-[10px] text-muted">
+              +{proposal.lights.length - 64} more
+            </span>
+          )}
+        </div>
+      )}
+      {proposal.kind === "palette" &&
+        proposal.palette_entries &&
+        proposal.palette_entries.length > 0 && (
+          <div className="mt-2 flex h-6 overflow-hidden rounded-md ring-1 ring-line">
+            {proposal.palette_entries.map((e, i) => (
+              <div
+                key={i}
+                className="h-full flex-1"
+                style={{ background: `rgb(${e.r}, ${e.g}, ${e.b})` }}
+                title={`${e.r}, ${e.g}, ${e.b}`}
+              />
+            ))}
+          </div>
         )}
-      </div>
+      {proposal.kind === "effect" && proposal.effect && (
+        <div className="mt-2 text-[11px] text-muted">
+          spread {proposal.effect.spread} · speed{" "}
+          {proposal.effect.params.speed_hz.toFixed(2)} Hz · channels{" "}
+          {proposal.effect.target_channels.join("+")}
+        </div>
+      )}
     </div>
   );
 }
@@ -789,7 +836,7 @@ function SaveModal({
   onSubmit,
 }: {
   value: string;
-  kind: "state" | "scene";
+  kind: DesignerProposal["kind"];
   onChange: (v: string) => void;
   onCancel: () => void;
   onSubmit: () => void;
@@ -797,6 +844,10 @@ function SaveModal({
   let blurb = "Saved as a rig-wide state on the Scenes page.";
   if (kind === "scene") {
     blurb = "Saved as a per-controller scene on the Scenes page.";
+  } else if (kind === "palette") {
+    blurb = "Saved to the Palettes page.";
+  } else if (kind === "effect") {
+    blurb = "Saved to the Effects page, ready to play.";
   }
   return (
     <div

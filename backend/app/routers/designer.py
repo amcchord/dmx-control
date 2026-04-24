@@ -33,20 +33,28 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select
 
-from ..artnet import manager
 from ..auth import AuthDep
 from ..config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
 from ..db import get_session
-from ..engine import engine as effect_engine
+from ..engine import (
+    EffectSpec,
+    engine as effect_engine,
+    new_handle,
+)
 from ..models import (
     Controller,
     DesignerConversation,
+    Effect,
     Light,
-    LightModel,
     LightModelMode,
     Palette,
     Scene,
     State,
+)
+from ..rig_context import (
+    build_rig_context,
+    motion_axes_for_mode,
+    zone_ids_for_mode,
 )
 from ..schemas import (
     DesignerApplyRequest,
@@ -54,11 +62,18 @@ from ..schemas import (
     DesignerConversationOut,
     DesignerConversationRename,
     DesignerConversationSummary,
+    DesignerEffectProposalBody,
     DesignerMessageIn,
     DesignerMessageOut,
     DesignerProposal,
     DesignerProposalLight,
     DesignerSaveRequest,
+    EFFECT_TARGET_CHANNELS,
+    EFFECT_FADE_MAX_S,
+    EFFECT_SIZE_MAX,
+    EFFECT_SPEED_HZ_MAX,
+    EffectParams,
+    PaletteEntry,
 )
 from ._capture import apply_state_to_light, push_light
 
@@ -70,6 +85,9 @@ router = APIRouter(
 
 
 _TOOL_NAME = "propose_rig_design"
+_PALETTE_TOOL_NAME = "propose_palette"
+_EFFECT_TOOL_NAME = "propose_effect"
+_DESIGNER_TOOL_NAMES = {_TOOL_NAME, _PALETTE_TOOL_NAME, _EFFECT_TOOL_NAME}
 _MAX_TURNS_HISTORY = 40
 
 
@@ -204,118 +222,168 @@ def _build_tool_schema() -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Rig context + system prompt
-# ---------------------------------------------------------------------------
-def _mode_for_light(
-    l: Light, modes_by_id: dict[int, LightModelMode]
-) -> Optional[LightModelMode]:
-    if l.mode_id is None:
-        return None
-    return modes_by_id.get(l.mode_id)
-
-
-def _zone_ids_for_mode(mode: Optional[LightModelMode]) -> list[str]:
-    if mode is None or not isinstance(mode.layout, dict):
-        return []
-    zones = mode.layout.get("zones") or []
-    out: list[str] = []
-    for z in zones:
-        if isinstance(z, dict):
-            zid = z.get("id")
-            if isinstance(zid, str) and zid:
-                out.append(zid)
-    return out
-
-
-def _motion_axes_for_mode(mode: Optional[LightModelMode]) -> list[str]:
-    if mode is None or not isinstance(mode.layout, dict):
-        return []
-    motion = mode.layout.get("motion")
-    if not isinstance(motion, dict):
-        return []
-    return [a for a in ("pan", "tilt", "zoom", "focus") if a in motion]
-
-
-def _build_rig_context(sess: Session) -> dict[str, Any]:
-    """Snapshot the rig into a JSON-serializable dict for the system prompt."""
-    controllers = list(
-        sess.exec(select(Controller).order_by(Controller.id)).all()
-    )
-    lights = list(sess.exec(select(Light).order_by(Light.controller_id, Light.position, Light.id)).all())
-    models = list(sess.exec(select(LightModel)).all())
-    modes = list(sess.exec(select(LightModelMode)).all())
-    palettes = list(sess.exec(select(Palette).order_by(Palette.name)).all())
-
-    model_by_id = {m.id: m for m in models}
-    mode_by_id = {m.id: m for m in modes}
-
-    ctrl_out: list[dict[str, Any]] = []
-    for c in controllers:
-        entry: dict[str, Any] = {
-            "id": c.id,
-            "name": c.name,
-            "ip": c.ip,
-            "universe": f"{c.net}:{c.subnet}:{c.universe}",
-            "enabled": bool(c.enabled),
-        }
-        if c.notes:
-            entry["notes"] = c.notes
-        ctrl_out.append(entry)
-
-    light_out: list[dict[str, Any]] = []
-    for l in lights:
-        m = model_by_id.get(l.model_id)
-        mode = _mode_for_light(l, mode_by_id)
-        entry: dict[str, Any] = {
-            "id": l.id,
-            "name": l.name,
-            "controller_id": l.controller_id,
-            "start_address": l.start_address,
-            "model": m.name if m else "?",
-            "mode": mode.name if mode else "?",
-            "channels": list(mode.channels) if mode else list(m.channels or []) if m else [],
-            "current": {
-                "r": int(l.r or 0),
-                "g": int(l.g or 0),
-                "b": int(l.b or 0),
-                "dimmer": int(l.dimmer if l.dimmer is not None else 255),
-                "on": bool(l.on),
-            },
-        }
-        zones = _zone_ids_for_mode(mode)
-        if zones:
-            entry["zones"] = zones
-        axes = _motion_axes_for_mode(mode)
-        if axes:
-            entry["motion_axes"] = axes
-        if l.notes:
-            entry["notes"] = l.notes
-        light_out.append(entry)
-
-    palette_out = [
-        {"name": p.name, "colors": list(p.colors or [])} for p in palettes
-    ]
-
+def _build_palette_tool_schema() -> dict[str, Any]:
+    entry_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "r": {"type": "integer", "minimum": 0, "maximum": 255},
+            "g": {"type": "integer", "minimum": 0, "maximum": 255},
+            "b": {"type": "integer", "minimum": 0, "maximum": 255},
+            "w": {"type": "integer", "minimum": 0, "maximum": 255},
+            "a": {"type": "integer", "minimum": 0, "maximum": 255},
+            "uv": {"type": "integer", "minimum": 0, "maximum": 255},
+        },
+        "required": ["r", "g", "b"],
+    }
     return {
-        "controllers": ctrl_out,
-        "lights": light_out,
-        "palettes": palette_out,
+        "name": _PALETTE_TOOL_NAME,
+        "description": (
+            "Propose one or more palette drafts. Use this when the user "
+            "asks for a palette, color theme, or mood-based color set. "
+            "The UI will show a preview and let the user save."
+        ),
+        "input_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "summary": {"type": "string"},
+                "palettes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "proposal_id": {"type": "string"},
+                            "name": {"type": "string"},
+                            "notes": {"type": "string"},
+                            "entries": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 16,
+                                "items": entry_schema,
+                            },
+                        },
+                        "required": ["proposal_id", "name", "entries"],
+                    },
+                },
+            },
+            "required": ["summary", "palettes"],
+        },
     }
 
 
+def _build_effect_tool_schema() -> dict[str, Any]:
+    effect_types = [
+        "static", "fade", "cycle", "chase", "pulse",
+        "rainbow", "strobe", "sparkle", "wave",
+    ]
+    params_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "speed_hz": {
+                "type": "number", "minimum": 0, "maximum": EFFECT_SPEED_HZ_MAX,
+            },
+            "direction": {
+                "type": "string",
+                "enum": ["forward", "reverse", "pingpong"],
+            },
+            "offset": {"type": "number", "minimum": 0, "maximum": 1},
+            "intensity": {"type": "number", "minimum": 0, "maximum": 1},
+            "size": {
+                "type": "number", "minimum": 0, "maximum": EFFECT_SIZE_MAX,
+            },
+            "softness": {"type": "number", "minimum": 0, "maximum": 1},
+            "fade_in_s": {
+                "type": "number", "minimum": 0, "maximum": EFFECT_FADE_MAX_S,
+            },
+            "fade_out_s": {
+                "type": "number", "minimum": 0, "maximum": EFFECT_FADE_MAX_S,
+            },
+        },
+    }
+    return {
+        "name": _EFFECT_TOOL_NAME,
+        "description": (
+            "Propose one or more effect drafts. Use this when the user "
+            "asks for motion (chase, pulse, wave, strobe, etc.). The UI "
+            "will offer Apply (play on current selection) and Save."
+        ),
+        "input_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "summary": {"type": "string"},
+                "effects": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "proposal_id": {"type": "string"},
+                            "name": {"type": "string"},
+                            "notes": {"type": "string"},
+                            "effect_type": {
+                                "type": "string", "enum": effect_types
+                            },
+                            "palette_id": {"type": "integer"},
+                            "spread": {
+                                "type": "string",
+                                "enum": [
+                                    "across_lights",
+                                    "across_fixture",
+                                    "across_zones",
+                                ],
+                            },
+                            "params": params_schema,
+                            "target_channels": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    "enum": sorted(EFFECT_TARGET_CHANNELS),
+                                },
+                                "description": (
+                                    "Which logical channels the overlay "
+                                    "animates. Default ['rgb']. Use ['w'] "
+                                    "or ['strobe'] to chase just the aux "
+                                    "channel without touching RGB."
+                                ),
+                            },
+                        },
+                        "required": [
+                            "proposal_id", "name", "effect_type",
+                        ],
+                    },
+                },
+            },
+            "required": ["summary", "effects"],
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Rig context + system prompt
+# ---------------------------------------------------------------------------
 _SYSTEM_INTRO = (
     "You are a lighting designer for a live stage rig. The user gives you "
     "creative prompts (a mood, a song section, a theme) and you respond "
-    "with one or more concrete rig designs using the propose_rig_design "
-    "tool. Every response MUST be a single tool call - do not reply with "
-    "plain prose only.\n\n"
-    "Each proposal is either:\n"
-    "  - kind='state': a rig-wide look covering every fixture you want to "
-    "set (omit lights you want to leave alone).\n"
-    "  - kind='scene': a look scoped to one controller_id.\n\n"
+    "with a single tool call. Available tools:\n"
+    "  - propose_rig_design: emit one or more concrete rig snapshots "
+    "(kind='state' for rig-wide, kind='scene' for a single controller).\n"
+    "  - propose_palette: emit one or more palette drafts (r/g/b plus "
+    "optional w/a/uv).\n"
+    "  - propose_effect: emit one or more animated effect drafts (chase, "
+    "pulse, strobe, etc.). These run on the user's current selection.\n"
+    "Pick the tool that best matches the user's ask; if they want a "
+    "look, use propose_rig_design. If they ask for 'colors' or a "
+    "palette, use propose_palette. If they ask for motion, use "
+    "propose_effect.\n\n"
     "Rules:\n"
-    "- Only reference light_id values that exist in the rig snapshot.\n"
+    "- Only reference light_id / controller_id / palette_id values that "
+    "exist in the rig snapshot.\n"
     "- RGB components are 0..255 integers; dimmer is 0..255.\n"
     "- Use on=false to explicitly blackout a fixture.\n"
     "- For compound fixtures (with zones), prefer zone_state for rich "
@@ -327,8 +395,12 @@ _SYSTEM_INTRO = (
     "- Keep proposal names short (1-4 words).\n"
     "- When the user asks for multiple looks (a 'show', 'sunset to "
     "night', etc.), emit multiple proposals in one call.\n"
-    "- Use named palettes from the rig snapshot as color inspiration "
-    "when appropriate.\n"
+    "- Palettes should keep w/a/uv undefined unless the user asked for "
+    "explicit UV/amber/white accents. The fixture policy usually "
+    "derives them from RGB.\n"
+    "- Effects default to target_channels=['rgb']. To chase only the "
+    "white LED while preserving the color, use target_channels=['w']. "
+    "Similarly ['uv'] or ['strobe'] for accent animations.\n"
 )
 
 
@@ -500,10 +572,197 @@ def _sanitize_proposal(
     return out
 
 
+def _sanitize_palette_entry(raw: Any) -> Optional[dict[str, int]]:
+    if not isinstance(raw, dict):
+        return None
+    r = _clip_byte(raw.get("r"))
+    g = _clip_byte(raw.get("g"))
+    b = _clip_byte(raw.get("b"))
+    if r is None or g is None or b is None:
+        return None
+    out: dict[str, int] = {"r": r, "g": g, "b": b}
+    for aux in ("w", "a", "uv"):
+        val = _clip_byte(raw.get(aux))
+        if val is not None:
+            out[aux] = val
+    return out
+
+
+def _sanitize_palette_proposal(
+    raw: Any, *, used_ids: set[str]
+) -> Optional[dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    pid = raw.get("proposal_id")
+    if not isinstance(pid, str) or not pid.strip():
+        return None
+    pid = pid.strip()[:48]
+    if pid in used_ids:
+        return None
+    name = str(raw.get("name") or "").strip()[:128] or "Palette"
+    entries_raw = raw.get("entries")
+    if not isinstance(entries_raw, list) or not entries_raw:
+        return None
+    entries: list[dict[str, int]] = []
+    for e in entries_raw:
+        cleaned = _sanitize_palette_entry(e)
+        if cleaned is not None:
+            entries.append(cleaned)
+    if len(entries) < 2:
+        return None
+    notes = raw.get("notes")
+    notes_str = str(notes).strip()[:500] if notes else None
+    out: dict[str, Any] = {
+        "proposal_id": pid,
+        "kind": "palette",
+        "name": name,
+        "palette_entries": entries,
+    }
+    if notes_str:
+        out["notes"] = notes_str
+    return out
+
+
+_EFFECT_TYPE_SET = {
+    "static", "fade", "cycle", "chase", "pulse",
+    "rainbow", "strobe", "sparkle", "wave",
+}
+_SPREAD_SET = {"across_lights", "across_fixture", "across_zones"}
+_DIRECTION_SET = {"forward", "reverse", "pingpong"}
+
+
+def _sanitize_effect_params(raw: Any) -> dict[str, Any]:
+    """Clamp Claude-supplied effect params to our EffectParams ranges."""
+    defaults = EffectParams().model_dump()
+    if not isinstance(raw, dict):
+        return defaults
+    out = dict(defaults)
+
+    def _num(key: str, lo: float, hi: float) -> None:
+        v = raw.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            fv = float(v)
+            out[key] = max(lo, min(hi, fv))
+
+    _num("speed_hz", 0.0, EFFECT_SPEED_HZ_MAX)
+    _num("offset", 0.0, 1.0)
+    _num("intensity", 0.0, 1.0)
+    _num("size", 0.0, EFFECT_SIZE_MAX)
+    _num("softness", 0.0, 1.0)
+    _num("fade_in_s", 0.0, EFFECT_FADE_MAX_S)
+    _num("fade_out_s", 0.0, EFFECT_FADE_MAX_S)
+    d = raw.get("direction")
+    if isinstance(d, str) and d in _DIRECTION_SET:
+        out["direction"] = d
+    return out
+
+
+def _sanitize_effect_proposal(
+    raw: Any,
+    *,
+    used_ids: set[str],
+    rig_palette_ids: set[int],
+) -> Optional[dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    pid = raw.get("proposal_id")
+    if not isinstance(pid, str) or not pid.strip():
+        return None
+    pid = pid.strip()[:48]
+    if pid in used_ids:
+        return None
+    name = str(raw.get("name") or "").strip()[:128] or "Effect"
+    etype = raw.get("effect_type")
+    if etype not in _EFFECT_TYPE_SET:
+        return None
+    spread = raw.get("spread")
+    if spread not in _SPREAD_SET:
+        spread = "across_lights"
+    palette_id = raw.get("palette_id")
+    if not isinstance(palette_id, int) or palette_id not in rig_palette_ids:
+        palette_id = None
+    tc_raw = raw.get("target_channels")
+    tc: list[str] = ["rgb"]
+    if isinstance(tc_raw, list):
+        cleaned = [
+            str(x).lower().strip()
+            for x in tc_raw
+            if isinstance(x, str) and str(x).lower().strip() in EFFECT_TARGET_CHANNELS
+        ]
+        if cleaned:
+            # dedupe preserving order
+            seen: list[str] = []
+            for c in cleaned:
+                if c not in seen:
+                    seen.append(c)
+            tc = seen
+    params = _sanitize_effect_params(raw.get("params"))
+    notes = raw.get("notes")
+    notes_str = str(notes).strip()[:500] if notes else None
+    body: dict[str, Any] = {
+        "effect_type": etype,
+        "palette_id": palette_id,
+        "spread": spread,
+        "params": params,
+        "target_channels": tc,
+    }
+    out: dict[str, Any] = {
+        "proposal_id": pid,
+        "kind": "effect",
+        "name": name,
+        "effect": body,
+    }
+    if notes_str:
+        out["notes"] = notes_str
+    return out
+
+
 def _sanitize_tool_payload(
-    raw: Any, sess: Session
+    raw: Any, sess: Session, *, tool_name: str = _TOOL_NAME
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Return (summary, proposals[]) with all ids validated against the rig."""
+    """Return (summary, proposals[]) with all ids validated against the rig.
+
+    ``tool_name`` dispatches to the right per-proposal sanitizer. All
+    proposals are returned under a single unified shape (discriminated by
+    ``kind``) so ``last_proposal`` can store a mixed list."""
+    if not isinstance(raw, dict):
+        return "", []
+    summary = str(raw.get("summary") or "").strip()[:1000]
+
+    if tool_name == _PALETTE_TOOL_NAME:
+        items = raw.get("palettes")
+        if not isinstance(items, list):
+            return summary, []
+        used_ids: set[str] = set()
+        cleaned: list[dict[str, Any]] = []
+        for entry in items:
+            res = _sanitize_palette_proposal(entry, used_ids=used_ids)
+            if res is None:
+                continue
+            used_ids.add(res["proposal_id"])
+            cleaned.append(res)
+        return summary, cleaned
+
+    if tool_name == _EFFECT_TOOL_NAME:
+        items = raw.get("effects")
+        if not isinstance(items, list):
+            return summary, []
+        rig_palette_ids: set[int] = {
+            p.id for p in sess.exec(select(Palette)).all() if p.id is not None
+        }
+        used_ids = set()
+        cleaned = []
+        for entry in items:
+            res = _sanitize_effect_proposal(
+                entry, used_ids=used_ids, rig_palette_ids=rig_palette_ids
+            )
+            if res is None:
+                continue
+            used_ids.add(res["proposal_id"])
+            cleaned.append(res)
+        return summary, cleaned
+
+    # Default: propose_rig_design
     lights = sess.exec(select(Light)).all()
     controllers = sess.exec(select(Controller)).all()
     modes = sess.exec(select(LightModelMode)).all()
@@ -519,22 +778,19 @@ def _sanitize_tool_payload(
         if l.id is None:
             continue
         mode = mode_by_id.get(l.mode_id) if l.mode_id is not None else None
-        zones = set(_zone_ids_for_mode(mode))
+        zones = set(zone_ids_for_mode(mode))
         if zones:
             light_zones_by_id[l.id] = zones
-        axes = set(_motion_axes_for_mode(mode))
+        axes = set(motion_axes_for_mode(mode))
         if axes:
             light_axes_by_id[l.id] = axes
 
-    if not isinstance(raw, dict):
-        return "", []
-    summary = str(raw.get("summary") or "").strip()[:1000]
     proposals_raw = raw.get("proposals")
     if not isinstance(proposals_raw, list):
         return summary, []
 
-    used_ids: set[str] = set()
-    cleaned: list[dict[str, Any]] = []
+    used_ids = set()
+    cleaned = []
     for entry in proposals_raw:
         res = _sanitize_proposal(
             entry,
@@ -554,6 +810,61 @@ def _sanitize_tool_payload(
 # ---------------------------------------------------------------------------
 # Conversation serialization
 # ---------------------------------------------------------------------------
+def _proposal_from_dict(p: dict[str, Any]) -> Optional[DesignerProposal]:
+    """Rehydrate a stored proposal dict into a :class:`DesignerProposal`."""
+    try:
+        kind = p.get("kind", "state")
+        if kind == "palette":
+            entries_raw = p.get("palette_entries") or []
+            entries: list[PaletteEntry] = []
+            for e in entries_raw:
+                if isinstance(e, dict):
+                    try:
+                        entries.append(PaletteEntry(**e))
+                    except Exception:
+                        continue
+            if not entries:
+                return None
+            return DesignerProposal(
+                proposal_id=str(p.get("proposal_id")),
+                kind="palette",
+                name=str(p.get("name") or ""),
+                notes=p.get("notes"),
+                lights=[],
+                palette_entries=entries,
+            )
+        if kind == "effect":
+            body = p.get("effect")
+            if not isinstance(body, dict):
+                return None
+            try:
+                effect_body = DesignerEffectProposalBody(**body)
+            except Exception:
+                return None
+            return DesignerProposal(
+                proposal_id=str(p.get("proposal_id")),
+                kind="effect",
+                name=str(p.get("name") or ""),
+                notes=p.get("notes"),
+                lights=[],
+                effect=effect_body,
+            )
+        return DesignerProposal(
+            proposal_id=str(p.get("proposal_id")),
+            kind=kind,
+            name=str(p.get("name") or ""),
+            controller_id=p.get("controller_id"),
+            notes=p.get("notes"),
+            lights=[
+                DesignerProposalLight(**lp)
+                for lp in (p.get("lights") or [])
+                if isinstance(lp, dict)
+            ],
+        )
+    except Exception:
+        return None
+
+
 def _render_message(raw_msg: dict[str, Any]) -> DesignerMessageOut:
     """Convert one stored Anthropic-shaped message into a UI-friendly form."""
     role_raw = raw_msg.get("role", "assistant")
@@ -574,31 +885,30 @@ def _render_message(raw_msg: dict[str, Any]) -> DesignerMessageOut:
                 t = block.get("text")
                 if isinstance(t, str):
                     text_out.append(t)
-            elif btype == "tool_use" and block.get("name") == _TOOL_NAME:
+            elif btype == "tool_use" and block.get("name") in _DESIGNER_TOOL_NAMES:
                 inp = block.get("input") or {}
                 if isinstance(inp, dict):
                     summary = inp.get("summary")
                     if isinstance(summary, str) and summary.strip():
                         text_out.append(summary.strip())
-                    for p in inp.get("proposals") or []:
+                    # Normalize the per-tool key names into a single
+                    # "proposals" list. The stored version (after
+                    # sanitization) already has this shape, so read that
+                    # first and fall back to the raw Claude shape when
+                    # this message was written before the change.
+                    items = inp.get("proposals")
+                    if not isinstance(items, list):
+                        if block.get("name") == _PALETTE_TOOL_NAME:
+                            items = inp.get("palettes") or []
+                        elif block.get("name") == _EFFECT_TOOL_NAME:
+                            items = inp.get("effects") or []
+                        else:
+                            items = []
+                    for p in items or []:
                         if isinstance(p, dict):
-                            try:
-                                proposals.append(
-                                    DesignerProposal(
-                                        proposal_id=str(p.get("proposal_id")),
-                                        kind=p.get("kind", "state"),
-                                        name=str(p.get("name") or ""),
-                                        controller_id=p.get("controller_id"),
-                                        notes=p.get("notes"),
-                                        lights=[
-                                            DesignerProposalLight(**lp)
-                                            for lp in (p.get("lights") or [])
-                                            if isinstance(lp, dict)
-                                        ],
-                                    )
-                                )
-                            except Exception:
-                                continue
+                            rendered = _proposal_from_dict(p)
+                            if rendered is not None:
+                                proposals.append(rendered)
     return DesignerMessageOut(
         role=role,
         text="\n\n".join(s for s in text_out if s),
@@ -616,23 +926,9 @@ def _convo_to_out(row: DesignerConversation) -> DesignerConversationOut:
     if isinstance(lp, dict):
         for p in lp.get("proposals") or []:
             if isinstance(p, dict):
-                try:
-                    last_props.append(
-                        DesignerProposal(
-                            proposal_id=str(p.get("proposal_id")),
-                            kind=p.get("kind", "state"),
-                            name=str(p.get("name") or ""),
-                            controller_id=p.get("controller_id"),
-                            notes=p.get("notes"),
-                            lights=[
-                                DesignerProposalLight(**lp)
-                                for lp in (p.get("lights") or [])
-                                if isinstance(lp, dict)
-                            ],
-                        )
-                    )
-                except Exception:
-                    continue
+                rendered_p = _proposal_from_dict(p)
+                if rendered_p is not None:
+                    last_props.append(rendered_p)
     return DesignerConversationOut(
         id=row.id,
         name=row.name or "",
@@ -775,6 +1071,52 @@ def apply_proposal(
     if row is None:
         raise HTTPException(404, "conversation not found")
     prop = _find_proposal(row, payload.proposal_id)
+    kind = prop.get("kind")
+
+    if kind == "palette":
+        # "Apply" for a palette in the designer means "save the palette"
+        # because there's no obvious rig target. We don't paint lights
+        # here; the user can apply the saved palette from the Palettes
+        # page.
+        return _save_palette_proposal(prop, sess, payload_name=None)
+
+    if kind == "effect":
+        body = prop.get("effect") or {}
+        if not isinstance(body, dict):
+            raise HTTPException(400, "effect proposal missing body")
+        etype = body.get("effect_type")
+        if etype not in _EFFECT_TYPE_SET:
+            raise HTTPException(400, "invalid effect_type in proposal")
+        palette_id = body.get("palette_id")
+        # Playing with no target defaults to "every light" via the engine.
+        light_ids: list[int] = []
+        if isinstance(body.get("light_ids"), list):
+            light_ids = [
+                int(i) for i in body["light_ids"] if isinstance(i, int)
+            ]
+        target_channels = list(body.get("target_channels") or ["rgb"])
+        palette_colors: list[str] = ["#FFFFFF"]
+        if isinstance(palette_id, int):
+            pal = sess.get(Palette, palette_id)
+            if pal is not None and pal.colors:
+                palette_colors = list(pal.colors)
+        handle = new_handle()
+        spec = EffectSpec(
+            handle=handle,
+            effect_id=None,
+            name=str(prop.get("name") or f"Live {etype}"),
+            effect_type=str(etype),
+            palette_colors=palette_colors,
+            light_ids=light_ids,
+            targets=[],
+            spread=str(body.get("spread", "across_lights")),
+            params=dict(body.get("params") or {}),
+            target_channels=target_channels,
+        )
+        effect_engine.play(spec)
+        return {"ok": True, "kind": "effect", "handle": handle}
+
+    # Default: state / scene
     entries = [
         _proposal_to_state_entry(pl)
         for pl in prop.get("lights") or []
@@ -801,6 +1143,73 @@ def apply_proposal(
     return {"ok": True, "applied": applied}
 
 
+def _save_palette_proposal(
+    prop: dict[str, Any], sess: Session, *, payload_name: Optional[str]
+) -> dict[str, Any]:
+    """Persist a palette proposal as a :class:`Palette` row."""
+    entries_raw = prop.get("palette_entries") or []
+    entries: list[dict[str, int]] = []
+    for e in entries_raw:
+        if isinstance(e, dict):
+            try:
+                PaletteEntry(**e)  # validate
+            except Exception:
+                continue
+            entries.append({k: int(v) for k, v in e.items() if isinstance(v, int)})
+    if not entries:
+        raise HTTPException(400, "palette proposal has no valid entries")
+    name = (payload_name or prop.get("name") or "").strip()[:128] or "Palette"
+    colors = [
+        f"#{int(e['r']):02X}{int(e['g']):02X}{int(e['b']):02X}"
+        for e in entries
+    ]
+    pal = Palette(name=name, colors=colors, entries=entries, builtin=False)
+    sess.add(pal)
+    sess.commit()
+    sess.refresh(pal)
+    return {"ok": True, "kind": "palette", "id": pal.id, "name": name}
+
+
+def _save_effect_proposal(
+    prop: dict[str, Any], sess: Session, *, payload_name: Optional[str]
+) -> dict[str, Any]:
+    body = prop.get("effect") or {}
+    if not isinstance(body, dict):
+        raise HTTPException(400, "effect proposal missing body")
+    etype = body.get("effect_type")
+    if etype not in _EFFECT_TYPE_SET:
+        raise HTTPException(400, "invalid effect_type")
+    spread = body.get("spread") or "across_lights"
+    if spread not in _SPREAD_SET:
+        spread = "across_lights"
+    palette_id = body.get("palette_id")
+    if not isinstance(palette_id, int):
+        palette_id = None
+    params_dict = dict(body.get("params") or {})
+    try:
+        params = EffectParams(**params_dict).model_dump()
+    except Exception:
+        params = EffectParams().model_dump()
+    target_channels = list(body.get("target_channels") or ["rgb"])
+    name = (payload_name or prop.get("name") or "").strip()[:128] or "Effect"
+    row = Effect(
+        name=name,
+        effect_type=str(etype),
+        palette_id=palette_id,
+        light_ids=[],
+        targets=[],
+        spread=spread,
+        params=params,
+        target_channels=target_channels,
+        is_active=False,
+        builtin=False,
+    )
+    sess.add(row)
+    sess.commit()
+    sess.refresh(row)
+    return {"ok": True, "kind": "effect", "id": row.id, "name": name}
+
+
 @router.post("/conversations/{cid}/save")
 def save_proposal(
     cid: int,
@@ -811,6 +1220,13 @@ def save_proposal(
     if row is None:
         raise HTTPException(404, "conversation not found")
     prop = _find_proposal(row, payload.proposal_id)
+    kind = prop.get("kind")
+
+    if kind == "palette":
+        return _save_palette_proposal(prop, sess, payload_name=payload.name)
+    if kind == "effect":
+        return _save_effect_proposal(prop, sess, payload_name=payload.name)
+
     name = (payload.name or prop.get("name") or "").strip()[:128]
     if not name:
         raise HTTPException(400, "save requires a non-empty name")
@@ -823,7 +1239,6 @@ def save_proposal(
     if not entries:
         raise HTTPException(400, "proposal has no lights to save")
 
-    kind = prop.get("kind")
     if kind == "scene":
         cid_target = prop.get("controller_id")
         if not isinstance(cid_target, int):
@@ -904,10 +1319,14 @@ async def stream_message(
             503, "anthropic package is not installed on the server"
         ) from exc
 
-    rig = _build_rig_context(sess)
+    rig = build_rig_context(sess)
     system_prompt = _build_system_prompt(rig)
     api_messages = _build_messages_for_api(row.messages or [], payload.message)
-    tool_schema = _build_tool_schema()
+    tool_schemas = [
+        _build_tool_schema(),
+        _build_palette_tool_schema(),
+        _build_effect_tool_schema(),
+    ]
     user_text = payload.message
     conversation_id = cid
 
@@ -928,8 +1347,8 @@ async def stream_message(
                     model=ANTHROPIC_MODEL,
                     max_tokens=8192,
                     system=system_prompt,
-                    tools=[tool_schema],
-                    tool_choice={"type": "tool", "name": _TOOL_NAME},
+                    tools=tool_schemas,
+                    tool_choice={"type": "any"},
                     messages=api_messages,
                 ) as stream:
                     for event in stream:
@@ -1056,16 +1475,24 @@ async def stream_message(
         proposals_clean: list[dict[str, Any]] = []
         summary_text = ""
         for block in final_content_blocks:
-            if block.get("type") == "tool_use" and block.get("name") == _TOOL_NAME:
+            if (
+                block.get("type") == "tool_use"
+                and block.get("name") in _DESIGNER_TOOL_NAMES
+            ):
                 summary_text, proposals_clean = _sanitize_tool_payload(
-                    block.get("input"), sess
+                    block.get("input"), sess, tool_name=block.get("name"),
                 )
                 break
 
         # Rewrite the tool_use input in place with the sanitized payload so
-        # the stored history matches what we'll later Apply/Save on.
+        # the stored history matches what we'll later Apply/Save on. The
+        # stored shape is always the same ("summary" + "proposals") even
+        # though the raw Claude input differs per tool.
         for block in final_content_blocks:
-            if block.get("type") == "tool_use" and block.get("name") == _TOOL_NAME:
+            if (
+                block.get("type") == "tool_use"
+                and block.get("name") in _DESIGNER_TOOL_NAMES
+            ):
                 block["input"] = {
                     "summary": summary_text,
                     "proposals": proposals_clean,

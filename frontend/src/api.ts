@@ -309,11 +309,37 @@ export type RenderedLight = {
   zone_state: Record<string, RenderedLightZone>;
 };
 
+export type PaletteEntry = {
+  r: number;
+  g: number;
+  b: number;
+  /** Optional explicit white channel value (0-255). When absent, the
+   *  palette paint logic derives it from RGB (mix policy) or leaves
+   *  the user's fader alone (direct policy). */
+  w?: number | null;
+  /** Optional explicit amber channel value (0-255). */
+  a?: number | null;
+  /** Optional explicit UV channel value (0-255). UV is sometimes
+   *  labelled "V" (violet) in hardware docs - they are the same
+   *  channel role in this app. */
+  uv?: number | null;
+};
+
 export type Palette = {
   id: number;
   name: string;
+  /** Legacy hex view of the palette. Always kept in sync with the
+   *  ``entries`` array on the backend. */
   colors: string[];
+  /** Structured per-color entries carrying optional W/A/UV values. */
+  entries: PaletteEntry[];
   builtin: boolean;
+};
+
+export type PaletteGenerateResponse = {
+  name: string;
+  entries: PaletteEntry[];
+  summary?: string | null;
 };
 
 export type AuthStatus = { authenticated: boolean };
@@ -381,6 +407,23 @@ export type EffectType =
 
 export type EffectDirection = "forward" | "reverse" | "pingpong";
 
+/** Channel groups an effect overlay can drive. */
+export type EffectTargetChannel =
+  | "rgb"
+  | "w"
+  | "a"
+  | "uv"
+  | "dimmer"
+  | "strobe";
+
+/** Slider caps shared between UI and backend validators. Raise
+ *  cautiously - values beyond these rarely model anything physical. */
+export const EFFECT_LIMITS = {
+  speed_hz_max: 25,
+  size_max: 16,
+  fade_max_s: 30,
+} as const;
+
 export type EffectParams = {
   speed_hz: number;
   direction: EffectDirection;
@@ -412,6 +455,7 @@ export type Effect = {
   targets: BulkTarget[];
   spread: PaletteSpread;
   params: EffectParams;
+  target_channels: EffectTargetChannel[];
   is_active: boolean;
   builtin: boolean;
 };
@@ -424,6 +468,7 @@ export type EffectInput = {
   targets: BulkTarget[];
   spread: PaletteSpread;
   params: EffectParams;
+  target_channels?: EffectTargetChannel[];
 };
 
 export type LiveEffectInput = Omit<EffectInput, "name"> & { name?: string };
@@ -575,12 +620,22 @@ export const Api = {
     }),
 
   listPalettes: () => api.get<Palette[]>("/api/palettes"),
-  createPalette: (body: { name: string; colors: string[] }) =>
-    api.post<Palette>("/api/palettes", body),
-  updatePalette: (id: number, body: { name: string; colors: string[] }) =>
-    api.patch<Palette>(`/api/palettes/${id}`, body),
+  createPalette: (body: {
+    name: string;
+    colors?: string[];
+    entries?: PaletteEntry[];
+  }) => api.post<Palette>("/api/palettes", body),
+  updatePalette: (
+    id: number,
+    body: { name: string; colors?: string[]; entries?: PaletteEntry[] },
+  ) => api.patch<Palette>(`/api/palettes/${id}`, body),
   deletePalette: (id: number) => api.del<void>(`/api/palettes/${id}`),
   clonePalette: (id: number) => api.post<Palette>(`/api/palettes/${id}/clone`),
+  generatePalette: (body: {
+    prompt: string;
+    num_colors?: number;
+    include_aux?: boolean;
+  }) => api.post<PaletteGenerateResponse>(`/api/palettes/generate`, body),
   applyPalette: (
     id: number,
     lightIds: number[],
@@ -678,10 +733,16 @@ export const Api = {
     deleteConversation: (cid: number) =>
       api.del<void>(`/api/designer/conversations/${cid}`),
     applyProposal: (cid: number, proposal_id: string) =>
-      api.post<{ ok: boolean; applied: number }>(
-        `/api/designer/conversations/${cid}/apply`,
-        { proposal_id },
-      ),
+      api.post<{
+        ok: boolean;
+        /** Number of lights touched for state/scene proposals. */
+        applied?: number;
+        /** Engine handle for effect proposals; handle/kind/id for
+         *  palettes that were auto-saved. */
+        handle?: string;
+        kind?: "palette" | "effect";
+        id?: number;
+      }>(`/api/designer/conversations/${cid}/apply`, { proposal_id }),
     saveProposal: (
       cid: number,
       proposal_id: string,
@@ -689,7 +750,7 @@ export const Api = {
     ) =>
       api.post<{
         ok: boolean;
-        kind: "state" | "scene";
+        kind: "state" | "scene" | "palette" | "effect";
         id: number;
         name: string;
       }>(`/api/designer/conversations/${cid}/save`, {
@@ -697,6 +758,42 @@ export const Api = {
         name: name ?? null,
       }),
     streamMessage: streamDesignerMessage,
+  },
+
+  effectChat: {
+    status: () => api.get<AiStatus>("/api/effect-chat/status"),
+    listConversations: () =>
+      api.get<EffectConversationSummary[]>(`/api/effect-chat/conversations`),
+    createConversation: (name?: string) =>
+      api.post<EffectConversationData>(`/api/effect-chat/conversations`, {
+        name: name ?? null,
+      }),
+    getConversation: (cid: number) =>
+      api.get<EffectConversationData>(
+        `/api/effect-chat/conversations/${cid}`,
+      ),
+    renameConversation: (cid: number, name: string) =>
+      api.patch<EffectConversationData>(
+        `/api/effect-chat/conversations/${cid}`,
+        { name },
+      ),
+    deleteConversation: (cid: number) =>
+      api.del<void>(`/api/effect-chat/conversations/${cid}`),
+    applyProposal: (
+      cid: number,
+      proposal_id: string,
+      light_ids: number[] = [],
+    ) =>
+      api.post<{ ok: boolean; handle: string; name: string }>(
+        `/api/effect-chat/conversations/${cid}/apply`,
+        { proposal_id, light_ids },
+      ),
+    saveProposal: (cid: number, proposal_id: string, name?: string) =>
+      api.post<{ ok: boolean; id: number; name: string }>(
+        `/api/effect-chat/conversations/${cid}/save`,
+        { proposal_id, name: name ?? null },
+      ),
+    streamMessage: streamEffectChatMessage,
   },
 };
 
@@ -717,13 +814,27 @@ export type DesignerProposalLight = {
   motion_state?: MotionState;
 };
 
+export type DesignerEffectProposalBody = {
+  effect_type: EffectType;
+  palette_id: number | null;
+  spread: PaletteSpread;
+  params: EffectParams;
+  target_channels: EffectTargetChannel[];
+  light_ids: number[];
+  targets: BulkTarget[];
+};
+
 export type DesignerProposal = {
   proposal_id: string;
-  kind: "state" | "scene";
+  kind: "state" | "scene" | "palette" | "effect";
   name: string;
   controller_id?: number | null;
   notes?: string | null;
   lights: DesignerProposalLight[];
+  /** Only set when kind === "palette". */
+  palette_entries?: PaletteEntry[] | null;
+  /** Only set when kind === "effect". */
+  effect?: DesignerEffectProposalBody | null;
 };
 
 export type DesignerMessage = {
@@ -764,6 +875,56 @@ export type DesignerStreamHandle = {
   /** Resolves when the stream fully finishes (done or error). */
   done: Promise<void>;
 };
+
+// ---------------------------------------------------------------------------
+// Effect chat types (multi-turn iterative effect authoring with Claude)
+// ---------------------------------------------------------------------------
+export type EffectProposal = {
+  proposal_id: string;
+  summary?: string | null;
+  name: string;
+  effect_type: EffectType;
+  palette_id: number | null;
+  spread: PaletteSpread;
+  params: EffectParams;
+  target_channels: EffectTargetChannel[];
+  light_ids: number[];
+  targets: BulkTarget[];
+};
+
+export type EffectChatMessage = {
+  role: "user" | "assistant";
+  text: string;
+  proposal: EffectProposal | null;
+};
+
+export type EffectConversationData = {
+  id: number;
+  name: string;
+  created_at: string;
+  updated_at: string;
+  messages: EffectChatMessage[];
+  last_proposal: EffectProposal | null;
+};
+
+export type EffectConversationSummary = {
+  id: number;
+  name: string;
+  message_count: number;
+  updated_at: string;
+};
+
+export type EffectChatStreamHandlers = {
+  onStart?: (data: { conversation_id: number }) => void;
+  onText?: (delta: string) => void;
+  onToolStart?: (tool: string) => void;
+  onToolDelta?: (partialJson: string) => void;
+  onProposal?: (proposal: EffectProposal | null) => void;
+  onDone?: (conversation: EffectConversationData) => void;
+  onError?: (message: string) => void;
+};
+
+export type EffectChatStreamHandle = DesignerStreamHandle;
 
 /** Stream a designer turn.
  *
@@ -888,6 +1049,146 @@ function streamDesignerMessage(
       dispatch(event, dataLines.join("\n"));
     };
 
+    try {
+      while (true) {
+        const { value, done: streamDone } = await reader.read();
+        if (streamDone) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          flushEventBlock(block);
+        }
+      }
+      if (buf.trim()) flushEventBlock(buf);
+    } catch (e) {
+      if ((e as { name?: string }).name === "AbortError") return;
+      handlers.onError?.(String(e));
+    }
+  })();
+  return {
+    cancel: () => ctrl.abort(),
+    done,
+  };
+}
+
+/** Stream an effect chat turn. Same SSE shape as the designer stream
+ *  but each turn emits at most one proposal (an EffectProposal) rather
+ *  than an array of DesignerProposals. */
+function streamEffectChatMessage(
+  cid: number,
+  message: string,
+  handlers: EffectChatStreamHandlers,
+): EffectChatStreamHandle {
+  const ctrl = new AbortController();
+  const done = (async () => {
+    let res: Response;
+    try {
+      res = await fetch(`/api/effect-chat/conversations/${cid}/message`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
+        body: JSON.stringify({ message }),
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      if ((e as { name?: string }).name === "AbortError") return;
+      handlers.onError?.(String(e));
+      return;
+    }
+    if (!res.ok || !res.body) {
+      const text = await res.text().catch(() => "");
+      let detail = text || res.statusText;
+      try {
+        const parsed = JSON.parse(text);
+        if (
+          parsed &&
+          typeof parsed === "object" &&
+          "detail" in parsed &&
+          typeof (parsed as { detail: unknown }).detail === "string"
+        ) {
+          detail = (parsed as { detail: string }).detail;
+        }
+      } catch {
+        // Non-JSON body; fall through.
+      }
+      handlers.onError?.(detail || `HTTP ${res.status}`);
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buf = "";
+    const dispatch = (event: string, data: string) => {
+      let parsed: unknown = null;
+      if (data.length > 0) {
+        try {
+          parsed = JSON.parse(data);
+        } catch {
+          parsed = data;
+        }
+      }
+      switch (event) {
+        case "start":
+          handlers.onStart?.(parsed as { conversation_id: number });
+          break;
+        case "text":
+          handlers.onText?.(
+            (parsed as { delta?: string })?.delta ?? "",
+          );
+          break;
+        case "tool_start":
+          handlers.onToolStart?.(
+            (parsed as { tool?: string })?.tool ?? "",
+          );
+          break;
+        case "tool_delta":
+          handlers.onToolDelta?.(
+            (parsed as { partial_json?: string })?.partial_json ?? "",
+          );
+          break;
+        case "proposal":
+          handlers.onProposal?.(parsed as EffectProposal | null);
+          break;
+        case "done":
+          if (
+            parsed &&
+            typeof parsed === "object" &&
+            "conversation" in parsed
+          ) {
+            handlers.onDone?.(
+              (parsed as { conversation: EffectConversationData })
+                .conversation,
+            );
+          }
+          break;
+        case "error":
+          handlers.onError?.(
+            (parsed as { message?: string })?.message ?? "stream error",
+          );
+          break;
+        default:
+          break;
+      }
+    };
+    const flushEventBlock = (block: string) => {
+      if (!block) return;
+      let event = "message";
+      const dataLines: string[] = [];
+      for (const line of block.split("\n")) {
+        if (line.startsWith(":")) continue;
+        if (line.startsWith("event:")) {
+          event = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).trim());
+        }
+      }
+      dispatch(event, dataLines.join("\n"));
+    };
     try {
       while (true) {
         const { value, done: streamDone } = await reader.read();

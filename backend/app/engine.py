@@ -62,6 +62,7 @@ class EffectSpec:
     targets: list[dict]
     spread: str
     params: dict
+    target_channels: list[str] = field(default_factory=lambda: ["rgb"])
 
 
 @dataclass
@@ -281,8 +282,10 @@ class EffectEngine:
         # Collect which lights every effect wants to touch this frame so
         # that when an effect stops we know which lights to restore.
         all_touched: set[int] = set()
-        # per-light: list of (overlay, fade_weight) to merge
-        per_light: dict[int, list[tuple[LightOverlay, float]]] = {}
+        # per-light: list of (overlay, fade_weight, target_channels) to merge
+        per_light: dict[
+            int, list[tuple[LightOverlay, float, list[str]]]
+        ] = {}
 
         completed_handles: list[str] = []
 
@@ -322,8 +325,9 @@ class EffectEngine:
                 modes_by_id=self._modes_by_id,
             )
             rs.touched = set(overlays.keys())
+            tc = list(spec.target_channels or ["rgb"])
             for lid, ov in overlays.items():
-                per_light.setdefault(lid, []).append((ov, fade_weight))
+                per_light.setdefault(lid, []).append((ov, fade_weight, tc))
                 all_touched.add(lid)
 
         # For every touched light, render base -> merge overlays -> push.
@@ -337,9 +341,14 @@ class EffectEngine:
                 zone_ids_for_light(light, self._modes_by_id)
             )
             policy = self._policy_for_light(light)
-            for overlay, fade_weight in contributions:
+            for overlay, fade_weight, target_channels in contributions:
                 state = merge_overlay_into_state(
-                    state, overlay, zone_ids, fade_weight, policy
+                    state,
+                    overlay,
+                    zone_ids,
+                    fade_weight,
+                    policy,
+                    target_channels,
                 )
             manager.set_light_state_deferred(lid, state)
 
@@ -469,4 +478,5 @@ def build_spec_from_effect(
         targets=targets,
         spread=effect.spread,
         params=dict(effect.params or {}),
+        target_channels=list(effect.target_channels or ["rgb"]),
     )

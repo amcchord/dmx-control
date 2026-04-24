@@ -15,19 +15,39 @@ a Caddy + systemd deployment that fronts everything at
   RGBWA+UV+dimmer bar is a first-class citizen.
 - Place **lights** on controllers at a specific DMX start address, with a
   "create N in a row" helper that auto-spaces by the model's channel count.
-- Maintain a library of **color palettes** — 15 built-ins (Cyberpunk Neon,
+- Maintain a library of **color palettes** — 17 built-ins (Cyberpunk Neon,
   Synthwave Sunset, Vaporwave, Aurora Borealis, Deep Ocean, Forest Canopy,
   Ember and Ash, Candlelight, Ice and Fire, Blood Moon, Pastel Dream,
-  Halloween, Bioluminescence, Desert Sunset, Rainbow Spectrum) plus unlimited
-  user-defined palettes.
+  Halloween, Bioluminescence, Desert Sunset, Rainbow Spectrum, UV Blacklight,
+  Warm Amber Wash) plus unlimited user-defined palettes. Each palette entry
+  carries RGB **plus optional explicit W / A / UV (also called "V") values**,
+  so a palette can kick the amber LED or UV strip independently of the
+  fixture's RGB derivation.
+- **Generate palettes with Claude** from a free-text prompt
+  (`POST /api/palettes/generate`) — the returned draft is loaded into the
+  editor where the user can tweak and save.
 - Apply a palette to a selection of lights in **cycle**, **gradient**, or
   **random** mode.
 - Turn lights on/off, set individual colors, and bulk-blackout a controller.
 - Run a real-time **effect engine** (static, fade, cycle, chase, pulse,
   rainbow, strobe, sparkle, wave) with per-effect fade-in/out, spread
-  (across lights / across fixture / across zones), and six curated
+  (across lights / across fixture / across zones), and nine curated
   built-in effects. Effects are non-destructive: stopping one cleanly
   restores whatever base color was in place.
+- Every effect carries a **`target_channels`** list that decides which
+  logical channels the overlay animates: `rgb` (default) blends into the
+  fixture's color, `w` / `a` / `uv` drive a scalar brightness on the
+  white / amber / UV LEDs **without touching RGB**, and `dimmer` /
+  `strobe` animate the master dimmer or strobe faders. This is how
+  "keep the wash red but chase a white pulse across the bar" works.
+- **Dedicated `/effects` page** — full-page editor with a simulated
+  preview grid (JS port of the effect math, no DMX required), a
+  "push live" toggle that drives `/api/effects/live` against the
+  currently selected lights, a target-channel chip selector, saved
+  presets with one-click load, and an **inline Claude chat** that
+  iteratively refines the effect (say "faster", "tighter window",
+  "chase only the white channel" and Claude returns a fresh
+  `EffectIn` draft each turn).
 - Save and recall named **scenes** — snapshots of every light's current
   color/dimmer/on state, scoped per-controller or spanning the whole rig.
   Each controller's header on the Lights page gets a `Restore scene`
@@ -52,9 +72,10 @@ a Caddy + systemd deployment that fronts everything at
 - **Designer tab** — a multi-turn chat with Claude Opus that turns a
   natural-language prompt ("warm amber ballad wash", "four-part DJ set:
   build, drop, breakdown, outro") into structured rig designs. Claude
-  returns one or more **proposals** via a forced `tool_use` call; each
-  proposal is either a rig-wide `State` or a per-controller `Scene`
-  covering whichever lights it wants to set. Responses stream
+  picks from three tools per turn: `propose_rig_design` (rig-wide
+  `State` or per-controller `Scene`), `propose_palette` (a new palette
+  draft), or `propose_effect` (an animated effect ready to play on the
+  current selection or save as a preset). Responses stream
   token-by-token over Server-Sent Events, with per-light color swatches
   and one-click `Apply` / `Save` buttons on every proposal card. The
   link auto-appears in the nav when an Anthropic API key is configured.
@@ -177,18 +198,44 @@ Channel roles: `r, g, b, w, a, uv, dimmer, strobe, macro, speed, pan, tilt, othe
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
 | GET | `/api/palettes` | — | `Palette[]` |
-| POST | `/api/palettes` | `{name, colors[]}` | `Palette` |
-| PATCH | `/api/palettes/{id}` | `{name, colors[]}` | `Palette` |
+| POST | `/api/palettes` | `PaletteIn` | `Palette` |
+| PATCH | `/api/palettes/{id}` | `PaletteIn` | `Palette` |
 | DELETE | `/api/palettes/{id}` | — | 204 |
 | POST | `/api/palettes/{id}/clone` | — | `Palette` |
-| POST | `/api/palettes/{id}/apply` | `{light_ids[], mode}` | `{updated: n}` |
+| POST | `/api/palettes/{id}/apply` | `{light_ids[], mode, spread?}` | `{updated: n}` |
+| POST | `/api/palettes/generate` | `{prompt, num_colors?, include_aux?}` | `PaletteGenerateResponse` |
 
-`mode` is one of `"cycle"`, `"gradient"`, or `"random"`. Colors are `#RRGGBB`.
+`mode` is one of `"cycle"`, `"gradient"`, or `"random"`. `spread` is one
+of `"across_lights"` (default), `"across_fixture"`, or `"across_zones"`.
+
+`PaletteIn` accepts either the legacy `colors: string[]` hex list **or**
+the richer `entries: PaletteEntry[]` shape:
+
+```json
+{
+  "name": "UV Blacklight",
+  "entries": [
+    { "r": 0,   "g": 0,  "b": 0,  "uv": 255 },
+    { "r": 48,  "g": 0,  "b": 96, "uv": 220 },
+    { "r": 124, "g": 77, "b": 255 }
+  ]
+}
+```
+
+`w`, `a`, `uv` are optional 0-255 integers. When set, they bypass the
+RGB-derivation fallback and write directly (subject to the mode's
+`color_policy`). `uv` is also labelled "V" (violet) in some fixture
+docs — they refer to the same channel role.
+
+`POST /api/palettes/generate` asks Claude for a draft palette from a
+free-text prompt and returns `{ name, entries: PaletteEntry[], summary? }`
+without persisting anything. The UI loads the draft into the editor.
+Requires `ANTHROPIC_API_KEY`.
 
 ### Effects (`/api/effects`)
 
 Saved animated presets (cycle/fade/rainbow/etc) plus a transient "live"
-playback path used by the Effects dialog on the Lights page.
+playback path used by the `/effects` page and the Effects dialog.
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
@@ -204,6 +251,45 @@ playback path used by the Effects dialog on the Lights page.
 | POST | `/api/effects/live` | `LiveEffectIn` | `{ok, handle, name}` |
 | POST | `/api/effects/live/{handle}/stop` | — | `{ok}` |
 | POST | `/api/effects/live/{handle}/save` | `{name}` | `Effect` |
+
+`EffectIn` carries a `target_channels` list that selects which logical
+channel groups the overlay animates:
+
+| Value | Effect on the overlay |
+| --- | --- |
+| `rgb` (default) | Blends the overlay color into fixture RGB; W/A are also derived under `mix` policy. |
+| `w` | Writes a scalar brightness (max of overlay RGB × envelope × intensity × fade) onto the white channel; leaves base RGB alone. |
+| `a` | Same scalar onto the amber channel. |
+| `uv` | Same scalar onto the UV / V channel. |
+| `dimmer` | Animates the master dimmer fader. |
+| `strobe` | Animates the fixture's strobe-rate channel. |
+
+Multiple values may be combined (e.g. `["rgb", "w"]`). `EffectParams`
+ranges are: `speed_hz` 0-25, `offset`/`intensity`/`softness` 0-1,
+`size` 0-16 (strobe duty is separately clamped 0.02-0.98), and
+`fade_in_s`/`fade_out_s` 0-30 seconds.
+
+### Effect chat (`/api/effect-chat`)
+
+Multi-turn Claude chat for iteratively refining one effect per
+conversation. Mirrors the Designer's SSE contract.
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/effect-chat/status` | — | `{enabled, model}` |
+| GET | `/api/effect-chat/conversations` | — | `EffectConversationSummary[]` |
+| POST | `/api/effect-chat/conversations` | `{name?}` | `EffectConversation` |
+| GET | `/api/effect-chat/conversations/{cid}` | — | `EffectConversation` |
+| PATCH | `/api/effect-chat/conversations/{cid}` | `{name}` | `EffectConversation` |
+| DELETE | `/api/effect-chat/conversations/{cid}` | — | 204 |
+| POST | `/api/effect-chat/conversations/{cid}/message` | `{message}` | `text/event-stream` |
+| POST | `/api/effect-chat/conversations/{cid}/apply` | `{proposal_id, light_ids[]}` | `{ok, handle, name}` |
+| POST | `/api/effect-chat/conversations/{cid}/save` | `{proposal_id, name?}` | `{ok, id, name}` |
+
+Each assistant turn emits at most one `EffectProposal` (name, effect
+type, palette id, spread, params, target channels). The `apply` endpoint
+plays it live on the supplied light ids; `save` persists it as an
+`Effect` row.
 
 ### Scenes (`/api/scenes`)
 
@@ -296,12 +382,14 @@ The message endpoint streams these SSE events:
 - `done` — `{conversation}` full persisted `DesignerConversation`
 - `error` — `{message}` on API / parse errors
 
-A `DesignerProposal` has the shape:
+A `DesignerProposal` has `kind` ∈ `state | scene | palette | effect` and
+one of the following payload shapes:
 
 ```json
+// kind: "state" or "scene"
 {
   "proposal_id": "p1",
-  "kind": "state",                 // or "scene"
+  "kind": "state",
   "name": "Sunset wash",
   "controller_id": 1,              // required when kind="scene"
   "notes": "Warm, low-saturation.",
@@ -317,12 +405,41 @@ A `DesignerProposal` has the shape:
     }
   ]
 }
+
+// kind: "palette"
+{
+  "proposal_id": "p1",
+  "kind": "palette",
+  "name": "Ember accents",
+  "palette_entries": [
+    { "r": 40,  "g": 10, "b": 0,  "a": 180 },
+    { "r": 200, "g": 80, "b": 20, "a": 220 }
+  ]
+}
+
+// kind: "effect"
+{
+  "proposal_id": "p1",
+  "kind": "effect",
+  "name": "White pulse",
+  "effect": {
+    "effect_type": "pulse",
+    "palette_id": null,
+    "spread": "across_lights",
+    "params": { "speed_hz": 1.2, "intensity": 1.0, "size": 1.0 },
+    "target_channels": ["w"],
+    "light_ids": [],
+    "targets": []
+  }
+}
 ```
 
-Applying a proposal reuses the same pipeline as `POST /api/scenes/{sid}/apply`
-(stops overlapping effects, rewrites the light state, and pushes to
-Art-Net). Saving a proposal inserts a new `State` or `Scene` row so the
-proposal outlives the conversation.
+Applying a `state` / `scene` proposal reuses the same pipeline as
+`POST /api/scenes/{sid}/apply` (stops overlapping effects, rewrites the
+light state, pushes to Art-Net). Applying a `palette` proposal saves it
+as a new `Palette` row; applying an `effect` proposal starts it live on
+the engine. Saving a proposal inserts the appropriate `State` / `Scene`
+/ `Palette` / `Effect` row so the proposal outlives the conversation.
 
 Per-controller and per-light `notes` fields feed the Designer's system
 prompt. They live on `POST /api/controllers` / `POST /api/lights` (plus
@@ -374,6 +491,22 @@ Browser --HTTPS--> Caddy --127.0.0.1:8000--> FastAPI (uvicorn)
 | Bioluminescence | `#001018 #003049 #00B4D8 #90E0EF #CAFFBF` |
 | Desert Sunset | `#2E0F0A #7A1F0F #C1440E #E57B3A #F6C28B` |
 | Rainbow Spectrum | 12-stop hue sweep |
+| UV Blacklight | Black base + explicit UV channel drive (e.g. `uv=255`) for fixtures with a UV LED. |
+| Warm Amber Wash | Tungsten-style palette with explicit amber (and one white) value per entry. |
+
+## Built-in effects
+
+| Name | Type | Target channels | Notes |
+| --- | --- | --- | --- |
+| Rainbow Wash | rainbow | `rgb` | Slow full-hue sweep; ignores palette. |
+| Breathing Amber | pulse | `rgb` | Candlelight palette breathing. |
+| Cyberpunk Chase | chase | `rgb` | Neon chase across the rig. |
+| Aurora Fade | fade | `rgb` | Across-fixture aurora crossfade. |
+| Halloween Strobe | strobe | `rgb` | 6 Hz flash on the Halloween palette. |
+| Pastel Sparkle | sparkle | `rgb` | Random pastel flashes per zone. |
+| White LED Chase | chase | `w` | Chases the white LED without touching RGB. |
+| Strobe Pulse (Strobe Channel) | pulse | `strobe` | Pulses the fixture's strobe-rate fader. |
+| UV Accent Wave | wave | `uv` | Slow UV brightness wave. |
 
 ## Built-in light models
 

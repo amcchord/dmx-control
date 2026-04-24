@@ -103,7 +103,18 @@ class Light(SQLModel, table=True):
 class Palette(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
+    # Legacy hex-only view of the palette. Kept for backward compatibility
+    # with consumers that only care about RGB (e.g. the simulated preview
+    # / the designer's rig summary); authoritative per-entry W/A/UV live
+    # in ``entries``.
     colors: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    # Structured per-color entries. Each entry is a dict with 0-255 ints:
+    #   {"r": int, "g": int, "b": int, "w"?: int, "a"?: int, "uv"?: int}
+    # Missing aux keys mean "derive from RGB (for mix policy) or leave the
+    # fader alone (for direct policy)". When the palette was created before
+    # the aux migration, entries are backfilled from ``colors`` with RGB
+    # only so behavior is identical to today.
+    entries: list[dict] = Field(default_factory=list, sa_column=Column(JSON))
     builtin: bool = False
 
 
@@ -127,6 +138,15 @@ class Effect(SQLModel, table=True):
     # across_lights | across_fixture | across_zones
     spread: str = "across_lights"
     params: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    # Which logical channels the overlay animates. Valid entries are
+    # "rgb", "w", "a", "uv", "dimmer", "strobe". Default ["rgb"] matches
+    # historical behavior. When "rgb" is absent the base fixture color is
+    # left untouched and the effect only modulates the listed aux channel
+    # via a scalar brightness envelope (useful for chases on the white /
+    # strobe / UV channel while keeping the palette on RGB).
+    target_channels: list[str] = Field(
+        default_factory=lambda: ["rgb"], sa_column=Column(JSON)
+    )
     is_active: bool = False
     builtin: bool = False
 
@@ -161,6 +181,27 @@ class DesignerConversation(SQLModel, table=True):
     ``last_proposal`` caches the most recent structured output so Apply/
     Save can target proposals by ``proposal_id`` even after the page has
     been reloaded."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = ""
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    messages: list[dict] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+    last_proposal: Optional[dict] = Field(
+        default=None, sa_column=Column(JSON, nullable=True)
+    )
+
+
+class EffectConversation(SQLModel, table=True):
+    """A multi-turn chat iteratively refining an effect definition.
+
+    Same shape as :class:`DesignerConversation` but the tool Claude is
+    forced to call is ``propose_effect`` and the persisted
+    ``last_proposal`` always holds one ``EffectIn``-shaped dict under a
+    ``proposal`` key. Kept separate from designer conversations to keep
+    the two contracts independent."""
 
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = ""

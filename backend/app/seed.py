@@ -20,7 +20,15 @@ BUILTIN_MODELS: list[tuple[str, list[str]]] = [
 ]
 
 
-BUILTIN_PALETTES: list[tuple[str, list[str]]] = [
+"""Per-entry shape for built-in palettes.
+
+Each entry is either a 6-digit hex string (no aux values) or a dict
+``{r, g, b, w?, a?, uv?}`` for palettes that intentionally drive the
+auxiliary channels. ``_upsert_palette`` normalizes both into the
+structured ``entries`` storage and the legacy ``colors`` hex list."""
+
+BUILTIN_PALETTE_ENTRY = str | dict
+BUILTIN_PALETTES: list[tuple[str, list]] = [
     (
         "Cyberpunk Neon",
         ["#FF2DAA", "#00E5FF", "#7C4DFF", "#2D1B69", "#C9D1D9"],
@@ -92,6 +100,29 @@ BUILTIN_PALETTES: list[tuple[str, list[str]]] = [
             "#7F00FF",
             "#FF00FF",
             "#FF007F",
+        ],
+    ),
+    (
+        "UV Blacklight",
+        [
+            # Black base + explicit UV punch — use on fixtures that expose
+            # a UV channel to kick the UV LEDs independently of RGB.
+            {"r": 0, "g": 0, "b": 0, "uv": 255},
+            {"r": 24, "g": 0, "b": 48, "uv": 200},
+            {"r": 48, "g": 0, "b": 96, "uv": 220},
+            {"r": 124, "g": 77, "b": 255, "uv": 255},
+        ],
+    ),
+    (
+        "Warm Amber Wash",
+        [
+            # Warm tungsten-style palette. Explicit amber values push
+            # fixtures that have an amber LED toward the classic warm
+            # color you can't hit with pure RGB.
+            {"r": 255, "g": 170, "b": 80, "a": 255, "w": 180},
+            {"r": 255, "g": 120, "b": 40, "a": 220},
+            {"r": 200, "g": 80, "b": 20, "a": 180},
+            {"r": 120, "g": 40, "b": 10, "a": 120},
         ],
     ),
 ]
@@ -250,15 +281,110 @@ BUILTIN_EFFECTS: list[dict] = [
             "fade_out_s": 0.5,
         },
     },
+    {
+        # Chase only the white LED without touching RGB. Use this on top
+        # of any static color palette to add a moving white accent.
+        "name": "White LED Chase",
+        "effect_type": "chase",
+        "palette_name": None,
+        "spread": "across_lights",
+        "target_channels": ["w"],
+        "params": {
+            "speed_hz": 1.2,
+            "direction": "forward",
+            "offset": 0.2,
+            "intensity": 1.0,
+            "size": 1.2,
+            "softness": 0.4,
+            "fade_in_s": 0.2,
+            "fade_out_s": 0.4,
+        },
+    },
+    {
+        "name": "Strobe Pulse (Strobe Channel)",
+        "effect_type": "pulse",
+        "palette_name": None,
+        "spread": "across_lights",
+        "target_channels": ["strobe"],
+        "params": {
+            "speed_hz": 0.5,
+            "direction": "forward",
+            "offset": 0.0,
+            "intensity": 1.0,
+            "size": 1.0,
+            "softness": 0.3,
+            "fade_in_s": 0.1,
+            "fade_out_s": 0.2,
+        },
+    },
+    {
+        "name": "UV Accent Wave",
+        "effect_type": "wave",
+        "palette_name": None,
+        "spread": "across_lights",
+        "target_channels": ["uv"],
+        "params": {
+            "speed_hz": 0.3,
+            "direction": "forward",
+            "offset": 0.1,
+            "intensity": 1.0,
+            "size": 1.0,
+            "softness": 0.5,
+            "fade_in_s": 0.5,
+            "fade_out_s": 0.5,
+        },
+    },
 ]
 
 
-def _upsert_palette(sess: Session, name: str, colors: list[str]) -> None:
+def _normalize_palette_items(
+    items: list,
+) -> tuple[list[str], list[dict]]:
+    """Split a built-in palette list into ``(colors, entries)``.
+
+    Accepts mixed entries: hex strings (RGB only) or dicts carrying
+    explicit aux values. The hex form is always regenerated from each
+    entry's RGB so the two lists stay in sync on disk."""
+    entries: list[dict] = []
+    for item in items:
+        if isinstance(item, str):
+            s = item.strip().lstrip("#")
+            if len(s) != 6:
+                continue
+            try:
+                r = int(s[0:2], 16)
+                g = int(s[2:4], 16)
+                b = int(s[4:6], 16)
+            except ValueError:
+                continue
+            entries.append({"r": r, "g": g, "b": b})
+        elif isinstance(item, dict):
+            try:
+                entry = {
+                    "r": int(item["r"]),
+                    "g": int(item["g"]),
+                    "b": int(item["b"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+            for aux in ("w", "a", "uv"):
+                if item.get(aux) is not None:
+                    entry[aux] = int(item[aux])
+            entries.append(entry)
+    colors = [f"#{e['r']:02X}{e['g']:02X}{e['b']:02X}" for e in entries]
+    return colors, entries
+
+
+def _upsert_palette(sess: Session, name: str, items: list) -> None:
+    colors, entries = _normalize_palette_items(items)
     existing = sess.exec(select(Palette).where(Palette.name == name)).first()
     if existing is None:
-        sess.add(Palette(name=name, colors=colors, builtin=True))
+        sess.add(
+            Palette(name=name, colors=colors, entries=entries, builtin=True)
+        )
     else:
         existing.colors = colors
+        existing.entries = entries
         existing.builtin = True
         sess.add(existing)
 
@@ -272,6 +398,7 @@ def _upsert_effect(sess: Session, spec: dict) -> None:
         ).first()
         if pal is not None:
             palette_id = pal.id
+    target_channels = list(spec.get("target_channels") or ["rgb"])
     existing = sess.exec(select(Effect).where(Effect.name == name)).first()
     if existing is None:
         sess.add(
@@ -283,6 +410,7 @@ def _upsert_effect(sess: Session, spec: dict) -> None:
                 targets=[],
                 spread=spec["spread"],
                 params=dict(spec["params"]),
+                target_channels=target_channels,
                 is_active=False,
                 builtin=True,
             )
@@ -293,6 +421,7 @@ def _upsert_effect(sess: Session, spec: dict) -> None:
     existing.palette_id = palette_id
     existing.spread = spec["spread"]
     existing.params = dict(spec["params"])
+    existing.target_channels = target_channels
     existing.builtin = True
     sess.add(existing)
 
@@ -302,8 +431,8 @@ def seed() -> None:
     with Session(engine) as sess:
         for name, chans in BUILTIN_MODELS:
             _upsert_model(sess, name, chans)
-        for name, colors in BUILTIN_PALETTES:
-            _upsert_palette(sess, name, colors)
+        for name, items in BUILTIN_PALETTES:
+            _upsert_palette(sess, name, items)
         # Palettes must be present before effects so palette_id resolves.
         sess.commit()
         for spec in BUILTIN_EFFECTS:

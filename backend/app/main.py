@@ -17,6 +17,7 @@ from .routers import ai as ai_router
 from .routers import auth as auth_router
 from .routers import controllers as controllers_router
 from .routers import designer as designer_router
+from .routers import effect_chat as effect_chat_router
 from .routers import effects as effects_router
 from .routers import lights as lights_router
 from .routers import models as models_router
@@ -79,6 +80,7 @@ app.include_router(states_router.router)
 app.include_router(state_router.router)
 app.include_router(ai_router.router)
 app.include_router(designer_router.router)
+app.include_router(effect_chat_router.router)
 
 
 @app.get("/api/health")

@@ -506,12 +506,22 @@ def compute_effect_overlays(
     return overlays
 
 
+def _scalar_from_rgb(r: int, g: int, b: int) -> int:
+    """Collapse an RGB triple to a 0-255 scalar for aux-channel overlays.
+
+    Using max preserves flash/chase intent - a chase's "lit" slot becomes
+    a bright scalar even when the palette color is saturated red/green/blue
+    rather than white."""
+    return max(0, min(255, max(int(r), int(g), int(b))))
+
+
 def merge_overlay_into_state(
     base_state: dict,
     overlay: LightOverlay,
     zone_ids: Iterable[str],
     fade_weight: float,
     color_policy: dict | None = None,
+    target_channels: Optional[list[str]] = None,
 ) -> dict:
     """Produce a rendered state dict for one light.
 
@@ -521,10 +531,23 @@ def merge_overlay_into_state(
     ArtNet renderer expects. ``color_policy`` is the mode's W/A/UV policy:
     roles marked ``"direct"`` are treated as independent faders and the
     effect RGB is NOT blended into them so the user's explicit W/A/UV
-    value is preserved through the effect."""
+    value is preserved through the effect.
+
+    ``target_channels`` selects which logical channel groups the overlay
+    drives. When ``"rgb"`` is in the list (the default) the behavior
+    matches the legacy flow: blend the overlay RGB into the fixture RGB
+    (and derive W/A under mix policy). When ``"rgb"`` is absent, RGB is
+    left untouched. Aux entries like ``"w"``, ``"a"``, ``"uv"``,
+    ``"dimmer"``, and ``"strobe"`` independently push a scalar derived
+    from the overlay's envelope/color onto that channel, so an effect can
+    e.g. chase the white LED without touching hue."""
     out = dict(base_state)
     zone_state = dict(base_state.get("zone_state") or {})
     policy = color_policy or {}
+    tc = {c for c in (target_channels or ["rgb"]) if isinstance(c, str)}
+    if not tc:
+        tc = {"rgb"}
+    touches_rgb = "rgb" in tc
 
     def _mix(a: int, b: int, w: float) -> int:
         w = max(0.0, min(1.0, w))
@@ -536,34 +559,55 @@ def merge_overlay_into_state(
     if overlay.flat is not None:
         r, g, b, eff = overlay.flat
         eff *= fade_weight
-        out["r"] = _mix(int(base_state.get("r", 0)), int(r * 1.0), eff)
-        out["g"] = _mix(int(base_state.get("g", 0)), int(g * 1.0), eff)
-        out["b"] = _mix(int(base_state.get("b", 0)), int(b * 1.0), eff)
-        # Derive w/a if not explicitly held by base (and not marked as a
-        # direct, user-controlled channel).
-        if base_state.get("w") is not None and policy.get("w") != "direct":
-            out["w"] = _mix(int(base_state.get("w", 0)), min(r, g, b), eff)
-        if base_state.get("a") is not None and policy.get("a") != "direct":
-            out["a"] = _mix(int(base_state.get("a", 0)), min(r, g) // 2, eff)
-        # Also propagate to every zone that isn't overridden by a zone
-        # overlay below - this makes "across_lights" actually colour every
-        # pixel of a compound fixture.
-        for zid in flat_zone_ids:
-            if zid in overlay.zones:
+        scalar = _scalar_from_rgb(r, g, b)
+        if touches_rgb:
+            out["r"] = _mix(int(base_state.get("r", 0)), int(r), eff)
+            out["g"] = _mix(int(base_state.get("g", 0)), int(g), eff)
+            out["b"] = _mix(int(base_state.get("b", 0)), int(b), eff)
+            # Derive w/a if not explicitly held by base (and not marked as
+            # a direct, user-controlled channel).
+            if base_state.get("w") is not None and policy.get("w") != "direct":
+                out["w"] = _mix(int(base_state.get("w", 0)), min(r, g, b), eff)
+            if base_state.get("a") is not None and policy.get("a") != "direct":
+                out["a"] = _mix(int(base_state.get("a", 0)), min(r, g) // 2, eff)
+            # Propagate to every zone that isn't overridden by a zone
+            # overlay below - this makes "across_lights" actually colour every
+            # pixel of a compound fixture.
+            for zid in flat_zone_ids:
+                if zid in overlay.zones:
+                    continue
+                zs = dict(zone_state.get(zid) or {})
+                zr = int(zs.get("r", base_state.get("r", 0)))
+                zg = int(zs.get("g", base_state.get("g", 0)))
+                zb = int(zs.get("b", base_state.get("b", 0)))
+                zs["r"] = _mix(zr, r, eff)
+                zs["g"] = _mix(zg, g, eff)
+                zs["b"] = _mix(zb, b, eff)
+                zs["on"] = True
+                zone_state[zid] = zs
+        # Scalar aux channels - driven even when rgb is not targeted.
+        for aux in ("w", "a", "uv"):
+            if aux not in tc:
                 continue
-            zs = dict(zone_state.get(zid) or {})
-            zr = int(zs.get("r", base_state.get("r", 0)))
-            zg = int(zs.get("g", base_state.get("g", 0)))
-            zb = int(zs.get("b", base_state.get("b", 0)))
-            zs["r"] = _mix(zr, r, eff)
-            zs["g"] = _mix(zg, g, eff)
-            zs["b"] = _mix(zb, b, eff)
-            zs["on"] = True
-            zone_state[zid] = zs
+            base_aux = int(base_state.get(aux) or 0)
+            out[aux] = _mix(base_aux, scalar, eff)
+        if "dimmer" in tc:
+            base_dim = int(base_state.get("dimmer") or 0)
+            out["dimmer"] = _mix(base_dim, scalar, eff)
+        if "strobe" in tc:
+            # Most strobe channels are "0 = off, higher = strobe-rate".
+            # Treat the scalar as the strobe rate while the envelope is
+            # bright, folding back toward base when the envelope fades.
+            base_strobe = int(base_state.get("strobe") or 0)
+            out["strobe"] = _mix(base_strobe, scalar, eff)
 
-    # Per-zone overlays win over flat for their specific zones.
+    # Per-zone overlays win over flat for their specific zones (RGB-only).
     for zid, (r, g, b, eff) in overlay.zones.items():
         eff *= fade_weight
+        if not touches_rgb:
+            # Non-RGB targets are a whole-fixture concept; skip per-zone
+            # RGB mutation entirely when the user opted out of RGB.
+            continue
         zs = dict(zone_state.get(zid) or {})
         zr = int(zs.get("r", base_state.get("r", 0)))
         zg = int(zs.get("g", base_state.get("g", 0)))
