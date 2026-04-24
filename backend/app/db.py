@@ -89,6 +89,17 @@ def _migrate() -> None:
                 conn.exec_driver_sql(
                     "ALTER TABLE light ADD COLUMN motion_state JSON"
                 )
+            # light.notes (designer AI context)
+            if "notes" not in cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE light ADD COLUMN notes TEXT"
+                )
+            # controller.notes (designer AI context)
+            ctrl_cols = _table_columns(conn, "controller")
+            if "notes" not in ctrl_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE controller ADD COLUMN notes TEXT"
+                )
             # lightmodelmode.layout (zone/motion overlay for a DMX mode)
             mode_cols = _table_columns(conn, "lightmodelmode")
             if "layout" not in mode_cols:
@@ -102,6 +113,8 @@ def _migrate() -> None:
                 "ALTER TABLE light ADD COLUMN mode_id INTEGER",
                 "ALTER TABLE light ADD COLUMN zone_state JSON",
                 "ALTER TABLE light ADD COLUMN motion_state JSON",
+                "ALTER TABLE light ADD COLUMN notes TEXT",
+                "ALTER TABLE controller ADD COLUMN notes TEXT",
                 "ALTER TABLE lightmodelmode ADD COLUMN layout JSON",
             ):
                 try:

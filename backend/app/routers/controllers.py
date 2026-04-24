@@ -20,6 +20,7 @@ def _to_out(c: Controller) -> ControllerOut:
         subnet=c.subnet,
         universe=c.universe,
         enabled=c.enabled,
+        notes=c.notes,
     )
 
 

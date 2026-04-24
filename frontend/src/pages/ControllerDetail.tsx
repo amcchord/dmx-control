@@ -10,6 +10,7 @@ type LightForm = {
   model_id: number;
   mode_id: number | null;
   start_address: number;
+  notes: string | null;
 };
 
 function pickDefaultMode(m?: LightModel | null): LightModelMode | null {
@@ -238,6 +239,11 @@ export default function ControllerDetail() {
               <span className="pill">universe {controller.universe}</span>
               <span className="pill">{controllerLights.length} lights</span>
             </div>
+            {controller.notes && (
+              <p className="mt-2 whitespace-pre-wrap text-xs text-muted">
+                {controller.notes}
+              </p>
+            )}
           </div>
         </div>
       </div>
@@ -278,6 +284,7 @@ function LightsPanel({
     model_id: firstModel?.id ?? 0,
     mode_id: firstMode?.id ?? null,
     start_address: 1,
+    notes: null,
   });
 
   const lightsById = useMemo(() => {
@@ -323,6 +330,7 @@ function LightsPanel({
       model_id: m0?.id ?? 0,
       mode_id: defaultMode?.id ?? null,
       start_address: nextFreeAddress(lights, models),
+      notes: null,
     });
     setLastAutoName(suggestedName);
     setEditing(null);
@@ -341,6 +349,7 @@ function LightsPanel({
       model_id: l.model_id,
       mode_id: l.mode_id,
       start_address: l.start_address,
+      notes: l.notes ?? null,
     });
     setLastAutoName("");
     setCount(1);
@@ -562,6 +571,22 @@ function LightsPanel({
               />
             </Field>
           )}
+          {editing && (
+            <Field label="Notes (for the AI Designer)">
+              <textarea
+                className="input"
+                rows={3}
+                value={form.notes ?? ""}
+                placeholder="e.g. Lead vocalist key light. Point slightly stage-right."
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    notes: e.target.value ? e.target.value : null,
+                  })
+                }
+              />
+            </Field>
+          )}
           <div className="flex justify-end gap-2 pt-2">
             <button type="button" className="btn-ghost" onClick={closeForm}>
               Cancel
@@ -623,7 +648,17 @@ function LightsPanel({
                   </span>
                   <ModelThumb model={m} size="sm" />
                   <div className="min-w-0">
-                    <div className="truncate font-medium">{l.name}</div>
+                    <div className="flex items-center gap-1">
+                      <span className="truncate font-medium">{l.name}</span>
+                      {l.notes && (
+                        <span
+                          className="pill text-[9px]"
+                          title={l.notes}
+                        >
+                          notes
+                        </span>
+                      )}
+                    </div>
                     <div className="truncate text-xs text-muted sm:hidden">
                       {m?.name ?? "?"} &middot; {mode?.name ?? "?"} &middot;{" "}
                       <span className="font-mono">

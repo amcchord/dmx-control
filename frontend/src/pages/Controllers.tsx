@@ -14,6 +14,7 @@ const emptyCtrl: CtrlForm = {
   subnet: 0,
   universe: 0,
   enabled: true,
+  notes: null,
 };
 
 export default function Controllers() {
@@ -251,6 +252,20 @@ export default function Controllers() {
             />
             Enabled
           </label>
+          <Field label="Notes (for the AI Designer)">
+            <textarea
+              className="input"
+              rows={3}
+              value={form.notes ?? ""}
+              placeholder="e.g. Stage-left wash bar, 4x RGB pars, front-of-house."
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  notes: e.target.value ? e.target.value : null,
+                })
+              }
+            />
+          </Field>
         </form>
       </Modal>
     </div>

@@ -9,6 +9,8 @@ import ControllerDetail from "./pages/ControllerDetail";
 import Models from "./pages/Models";
 import Palettes from "./pages/Palettes";
 import Scenes from "./pages/Scenes";
+import Designer from "./pages/Designer";
+import ApiDocs from "./pages/ApiDocs";
 import Nav from "./components/Nav";
 
 function Protected({ children }: { children: React.ReactNode }) {
@@ -100,6 +102,26 @@ export default function App() {
               <Protected>
                 <Layout>
                   <Scenes />
+                </Layout>
+              </Protected>
+            }
+          />
+          <Route
+            path="/designer"
+            element={
+              <Protected>
+                <Layout>
+                  <Designer />
+                </Layout>
+              </Protected>
+            }
+          />
+          <Route
+            path="/api-docs"
+            element={
+              <Protected>
+                <Layout>
+                  <ApiDocs />
                 </Layout>
               </Protected>
             }

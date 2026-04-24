@@ -58,6 +58,19 @@ class ControllerIn(BaseModel):
     subnet: int = 0
     universe: int = 0
     enabled: bool = True
+    notes: Optional[str] = None
+
+    @field_validator("notes")
+    @classmethod
+    def _notes(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        s = v.strip()
+        if not s:
+            return None
+        if len(s) > 2000:
+            raise ValueError("notes too long (max 2000 chars)")
+        return s
 
     @field_validator("port")
     @classmethod
@@ -206,6 +219,7 @@ class LightIn(BaseModel):
     mode_id: Optional[int] = None
     start_address: int
     position: int = 0
+    notes: Optional[str] = None
 
     @field_validator("start_address")
     @classmethod
@@ -213,6 +227,18 @@ class LightIn(BaseModel):
         if not (1 <= v <= 512):
             raise ValueError("start_address must be 1..512")
         return v
+
+    @field_validator("notes")
+    @classmethod
+    def _notes(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        s = v.strip()
+        if not s:
+            return None
+        if len(s) > 2000:
+            raise ValueError("notes too long (max 2000 chars)")
+        return s
 
 
 class LightOut(BaseModel):
@@ -237,6 +263,7 @@ class LightOut(BaseModel):
     zone_state: dict = Field(default_factory=dict)
     # Motion axes as floats in [0, 1]; empty when the fixture has no motion.
     motion_state: dict = Field(default_factory=dict)
+    notes: Optional[str] = None
 
 
 class MotionRequest(BaseModel):
@@ -661,3 +688,105 @@ class ApplyPaletteRequest(BaseModel):
     spread: Literal["across_lights", "across_fixture", "across_zones"] = (
         "across_lights"
     )
+
+
+# ---------------------------------------------------------------------------
+# Designer (Claude chat → structured rig states / scenes)
+# ---------------------------------------------------------------------------
+
+
+class DesignerMessageIn(BaseModel):
+    """One user turn in a designer chat."""
+
+    message: str
+
+    @field_validator("message")
+    @classmethod
+    def _msg(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("message must be non-empty")
+        if len(s) > 10_000:
+            raise ValueError("message too long (max 10000 chars)")
+        return s
+
+
+class DesignerProposalLight(BaseModel):
+    """One light's target state inside a designer proposal."""
+
+    light_id: int
+    on: bool = True
+    dimmer: int = 255
+    r: int = 0
+    g: int = 0
+    b: int = 0
+    w: Optional[int] = None
+    a: Optional[int] = None
+    uv: Optional[int] = None
+    zone_state: dict = Field(default_factory=dict)
+    motion_state: dict = Field(default_factory=dict)
+
+
+class DesignerProposal(BaseModel):
+    """A named rig design Claude proposes.
+
+    ``kind='state'`` is a rig-wide snapshot (every addressed light);
+    ``kind='scene'`` targets one ``controller_id``."""
+
+    proposal_id: str
+    kind: Literal["state", "scene"]
+    name: str
+    controller_id: Optional[int] = None
+    notes: Optional[str] = None
+    lights: list[DesignerProposalLight] = Field(default_factory=list)
+
+
+class DesignerMessageOut(BaseModel):
+    """One rendered turn in a designer chat (UI-friendly)."""
+
+    role: Literal["user", "assistant"]
+    text: str = ""
+    proposals: list[DesignerProposal] = Field(default_factory=list)
+
+
+class DesignerConversationSummary(BaseModel):
+    id: int
+    name: str
+    message_count: int
+    updated_at: str
+
+
+class DesignerConversationOut(BaseModel):
+    id: int
+    name: str
+    created_at: str
+    updated_at: str
+    messages: list[DesignerMessageOut] = Field(default_factory=list)
+    last_proposals: list[DesignerProposal] = Field(default_factory=list)
+
+
+class DesignerConversationCreate(BaseModel):
+    name: Optional[str] = None
+
+
+class DesignerConversationRename(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("name must be non-empty")
+        if len(s) > 128:
+            raise ValueError("name too long")
+        return s
+
+
+class DesignerApplyRequest(BaseModel):
+    proposal_id: str
+
+
+class DesignerSaveRequest(BaseModel):
+    proposal_id: str
+    name: Optional[str] = None

@@ -1,8 +1,11 @@
-import React, { useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
+import { Api } from "../api";
 import { useAuth } from "../auth";
 
-const links = [
+type LinkDef = { to: string; label: string; end?: boolean };
+
+const BASE_LINKS: LinkDef[] = [
   { to: "/", label: "Lights", end: true },
   { to: "/controllers", label: "Controllers" },
   { to: "/scenes", label: "Scenes" },
@@ -12,9 +15,32 @@ const links = [
 ];
 
 export default function Nav() {
-  const { logout } = useAuth();
+  const { logout, authenticated } = useAuth();
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
+  const [aiEnabled, setAiEnabled] = useState<boolean>(false);
+
+  // Only probe the AI status once we're authenticated (the endpoint is
+  // behind the session cookie).
+  useEffect(() => {
+    if (!authenticated) return;
+    Api.designer
+      .status()
+      .then((s) => setAiEnabled(!!s.enabled))
+      .catch(() => setAiEnabled(false));
+  }, [authenticated]);
+
+  const links = useMemo<LinkDef[]>(() => {
+    if (!aiEnabled) return BASE_LINKS;
+    const out = [...BASE_LINKS];
+    // Insert Designer right after Scenes so the creative flow reads
+    // Scenes -> Designer -> Models.
+    const idx = out.findIndex((l) => l.to === "/scenes");
+    const entry: LinkDef = { to: "/designer", label: "Designer" };
+    if (idx >= 0) out.splice(idx + 1, 0, entry);
+    else out.push(entry);
+    return out;
+  }, [aiEnabled]);
 
   const onLogout = async () => {
     await logout();

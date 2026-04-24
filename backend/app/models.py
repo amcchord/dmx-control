@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import Column
-from sqlalchemy.types import JSON
+from sqlalchemy.types import JSON, Text
 from sqlmodel import Field, SQLModel
 
 
@@ -16,6 +17,11 @@ class Controller(SQLModel, table=True):
     subnet: int = 0
     universe: int = 0
     enabled: bool = True
+    # Free-text description the designer AI reads for rig context
+    # (e.g. "stage-left wash bar, front-of-house"). Optional.
+    notes: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
 
 
 class LightModel(SQLModel, table=True):
@@ -79,6 +85,12 @@ class Light(SQLModel, table=True):
     # coarse/fine bytes if both offsets are present in the layout.
     motion_state: dict = Field(default_factory=dict, sa_column=Column(JSON))
 
+    # Free-text description the designer AI reads for rig context
+    # (e.g. "lead vocalist key light"). Optional.
+    notes: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+
 
 class Palette(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -127,6 +139,31 @@ class Scene(SQLModel, table=True):
     controller_id: int = Field(foreign_key="controller.id", index=True)
     cross_controller: bool = False
     lights: list[dict] = Field(default_factory=list, sa_column=Column(JSON))
+
+
+class DesignerConversation(SQLModel, table=True):
+    """A multi-turn chat with the designer AI (Claude Opus).
+
+    ``messages`` is the raw Anthropic-shaped conversation log: each entry
+    is ``{role, content}`` where ``content`` is a list of content blocks
+    (``text`` / ``tool_use`` / ``tool_result``). We persist the full raw
+    log so every follow-up request can replay prior turns without losing
+    any tool plumbing.
+
+    ``last_proposal`` caches the most recent structured output so Apply/
+    Save can target proposals by ``proposal_id`` even after the page has
+    been reloaded."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = ""
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    messages: list[dict] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+    last_proposal: Optional[dict] = Field(
+        default=None, sa_column=Column(JSON, nullable=True)
+    )
 
 
 class State(SQLModel, table=True):

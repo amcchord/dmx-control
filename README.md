@@ -49,6 +49,21 @@ a Caddy + systemd deployment that fronts everything at
   running effects shown inline on the same row). Each controller's
   header also has a `Select all` button for grabbing every light on
   that one controller.
+- **Designer tab** — a multi-turn chat with Claude Opus that turns a
+  natural-language prompt ("warm amber ballad wash", "four-part DJ set:
+  build, drop, breakdown, outro") into structured rig designs. Claude
+  returns one or more **proposals** via a forced `tool_use` call; each
+  proposal is either a rig-wide `State` or a per-controller `Scene`
+  covering whichever lights it wants to set. Responses stream
+  token-by-token over Server-Sent Events, with per-light color swatches
+  and one-click `Apply` / `Save` buttons on every proposal card. The
+  link auto-appears in the nav when an Anthropic API key is configured.
+- **Context notes** on every controller and every light — free-text
+  descriptions ("stage-left wash bar, front-of-house" / "lead vocalist
+  key light") that the Designer reads as part of the system prompt, so
+  Claude knows the purpose and layout of each fixture when composing
+  looks. Notes edit inline on the Controllers modal and the per-light
+  edit form.
 - Single shared password ("secretsauce" by default) via a signed session
   cookie.
 - Everything persists to SQLite and is restored to the physical rig on
@@ -252,6 +267,71 @@ touches the whole rig. A virtual `Blackout all` entry is synthesized in
 `GET /api/state` returns the current in-memory DMX buffers and the per-light
 state. `POST /api/state/resend` pushes every controller's buffer again.
 
+### Designer (`/api/designer`)
+
+Multi-turn chat with Claude Opus that produces structured rig designs.
+Each turn is persisted as a `DesignerConversation`, and each response
+streams from the server as Server-Sent Events so the UI can render
+tokens as they arrive.
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/designer/status` | — | `{enabled, model}` |
+| GET | `/api/designer/conversations` | — | `DesignerConversationSummary[]` |
+| POST | `/api/designer/conversations` | `{name?}` | `DesignerConversation` |
+| GET | `/api/designer/conversations/{cid}` | — | `DesignerConversation` |
+| PATCH | `/api/designer/conversations/{cid}` | `{name}` | `DesignerConversation` |
+| DELETE | `/api/designer/conversations/{cid}` | — | 204 |
+| POST | `/api/designer/conversations/{cid}/message` | `{message}` | `text/event-stream` |
+| POST | `/api/designer/conversations/{cid}/apply` | `{proposal_id}` | `{ok, applied}` |
+| POST | `/api/designer/conversations/{cid}/save` | `{proposal_id, name?}` | `{ok, kind, id, name}` |
+
+The message endpoint streams these SSE events:
+
+- `start` — `{conversation_id}`
+- `text` — `{delta}` incremental prose tokens
+- `tool_start` — `{tool}` Claude has begun constructing the proposal
+- `tool_delta` — `{partial_json}` raw partial JSON for the tool input
+- `proposal` — `DesignerProposal[]` final sanitized proposals
+- `done` — `{conversation}` full persisted `DesignerConversation`
+- `error` — `{message}` on API / parse errors
+
+A `DesignerProposal` has the shape:
+
+```json
+{
+  "proposal_id": "p1",
+  "kind": "state",                 // or "scene"
+  "name": "Sunset wash",
+  "controller_id": 1,              // required when kind="scene"
+  "notes": "Warm, low-saturation.",
+  "lights": [
+    {
+      "light_id": 12,
+      "on": true,
+      "dimmer": 220,
+      "r": 255, "g": 120, "b": 40,
+      "w": null, "a": null, "uv": null,
+      "zone_state": { "p0": { "r": 255, "g": 0, "b": 0, "on": true } },
+      "motion_state": { "pan": 0.5, "tilt": 0.25 }
+    }
+  ]
+}
+```
+
+Applying a proposal reuses the same pipeline as `POST /api/scenes/{sid}/apply`
+(stops overlapping effects, rewrites the light state, and pushes to
+Art-Net). Saving a proposal inserts a new `State` or `Scene` row so the
+proposal outlives the conversation.
+
+Per-controller and per-light `notes` fields feed the Designer's system
+prompt. They live on `POST /api/controllers` / `POST /api/lights` (plus
+the matching `PATCH` endpoints) as an optional `notes: string | null`.
+
+Requires `ANTHROPIC_API_KEY` (env var or `claudeKey.env` at the repo
+root); the model defaults to `claude-opus-4-7` and is overridable via
+`ANTHROPIC_MODEL`.
+
 ## Architecture
 
 ```
@@ -268,6 +348,12 @@ Browser --HTTPS--> Caddy --127.0.0.1:8000--> FastAPI (uvicorn)
   restoring the last-known color state for every light.
 - Sessions are signed with `itsdangerous`; the key is persisted at
   `$DMX_DATA_DIR/session.key` so restarts do not log everybody out.
+- The Designer tab streams Claude via `anthropic.Anthropic().messages.stream()`
+  from a worker thread that feeds an `asyncio.Queue`. The FastAPI
+  handler drains the queue as Server-Sent Events; the full assistant
+  message (prose + tool_use) is sanitized and persisted in a single
+  commit at the stream's `done` boundary, so a disconnect mid-stream
+  cleanly drops the turn.
 
 ## Built-in palettes
 

@@ -151,6 +151,7 @@ export type Controller = {
   subnet: number;
   universe: number;
   enabled: boolean;
+  notes?: string | null;
 };
 
 export type ColorRole = "r" | "g" | "b" | "w" | "a" | "uv";
@@ -274,6 +275,7 @@ export type Light = {
   on: boolean;
   zone_state: Record<string, ZoneColorState>;
   motion_state: MotionState;
+  notes?: string | null;
 };
 
 /** Live DMX snapshot for one light, decoded from the Art-Net buffer.
@@ -333,6 +335,7 @@ export type LightPayload = {
   mode_id?: number | null;
   start_address: number;
   position?: number;
+  notes?: string | null;
 };
 
 export type ColorRequestBody = {
@@ -645,4 +648,256 @@ export const Api = {
       onProgress,
     );
   },
+
+  designer: {
+    status: () => api.get<AiStatus>("/api/designer/status"),
+    listConversations: () =>
+      api.get<DesignerConversationSummary[]>(
+        "/api/designer/conversations",
+      ),
+    createConversation: (name?: string) =>
+      api.post<DesignerConversation>(`/api/designer/conversations`, {
+        name: name ?? null,
+      }),
+    getConversation: (cid: number) =>
+      api.get<DesignerConversation>(`/api/designer/conversations/${cid}`),
+    renameConversation: (cid: number, name: string) =>
+      api.patch<DesignerConversation>(`/api/designer/conversations/${cid}`, {
+        name,
+      }),
+    deleteConversation: (cid: number) =>
+      api.del<void>(`/api/designer/conversations/${cid}`),
+    applyProposal: (cid: number, proposal_id: string) =>
+      api.post<{ ok: boolean; applied: number }>(
+        `/api/designer/conversations/${cid}/apply`,
+        { proposal_id },
+      ),
+    saveProposal: (
+      cid: number,
+      proposal_id: string,
+      name?: string,
+    ) =>
+      api.post<{
+        ok: boolean;
+        kind: "state" | "scene";
+        id: number;
+        name: string;
+      }>(`/api/designer/conversations/${cid}/save`, {
+        proposal_id,
+        name: name ?? null,
+      }),
+    streamMessage: streamDesignerMessage,
+  },
 };
+
+// ---------------------------------------------------------------------------
+// Designer chat types
+// ---------------------------------------------------------------------------
+export type DesignerProposalLight = {
+  light_id: number;
+  on: boolean;
+  dimmer: number;
+  r: number;
+  g: number;
+  b: number;
+  w?: number | null;
+  a?: number | null;
+  uv?: number | null;
+  zone_state?: Record<string, ZoneColorState>;
+  motion_state?: MotionState;
+};
+
+export type DesignerProposal = {
+  proposal_id: string;
+  kind: "state" | "scene";
+  name: string;
+  controller_id?: number | null;
+  notes?: string | null;
+  lights: DesignerProposalLight[];
+};
+
+export type DesignerMessage = {
+  role: "user" | "assistant";
+  text: string;
+  proposals: DesignerProposal[];
+};
+
+export type DesignerConversation = {
+  id: number;
+  name: string;
+  created_at: string;
+  updated_at: string;
+  messages: DesignerMessage[];
+  last_proposals: DesignerProposal[];
+};
+
+export type DesignerConversationSummary = {
+  id: number;
+  name: string;
+  message_count: number;
+  updated_at: string;
+};
+
+export type DesignerStreamHandlers = {
+  onStart?: (data: { conversation_id: number }) => void;
+  onText?: (delta: string) => void;
+  onToolStart?: (tool: string) => void;
+  onToolDelta?: (partialJson: string) => void;
+  onProposal?: (proposals: DesignerProposal[]) => void;
+  onDone?: (conversation: DesignerConversation) => void;
+  onError?: (message: string) => void;
+};
+
+export type DesignerStreamHandle = {
+  /** Abort the in-flight stream. */
+  cancel: () => void;
+  /** Resolves when the stream fully finishes (done or error). */
+  done: Promise<void>;
+};
+
+/** Stream a designer turn.
+ *
+ * Uses ``fetch`` + ``ReadableStream`` with a tiny SSE line parser because
+ * ``EventSource`` cannot POST a JSON body while carrying the session
+ * cookie reliably across all browsers. Returns a cancel handle so the
+ * UI can wire a Stop button to it. */
+function streamDesignerMessage(
+  cid: number,
+  message: string,
+  handlers: DesignerStreamHandlers,
+): DesignerStreamHandle {
+  const ctrl = new AbortController();
+  const done = (async () => {
+    let res: Response;
+    try {
+      res = await fetch(`/api/designer/conversations/${cid}/message`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
+        body: JSON.stringify({ message }),
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      if ((e as { name?: string }).name === "AbortError") return;
+      handlers.onError?.(String(e));
+      return;
+    }
+    if (!res.ok || !res.body) {
+      const text = await res.text().catch(() => "");
+      let detail = text || res.statusText;
+      try {
+        const parsed = JSON.parse(text);
+        if (
+          parsed &&
+          typeof parsed === "object" &&
+          "detail" in parsed &&
+          typeof (parsed as { detail: unknown }).detail === "string"
+        ) {
+          detail = (parsed as { detail: string }).detail;
+        }
+      } catch {
+        // Non-JSON body; use raw text.
+      }
+      handlers.onError?.(detail || `HTTP ${res.status}`);
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buf = "";
+    const dispatch = (event: string, data: string) => {
+      let parsed: unknown = null;
+      if (data.length > 0) {
+        try {
+          parsed = JSON.parse(data);
+        } catch {
+          parsed = data;
+        }
+      }
+      switch (event) {
+        case "start":
+          handlers.onStart?.(parsed as { conversation_id: number });
+          break;
+        case "text":
+          handlers.onText?.(
+            (parsed as { delta?: string })?.delta ?? "",
+          );
+          break;
+        case "tool_start":
+          handlers.onToolStart?.(
+            (parsed as { tool?: string })?.tool ?? "",
+          );
+          break;
+        case "tool_delta":
+          handlers.onToolDelta?.(
+            (parsed as { partial_json?: string })?.partial_json ?? "",
+          );
+          break;
+        case "proposal":
+          if (Array.isArray(parsed)) {
+            handlers.onProposal?.(parsed as DesignerProposal[]);
+          }
+          break;
+        case "done":
+          if (
+            parsed &&
+            typeof parsed === "object" &&
+            "conversation" in parsed
+          ) {
+            handlers.onDone?.(
+              (parsed as { conversation: DesignerConversation })
+                .conversation,
+            );
+          }
+          break;
+        case "error":
+          handlers.onError?.(
+            (parsed as { message?: string })?.message ?? "stream error",
+          );
+          break;
+        default:
+          break;
+      }
+    };
+
+    const flushEventBlock = (block: string) => {
+      if (!block) return;
+      let event = "message";
+      const dataLines: string[] = [];
+      for (const line of block.split("\n")) {
+        if (line.startsWith(":")) continue; // SSE comment
+        if (line.startsWith("event:")) {
+          event = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).trim());
+        }
+      }
+      dispatch(event, dataLines.join("\n"));
+    };
+
+    try {
+      while (true) {
+        const { value, done: streamDone } = await reader.read();
+        if (streamDone) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          flushEventBlock(block);
+        }
+      }
+      if (buf.trim()) flushEventBlock(buf);
+    } catch (e) {
+      if ((e as { name?: string }).name === "AbortError") return;
+      handlers.onError?.(String(e));
+    }
+  })();
+  return {
+    cancel: () => ctrl.abort(),
+    done,
+  };
+}

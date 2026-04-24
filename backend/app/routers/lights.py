@@ -36,6 +36,7 @@ def _to_out(l: Light) -> LightOut:
         on=l.on,
         zone_state=dict(l.zone_state or {}),
         motion_state=dict(l.motion_state or {}),
+        notes=l.notes,
     )
 
 
