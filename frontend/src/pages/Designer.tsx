@@ -731,9 +731,7 @@ function ProposalCard({
               </span>
             )}
             {proposal.kind === "effect" && proposal.effect && (
-              <span className="pill text-[10px]">
-                {proposal.effect.effect_type}
-              </span>
+              <span className="pill text-[10px]">lua</span>
             )}
           </div>
           {proposal.notes && (
@@ -789,8 +787,11 @@ function ProposalCard({
         )}
       {proposal.kind === "effect" && proposal.effect && (
         <div className="mt-2 text-[11px] text-muted">
-          spread {proposal.effect.spread} · speed{" "}
-          {proposal.effect.params.speed_hz.toFixed(2)} Hz · channels{" "}
+          spread {proposal.effect.spread}
+          {typeof proposal.effect.params?.speed_hz === "number" && (
+            <> · speed {(proposal.effect.params.speed_hz as number).toFixed(2)} Hz</>
+          )}
+          {" · channels "}
           {proposal.effect.target_channels.join("+")}
         </div>
       )}

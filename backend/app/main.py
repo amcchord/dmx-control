@@ -13,6 +13,7 @@ from .artnet import manager, rebuild_manager_sync
 from .config import FRONTEND_DIST
 from .db import init_db
 from .engine import build_spec_from_effect, engine as effect_engine
+from .lua import ScriptError
 from .routers import ai as ai_router
 from .routers import auth as auth_router
 from .routers import controllers as controllers_router
@@ -63,6 +64,11 @@ def _resume_active_effects() -> None:
                 spec = build_spec_from_effect(row, palette)
                 effect_engine.play(spec)
                 log.info("resumed effect %s (%s)", row.id, row.name)
+            except ScriptError as exc:
+                log.warning(
+                    "skipping effect %s (%s) on resume: %s",
+                    row.id, row.name, exc,
+                )
             except Exception:
                 log.exception("failed to resume effect %s", row.id)
 
@@ -75,6 +81,7 @@ app.include_router(models_router.router)
 app.include_router(lights_router.router)
 app.include_router(palettes_router.router)
 app.include_router(effects_router.router)
+app.include_router(effects_router.ws_router)
 app.include_router(scenes_router.router)
 app.include_router(states_router.router)
 app.include_router(state_router.router)

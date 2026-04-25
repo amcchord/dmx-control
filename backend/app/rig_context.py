@@ -180,10 +180,10 @@ def build_rig_context(
             {
                 "id": e.id,
                 "name": e.name,
-                "effect_type": e.effect_type,
                 "palette_id": e.palette_id,
                 "spread": e.spread,
                 "params": dict(e.params or {}),
+                "param_schema": list(e.param_schema or []),
                 "target_channels": list(e.target_channels or ["rgb"]),
                 "is_active": bool(e.is_active),
                 "builtin": bool(e.builtin),

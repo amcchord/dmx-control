@@ -56,6 +56,14 @@ from ..rig_context import (
     motion_axes_for_mode,
     zone_ids_for_mode,
 )
+from ..lua import (
+    LuaScript,
+    ScriptError,
+    builtin_sources,
+    compile_script,
+    get_builtin_source,
+)
+from ..lua.runtime import merge_with_schema
 from ..schemas import (
     DesignerApplyRequest,
     DesignerConversationCreate,
@@ -70,9 +78,7 @@ from ..schemas import (
     DesignerSaveRequest,
     EFFECT_TARGET_CHANNELS,
     EFFECT_FADE_MAX_S,
-    EFFECT_SIZE_MAX,
-    EFFECT_SPEED_HZ_MAX,
-    EffectParams,
+    EffectControls,
     PaletteEntry,
 )
 from ._capture import apply_state_to_light, push_light
@@ -275,41 +281,16 @@ def _build_palette_tool_schema() -> dict[str, Any]:
 
 
 def _build_effect_tool_schema() -> dict[str, Any]:
-    effect_types = [
-        "static", "fade", "cycle", "chase", "pulse",
-        "rainbow", "strobe", "sparkle", "wave",
-    ]
-    params_schema = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "speed_hz": {
-                "type": "number", "minimum": 0, "maximum": EFFECT_SPEED_HZ_MAX,
-            },
-            "direction": {
-                "type": "string",
-                "enum": ["forward", "reverse", "pingpong"],
-            },
-            "offset": {"type": "number", "minimum": 0, "maximum": 1},
-            "intensity": {"type": "number", "minimum": 0, "maximum": 1},
-            "size": {
-                "type": "number", "minimum": 0, "maximum": EFFECT_SIZE_MAX,
-            },
-            "softness": {"type": "number", "minimum": 0, "maximum": 1},
-            "fade_in_s": {
-                "type": "number", "minimum": 0, "maximum": EFFECT_FADE_MAX_S,
-            },
-            "fade_out_s": {
-                "type": "number", "minimum": 0, "maximum": EFFECT_FADE_MAX_S,
-            },
-        },
-    }
+    builtin_names = sorted(builtin_sources().keys())
     return {
         "name": _EFFECT_TOOL_NAME,
         "description": (
-            "Propose one or more effect drafts. Use this when the user "
-            "asks for motion (chase, pulse, wave, strobe, etc.). The UI "
-            "will offer Apply (play on current selection) and Save."
+            "Propose one or more animated effects. Each effect is a "
+            "sandboxed Lua script. Either reference a builtin script by "
+            "name (recommended for the common cases - fade, chase, "
+            "pulse, sparkle, strobe, wave, rainbow, cycle, static) or "
+            "supply a custom Lua ``source``. The UI will offer Apply "
+            "(play on current selection) and Save."
         ),
         "input_schema": {
             "type": "object",
@@ -326,8 +307,21 @@ def _build_effect_tool_schema() -> dict[str, Any]:
                             "proposal_id": {"type": "string"},
                             "name": {"type": "string"},
                             "notes": {"type": "string"},
-                            "effect_type": {
-                                "type": "string", "enum": effect_types
+                            "builtin": {
+                                "type": "string",
+                                "enum": builtin_names,
+                                "description": (
+                                    "Builtin Lua script name. Mutually "
+                                    "exclusive with ``source``."
+                                ),
+                            },
+                            "source": {
+                                "type": "string",
+                                "description": (
+                                    "Custom Lua script. Must define "
+                                    "render(ctx) or tick(ctx). See the "
+                                    "Lua effect API in the system prompt."
+                                ),
                             },
                             "palette_id": {"type": "integer"},
                             "spread": {
@@ -338,7 +332,34 @@ def _build_effect_tool_schema() -> dict[str, Any]:
                                     "across_zones",
                                 ],
                             },
-                            "params": params_schema,
+                            "params": {
+                                "type": "object",
+                                "description": (
+                                    "Free-form param overrides keyed by "
+                                    "the script's PARAMS ids. Example: "
+                                    "{\"speed_hz\": 1.2, \"size\": 1.5}."
+                                ),
+                            },
+                            "controls": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "intensity": {
+                                        "type": "number",
+                                        "minimum": 0, "maximum": 1,
+                                    },
+                                    "fade_in_s": {
+                                        "type": "number",
+                                        "minimum": 0,
+                                        "maximum": EFFECT_FADE_MAX_S,
+                                    },
+                                    "fade_out_s": {
+                                        "type": "number",
+                                        "minimum": 0,
+                                        "maximum": EFFECT_FADE_MAX_S,
+                                    },
+                                },
+                            },
                             "target_channels": {
                                 "type": "array",
                                 "items": {
@@ -353,9 +374,7 @@ def _build_effect_tool_schema() -> dict[str, Any]:
                                 ),
                             },
                         },
-                        "required": [
-                            "proposal_id", "name", "effect_type",
-                        ],
+                        "required": ["proposal_id", "name"],
                     },
                 },
             },
@@ -623,37 +642,20 @@ def _sanitize_palette_proposal(
     return out
 
 
-_EFFECT_TYPE_SET = {
-    "static", "fade", "cycle", "chase", "pulse",
-    "rainbow", "strobe", "sparkle", "wave",
-}
 _SPREAD_SET = {"across_lights", "across_fixture", "across_zones"}
-_DIRECTION_SET = {"forward", "reverse", "pingpong"}
 
 
-def _sanitize_effect_params(raw: Any) -> dict[str, Any]:
-    """Clamp Claude-supplied effect params to our EffectParams ranges."""
-    defaults = EffectParams().model_dump()
+def _sanitize_effect_controls(raw: Any) -> dict[str, float]:
+    out = {"intensity": 1.0, "fade_in_s": 0.25, "fade_out_s": 0.25}
     if not isinstance(raw, dict):
-        return defaults
-    out = dict(defaults)
-
-    def _num(key: str, lo: float, hi: float) -> None:
+        return out
+    v = raw.get("intensity")
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        out["intensity"] = max(0.0, min(1.0, float(v)))
+    for key in ("fade_in_s", "fade_out_s"):
         v = raw.get(key)
         if isinstance(v, (int, float)) and not isinstance(v, bool):
-            fv = float(v)
-            out[key] = max(lo, min(hi, fv))
-
-    _num("speed_hz", 0.0, EFFECT_SPEED_HZ_MAX)
-    _num("offset", 0.0, 1.0)
-    _num("intensity", 0.0, 1.0)
-    _num("size", 0.0, EFFECT_SIZE_MAX)
-    _num("softness", 0.0, 1.0)
-    _num("fade_in_s", 0.0, EFFECT_FADE_MAX_S)
-    _num("fade_out_s", 0.0, EFFECT_FADE_MAX_S)
-    d = raw.get("direction")
-    if isinstance(d, str) and d in _DIRECTION_SET:
-        out["direction"] = d
+            out[key] = max(0.0, min(EFFECT_FADE_MAX_S, float(v)))
     return out
 
 
@@ -663,6 +665,12 @@ def _sanitize_effect_proposal(
     used_ids: set[str],
     rig_palette_ids: set[int],
 ) -> Optional[dict[str, Any]]:
+    """Resolve an effect proposal to a Lua source + clean payload.
+
+    Either ``builtin`` (a known builtin script name) or ``source`` (raw
+    Lua) is required; if both are supplied, ``source`` wins. The script
+    is compiled here so we can stash the parsed param schema for the
+    UI."""
     if not isinstance(raw, dict):
         return None
     pid = raw.get("proposal_id")
@@ -672,9 +680,22 @@ def _sanitize_effect_proposal(
     if pid in used_ids:
         return None
     name = str(raw.get("name") or "").strip()[:128] or "Effect"
-    etype = raw.get("effect_type")
-    if etype not in _EFFECT_TYPE_SET:
+
+    source: Optional[str] = None
+    raw_source = raw.get("source")
+    if isinstance(raw_source, str) and raw_source.strip():
+        source = raw_source
+    if source is None:
+        builtin = raw.get("builtin")
+        if isinstance(builtin, str):
+            source = get_builtin_source(builtin.strip())
+    if source is None:
         return None
+    try:
+        script = compile_script(source, chunkname="=designer")
+    except ScriptError:
+        return None
+
     spread = raw.get("spread")
     if spread not in _SPREAD_SET:
         spread = "across_lights"
@@ -690,20 +711,25 @@ def _sanitize_effect_proposal(
             if isinstance(x, str) and str(x).lower().strip() in EFFECT_TARGET_CHANNELS
         ]
         if cleaned:
-            # dedupe preserving order
             seen: list[str] = []
             for c in cleaned:
                 if c not in seen:
                     seen.append(c)
             tc = seen
-    params = _sanitize_effect_params(raw.get("params"))
+    params = merge_with_schema(
+        list(script.meta.param_schema), raw.get("params") or {}
+    )
+    controls = _sanitize_effect_controls(raw.get("controls"))
     notes = raw.get("notes")
     notes_str = str(notes).strip()[:500] if notes else None
     body: dict[str, Any] = {
-        "effect_type": etype,
+        "source": source,
+        "param_schema": list(script.meta.param_schema),
+        "description": script.meta.description,
         "palette_id": palette_id,
         "spread": spread,
         "params": params,
+        "controls": controls,
         "target_channels": tc,
     }
     out: dict[str, Any] = {
@@ -1084,11 +1110,14 @@ def apply_proposal(
         body = prop.get("effect") or {}
         if not isinstance(body, dict):
             raise HTTPException(400, "effect proposal missing body")
-        etype = body.get("effect_type")
-        if etype not in _EFFECT_TYPE_SET:
-            raise HTTPException(400, "invalid effect_type in proposal")
+        source = body.get("source")
+        if not isinstance(source, str) or not source.strip():
+            raise HTTPException(400, "effect proposal missing Lua source")
+        try:
+            script = compile_script(source, chunkname="=designer-apply")
+        except ScriptError as e:
+            raise HTTPException(400, {"error": e.to_dict()})
         palette_id = body.get("palette_id")
-        # Playing with no target defaults to "every light" via the engine.
         light_ids: list[int] = []
         if isinstance(body.get("light_ids"), list):
             light_ids = [
@@ -1100,17 +1129,24 @@ def apply_proposal(
             pal = sess.get(Palette, palette_id)
             if pal is not None and pal.colors:
                 palette_colors = list(pal.colors)
+        controls = _sanitize_effect_controls(body.get("controls"))
+        params = merge_with_schema(
+            list(script.meta.param_schema), body.get("params") or {}
+        )
         handle = new_handle()
         spec = EffectSpec(
             handle=handle,
             effect_id=None,
-            name=str(prop.get("name") or f"Live {etype}"),
-            effect_type=str(etype),
+            name=str(prop.get("name") or "Live effect"),
+            script=script,
             palette_colors=palette_colors,
             light_ids=light_ids,
             targets=[],
             spread=str(body.get("spread", "across_lights")),
-            params=dict(body.get("params") or {}),
+            params=params,
+            intensity=controls["intensity"],
+            fade_in_s=controls["fade_in_s"],
+            fade_out_s=controls["fade_out_s"],
             target_channels=target_channels,
         )
         effect_engine.play(spec)
@@ -1176,30 +1212,35 @@ def _save_effect_proposal(
     body = prop.get("effect") or {}
     if not isinstance(body, dict):
         raise HTTPException(400, "effect proposal missing body")
-    etype = body.get("effect_type")
-    if etype not in _EFFECT_TYPE_SET:
-        raise HTTPException(400, "invalid effect_type")
+    source = body.get("source")
+    if not isinstance(source, str) or not source.strip():
+        raise HTTPException(400, "effect proposal missing Lua source")
+    try:
+        script = compile_script(source, chunkname="=designer-save")
+    except ScriptError as e:
+        raise HTTPException(400, {"error": e.to_dict()})
     spread = body.get("spread") or "across_lights"
     if spread not in _SPREAD_SET:
         spread = "across_lights"
     palette_id = body.get("palette_id")
     if not isinstance(palette_id, int):
         palette_id = None
-    params_dict = dict(body.get("params") or {})
-    try:
-        params = EffectParams(**params_dict).model_dump()
-    except Exception:
-        params = EffectParams().model_dump()
+    schema = list(script.meta.param_schema)
+    params = merge_with_schema(schema, body.get("params") or {})
+    controls = _sanitize_effect_controls(body.get("controls"))
+    persisted = dict(params)
+    persisted.update(controls)
     target_channels = list(body.get("target_channels") or ["rgb"])
     name = (payload_name or prop.get("name") or "").strip()[:128] or "Effect"
     row = Effect(
         name=name,
-        effect_type=str(etype),
+        source=source,
+        param_schema=schema,
         palette_id=palette_id,
         light_ids=[],
         targets=[],
         spread=spread,
-        params=params,
+        params=persisted,
         target_channels=target_channels,
         is_active=False,
         builtin=False,
@@ -1273,12 +1314,35 @@ def _build_messages_for_api(
 ) -> list[dict[str, Any]]:
     """Clone the stored Anthropic-shaped history and append the new user turn.
 
-    Truncate to the most recent ``_MAX_TURNS_HISTORY`` turns to keep the
-    request within Claude's context window on very long conversations."""
+    Anthropic requires that any assistant ``tool_use`` block be followed
+    by a matching ``tool_result`` in the next user turn. Our UI consumes
+    the tool output directly so we synthesize ``"applied"`` placeholders
+    here and fold them into the next user message."""
     msgs: list[dict[str, Any]] = []
     raw = list(stored)
     if len(raw) > _MAX_TURNS_HISTORY:
         raw = raw[-_MAX_TURNS_HISTORY:]
+
+    pending_tool_ids: list[str] = []
+
+    def _wrap_user(content: Any) -> dict[str, Any]:
+        nonlocal pending_tool_ids
+        if pending_tool_ids:
+            blocks: list[dict[str, Any]] = [
+                {"type": "tool_result", "tool_use_id": tid, "content": "applied"}
+                for tid in pending_tool_ids
+            ]
+            if isinstance(content, str):
+                if content:
+                    blocks.append({"type": "text", "text": content})
+            elif isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict):
+                        blocks.append(b)
+            pending_tool_ids = []
+            return {"role": "user", "content": blocks}
+        return {"role": "user", "content": content}
+
     for m in raw:
         if not isinstance(m, dict):
             continue
@@ -1288,8 +1352,20 @@ def _build_messages_for_api(
             continue
         if not isinstance(content, (str, list)):
             continue
-        msgs.append({"role": role, "content": content})
-    msgs.append({"role": "user", "content": new_user_text})
+        if role == "user":
+            msgs.append(_wrap_user(content))
+        else:
+            msgs.append({"role": "assistant", "content": content})
+            if isinstance(content, list):
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "tool_use":
+                        tid = b.get("id")
+                        if isinstance(tid, str) and tid:
+                            pending_tool_ids.append(tid)
+
+    msgs.append(_wrap_user(new_user_text))
     return msgs
 
 

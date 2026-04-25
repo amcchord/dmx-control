@@ -423,19 +423,6 @@ export type PaletteSpread =
   | "across_fixture"
   | "across_zones";
 
-export type EffectType =
-  | "static"
-  | "fade"
-  | "cycle"
-  | "chase"
-  | "pulse"
-  | "rainbow"
-  | "strobe"
-  | "sparkle"
-  | "wave";
-
-export type EffectDirection = "forward" | "reverse" | "pingpong";
-
 /** Channel groups an effect overlay can drive. */
 export type EffectTargetChannel =
   | "rgb"
@@ -445,45 +432,47 @@ export type EffectTargetChannel =
   | "dimmer"
   | "strobe";
 
-/** Slider caps shared between UI and backend validators. Raise
- *  cautiously - values beyond these rarely model anything physical. */
-export const EFFECT_LIMITS = {
-  speed_hz_max: 25,
-  size_max: 16,
-  fade_max_s: 30,
-} as const;
+/** One entry in a script's declared PARAMS table. The backend's lint
+ *  endpoint normalises Lua tables into this shape. */
+export type EffectParamSchemaEntry = {
+  id: string;
+  type: "number" | "slider" | "color" | "bool" | "choice";
+  label?: string;
+  suffix?: string;
+  min?: number;
+  max?: number;
+  step?: number;
+  options?: string[];
+  default?: number | string | boolean;
+};
 
-export type EffectParams = {
-  speed_hz: number;
-  direction: EffectDirection;
-  offset: number;
+/** Engine-applied controls (always present, regardless of script). */
+export type EffectControls = {
   intensity: number;
-  size: number;
-  softness: number;
   fade_in_s: number;
   fade_out_s: number;
 };
 
-export const DEFAULT_EFFECT_PARAMS: EffectParams = {
-  speed_hz: 0.5,
-  direction: "forward",
-  offset: 0,
+export const DEFAULT_EFFECT_CONTROLS: EffectControls = {
   intensity: 1,
-  size: 1,
-  softness: 0.5,
   fade_in_s: 0.25,
   fade_out_s: 0.25,
 };
 
+export type EffectParams = Record<string, number | string | boolean>;
+
 export type Effect = {
   id: number;
   name: string;
-  effect_type: EffectType;
+  source: string;
+  description: string;
+  param_schema: EffectParamSchemaEntry[];
   palette_id: number | null;
   light_ids: number[];
   targets: BulkTarget[];
   spread: PaletteSpread;
   params: EffectParams;
+  controls: EffectControls;
   target_channels: EffectTargetChannel[];
   is_active: boolean;
   builtin: boolean;
@@ -491,12 +480,13 @@ export type Effect = {
 
 export type EffectInput = {
   name: string;
-  effect_type: EffectType;
+  source: string;
   palette_id: number | null;
   light_ids: number[];
   targets: BulkTarget[];
   spread: PaletteSpread;
   params: EffectParams;
+  controls?: EffectControls;
   target_channels?: EffectTargetChannel[];
 };
 
@@ -506,8 +496,52 @@ export type ActiveEffect = {
   id: number | null;
   handle: string;
   name: string;
-  effect_type: EffectType;
   runtime_s: number;
+};
+
+export type EffectLintError = { message: string; line?: number };
+
+export type EffectLintResponse = {
+  ok: boolean;
+  name: string;
+  description: string;
+  param_schema: EffectParamSchemaEntry[];
+  has_render: boolean;
+  has_tick: boolean;
+  error?: EffectLintError | null;
+};
+
+/** One cell in a preview strip. RGB strips carry r/g/b/brightness; aux
+ *  strips (w/a/uv/dimmer/strobe) carry only ``brightness`` (a scalar
+ *  envelope on that channel). */
+export type PreviewCell = {
+  active: boolean;
+  r?: number;
+  g?: number;
+  b?: number;
+  brightness?: number;
+};
+
+export type PreviewStrip = {
+  target: EffectTargetChannel;
+  cells: PreviewCell[];
+};
+
+export type PreviewFrame = {
+  frame: number;
+  strips: PreviewStrip[];
+  t?: number;
+  error?: EffectLintError;
+};
+
+export type PreviewPatch = {
+  source?: string;
+  params?: EffectParams;
+  palette?: string[];
+  cells?: number;
+  spread?: PaletteSpread;
+  target_channels?: EffectTargetChannel[];
+  intensity?: number;
 };
 
 /** Per-light snapshot inside a saved Scene. Mirrors the writable fields
@@ -679,6 +713,8 @@ export const Api = {
     }),
 
   listEffects: () => api.get<Effect[]>("/api/effects"),
+  lintEffect: (source: string) =>
+    api.post<EffectLintResponse>("/api/effects/lint", { source }),
   createEffect: (body: EffectInput) => api.post<Effect>("/api/effects", body),
   updateEffect: (id: number, body: EffectInput) =>
     api.patch<Effect>(`/api/effects/${id}`, body),
@@ -849,10 +885,13 @@ export type DesignerProposalLight = {
 };
 
 export type DesignerEffectProposalBody = {
-  effect_type: EffectType;
+  source: string;
+  description?: string;
+  param_schema?: EffectParamSchemaEntry[];
   palette_id: number | null;
   spread: PaletteSpread;
   params: EffectParams;
+  controls: EffectControls;
   target_channels: EffectTargetChannel[];
   light_ids: number[];
   targets: BulkTarget[];
@@ -917,10 +956,13 @@ export type EffectProposal = {
   proposal_id: string;
   summary?: string | null;
   name: string;
-  effect_type: EffectType;
+  source: string;
+  description?: string;
+  param_schema?: EffectParamSchemaEntry[];
   palette_id: number | null;
   spread: PaletteSpread;
   params: EffectParams;
+  controls: EffectControls;
   target_channels: EffectTargetChannel[];
   light_ids: number[];
   targets: BulkTarget[];
@@ -953,6 +995,16 @@ export type EffectChatStreamHandlers = {
   onText?: (delta: string) => void;
   onToolStart?: (tool: string) => void;
   onToolDelta?: (partialJson: string) => void;
+  onRetry?: (info: {
+    attempt: number;
+    max_attempts: number;
+    reason: string;
+  }) => void;
+  onScriptError?: (info: {
+    message: string;
+    line?: number | null;
+    attempts: number;
+  }) => void;
   onProposal?: (proposal: EffectProposal | null) => void;
   onDone?: (conversation: EffectConversationData) => void;
   onError?: (message: string) => void;
@@ -1183,6 +1235,24 @@ function streamEffectChatMessage(
         case "tool_delta":
           handlers.onToolDelta?.(
             (parsed as { partial_json?: string })?.partial_json ?? "",
+          );
+          break;
+        case "retry":
+          handlers.onRetry?.(
+            parsed as {
+              attempt: number;
+              max_attempts: number;
+              reason: string;
+            },
+          );
+          break;
+        case "script_error":
+          handlers.onScriptError?.(
+            parsed as {
+              message: string;
+              line?: number | null;
+              attempts: number;
+            },
           );
           break;
         case "proposal":

@@ -141,6 +141,17 @@ def _migrate() -> None:
                 conn.exec_driver_sql(
                     "ALTER TABLE effect ADD COLUMN target_channels JSON"
                 )
+            # effect.source (Lua script, replaces the legacy effect_type
+            # primitive switch).
+            if "source" not in eff_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE effect ADD COLUMN source TEXT NOT NULL "
+                    "DEFAULT ''"
+                )
+            if "param_schema" not in eff_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE effect ADD COLUMN param_schema JSON"
+                )
         else:
             # Best-effort for other backends; swallow errors if column already exists.
             for stmt in (
@@ -155,6 +166,8 @@ def _migrate() -> None:
                 "ALTER TABLE lightmodelmode ADD COLUMN color_policy JSON",
                 "ALTER TABLE palette ADD COLUMN entries JSON",
                 "ALTER TABLE effect ADD COLUMN target_channels JSON",
+                "ALTER TABLE effect ADD COLUMN source TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE effect ADD COLUMN param_schema JSON",
             ):
                 try:
                     conn.execute(text(stmt))

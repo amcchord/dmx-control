@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { Api, ActiveEffect, Effect, Palette } from "../api";
 import PaletteSwatch from "./PaletteSwatch";
 
@@ -107,6 +108,13 @@ export default function EffectsSidebar({
         </div>
       ) : (
         <div className="flex-1 space-y-1.5 overflow-y-auto pr-1">
+          <div className="rounded-md bg-bg-elev p-2 text-[11px] text-muted ring-1 ring-line">
+            Author Lua effects on the{" "}
+            <Link to="/effects" className="text-accent hover:underline">
+              Effects page
+            </Link>
+            .
+          </div>
           {effects.map((e) => {
             const active = activeByEffect.get(e.id);
             const palette = e.palette_id
@@ -136,9 +144,11 @@ export default function EffectsSidebar({
                     )}
                   </button>
                   <div className="mt-0.5 flex items-center gap-1.5">
-                    <span className="text-[10px] uppercase tracking-wide text-muted">
-                      {e.effect_type}
-                    </span>
+                    {e.description && (
+                      <span className="truncate text-[10px] text-muted">
+                        {e.description}
+                      </span>
+                    )}
                     {palette && (
                       <div className="max-w-[100px] flex-1">
                         <PaletteSwatch colors={palette.colors.slice(0, 6)} />

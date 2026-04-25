@@ -7,18 +7,6 @@ type Props = {
   notify?: (msg: string, kind?: "success" | "error" | "info") => void;
 };
 
-const EFFECT_ICONS: Record<string, string> = {
-  static: "\u25A0",
-  fade: "\u25C9",
-  cycle: "\u21BB",
-  chase: "\u27A4",
-  pulse: "\u2665",
-  rainbow: "\u2728",
-  strobe: "\u26A1",
-  sparkle: "\u2734",
-  wave: "\u223F",
-};
-
 export default function ActiveEffectsBar({
   activeEffects,
   onChanged,
@@ -77,7 +65,6 @@ export default function ActiveEffectsBar({
       </div>
       <div className="flex flex-1 flex-wrap gap-1.5">
         {activeEffects.map((a) => {
-          const icon = EFFECT_ICONS[a.effect_type] ?? "\u25CF";
           const isBusy = busy === a.handle;
           return (
             <div
@@ -86,10 +73,10 @@ export default function ActiveEffectsBar({
                 "flex items-center gap-1.5 rounded-full bg-bg-card py-0.5 pl-2 pr-0.5 text-xs ring-1 " +
                 (a.id == null ? "ring-amber-800" : "ring-emerald-800")
               }
-              title={`${a.effect_type} \u2022 running ${formatRuntime(a.runtime_s)}`}
+              title={`running ${formatRuntime(a.runtime_s)}`}
             >
               <span className="text-sm leading-none" aria-hidden>
-                {icon}
+                {"\u25C9"}
               </span>
               <span className="max-w-[14ch] truncate font-medium text-slate-100">
                 {a.name}

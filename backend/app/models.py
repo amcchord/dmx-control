@@ -126,14 +126,33 @@ class Palette(SQLModel, table=True):
 class Effect(SQLModel, table=True):
     """A named animated effect over a set of targets.
 
-    Targets mirror the shape of :class:`BulkColorRequest`: whole-fixture
-    ``light_ids`` plus per-zone ``targets``. The engine computes an overlay
-    every frame; the fixture's base color in the DB is left untouched."""
+    Effects are sandboxed Lua scripts. Each script declares its own
+    parameters via a top-level ``PARAMS`` table; the user's chosen values
+    are stored on this row in ``params``. The engine ticks the script
+    every frame and merges the result onto each target's base color (the
+    fixture's persistent DB state is never written by the engine).
+
+    ``effect_type`` is retained as a nullable column for backwards
+    compatibility with pre-Lua databases. New rows should leave it null;
+    the migration in :mod:`.seed` resolves legacy values to the matching
+    builtin script source on first boot of the new build."""
 
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
-    # static | fade | cycle | chase | pulse | rainbow | strobe | sparkle | wave
-    effect_type: str
+    # Lua source for this effect. Empty string only on legacy rows that
+    # haven't been migrated yet (the seeder fills these in).
+    source: str = Field(default="", sa_column=Column(Text))
+    # Cached parameter schema parsed out of the script's top-level
+    # ``PARAMS`` table. The lint endpoint refreshes this on save so the
+    # auto-generated form stays in sync with the source.
+    param_schema: list[dict] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+    # Legacy column - left in place to avoid a destructive migration on
+    # existing rows. SQLite originally created this with ``NOT NULL`` and
+    # we can't drop the constraint with ALTER TABLE, so default to a
+    # placeholder ``"lua"`` for new rows. Not part of the public API.
+    effect_type: str = Field(default="lua", nullable=True)
     palette_id: Optional[int] = Field(
         default=None, foreign_key="palette.id", index=True
     )
@@ -142,6 +161,8 @@ class Effect(SQLModel, table=True):
     targets: list[dict] = Field(default_factory=list, sa_column=Column(JSON))
     # across_lights | across_fixture | across_zones
     spread: str = "across_lights"
+    # User-customized parameter values; clamped against ``param_schema``
+    # at save time. Engine reads from here every tick.
     params: dict = Field(default_factory=dict, sa_column=Column(JSON))
     # Which logical channels the overlay animates. Valid entries are
     # "rgb", "w", "a", "uv", "dimmer", "strobe". Default ["rgb"] matches

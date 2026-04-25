@@ -20,7 +20,6 @@ import {
 import { useToast } from "../toast";
 import ActiveEffectsBar from "../components/ActiveEffectsBar";
 import ColorPicker from "../components/ColorPicker";
-import EffectPanel from "../components/EffectPanel";
 import Modal from "../components/Modal";
 import PaletteSwatch from "../components/PaletteSwatch";
 import EffectsSidebar from "../components/EffectsSidebar";
@@ -823,42 +822,36 @@ export default function Dashboard() {
         title={`Effects — ${selected.size} light${selected.size === 1 ? "" : "s"} selected`}
         size="lg"
       >
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-          <EffectPanel
-            selection={selToBulkTargets(selected)}
-            palettes={palettes}
-            onActiveChanged={refreshActive}
-            onSaved={async () => {
-              await refreshEffects();
-              await refreshActive();
-            }}
-            notify={(msg, kind) => toast.push(msg, kind)}
-          />
-          <EffectsSidebar
-            effects={effects}
-            activeEffects={activeEffects}
-            palettes={palettes}
-            onEffectSelected={(e) => {
-              // Load this effect's targets into the Dashboard selection so
-              // the user can tweak it without manually reselecting lights.
-              const next: Selection = new Map();
-              for (const lid of e.light_ids) next.set(lid, "all");
-              for (const t of e.targets) {
-                const existing = next.get(t.light_id);
-                if (existing === "all") continue;
-                const set = existing ?? new Set<string>();
-                if (t.zone_id) set.add(t.zone_id);
-                next.set(t.light_id, set);
-              }
-              setSelected(next);
-            }}
-            onChanged={async () => {
-              await refreshEffects();
-              await refreshActive();
-            }}
-            notify={(msg, kind) => toast.push(msg, kind)}
-          />
-        </div>
+        <p className="mb-3 text-sm text-muted">
+          Pick a saved effect to play on the current selection. Author or
+          edit Lua effects on the{" "}
+          <Link to="/effects" className="text-accent hover:underline">
+            Effects page
+          </Link>
+          .
+        </p>
+        <EffectsSidebar
+          effects={effects}
+          activeEffects={activeEffects}
+          palettes={palettes}
+          onEffectSelected={(e) => {
+            const next: Selection = new Map();
+            for (const lid of e.light_ids) next.set(lid, "all");
+            for (const t of e.targets) {
+              const existing = next.get(t.light_id);
+              if (existing === "all") continue;
+              const set = existing ?? new Set<string>();
+              if (t.zone_id) set.add(t.zone_id);
+              next.set(t.light_id, set);
+            }
+            setSelected(next);
+          }}
+          onChanged={async () => {
+            await refreshEffects();
+            await refreshActive();
+          }}
+          notify={(msg, kind) => toast.push(msg, kind)}
+        />
       </Modal>
 
       <Modal

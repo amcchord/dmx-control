@@ -542,21 +542,7 @@ class PaletteOut(BaseModel):
     builtin: bool
 
 
-EFFECT_TYPES = {
-    "static",
-    "fade",
-    "cycle",
-    "chase",
-    "pulse",
-    "rainbow",
-    "strobe",
-    "sparkle",
-    "wave",
-}
-
 SPREAD_MODES = {"across_lights", "across_fixture", "across_zones"}
-
-DIRECTIONS = {"forward", "reverse", "pingpong"}
 
 # Logical "channel groups" an effect overlay may drive. "rgb" is the
 # classic path (color animates across the fixture's RGB inputs); the
@@ -565,50 +551,33 @@ DIRECTIONS = {"forward", "reverse", "pingpong"}
 # merge logic in ``effects.merge_overlay_into_state``.
 EFFECT_TARGET_CHANNELS = {"rgb", "w", "a", "uv", "dimmer", "strobe"}
 
-# Slider caps tightened from the overly-generous original ranges. These
-# match the UI so the two stay in sync. Raise cautiously — values beyond
-# these caps rarely model anything physical.
-EFFECT_SPEED_HZ_MAX = 25.0
-EFFECT_SIZE_MAX = 16.0
+# Limits enforced on engine-applied "system" params (the ones outside the
+# script's PARAMS table - the engine still applies fade in/out and the
+# global intensity multiplier regardless of what the script declares).
 EFFECT_FADE_MAX_S = 30.0
+EFFECT_MAX_SOURCE_BYTES = 64 * 1024
 
 
-class EffectParams(BaseModel):
-    """Runtime parameters shared by every effect primitive.
+# Engine-level controls applied to every effect, regardless of the
+# script's PARAMS schema. Scripts read their own knobs out of
+# ``ctx.params`` (which is the user's saved ``params`` minus these).
+class EffectControls(BaseModel):
+    """Per-effect controls the engine applies on top of the script.
 
-    All effects interpret the same field set; individual effects ignore
-    fields that don't apply (e.g. ``size`` is meaningless for ``pulse``)."""
+    These never reach the script's ``ctx.params``: ``intensity`` is a
+    final multiplier on the script's ``brightness``, and the fade-in /
+    fade-out seconds shape the engine's start/stop envelope around the
+    whole effect."""
 
-    speed_hz: float = 0.5
-    direction: Literal["forward", "reverse", "pingpong"] = "forward"
-    offset: float = 0.0
     intensity: float = 1.0
-    size: float = 1.0
-    softness: float = 0.5
     fade_in_s: float = 0.25
     fade_out_s: float = 0.25
 
-    @field_validator("speed_hz")
-    @classmethod
-    def _speed(cls, v: float) -> float:
-        if not (0.0 <= v <= EFFECT_SPEED_HZ_MAX):
-            raise ValueError(
-                f"speed_hz must be in [0, {EFFECT_SPEED_HZ_MAX:g}]"
-            )
-        return float(v)
-
-    @field_validator("offset", "intensity", "softness")
+    @field_validator("intensity")
     @classmethod
     def _unit(cls, v: float) -> float:
         if not (0.0 <= v <= 1.0):
-            raise ValueError("must be in [0, 1]")
-        return float(v)
-
-    @field_validator("size")
-    @classmethod
-    def _size(cls, v: float) -> float:
-        if not (0.0 <= v <= EFFECT_SIZE_MAX):
-            raise ValueError(f"size must be in [0, {EFFECT_SIZE_MAX:g}]")
+            raise ValueError("intensity must be in [0, 1]")
         return float(v)
 
     @field_validator("fade_in_s", "fade_out_s")
@@ -639,19 +608,36 @@ def _validate_target_channels(v: Optional[list[str]]) -> list[str]:
     return seen
 
 
+def _validate_source(v: str) -> str:
+    if not isinstance(v, str):
+        raise ValueError("source must be a string")
+    if len(v.encode("utf-8")) > EFFECT_MAX_SOURCE_BYTES:
+        raise ValueError(
+            f"source too large (max {EFFECT_MAX_SOURCE_BYTES} bytes)"
+        )
+    if not v.strip():
+        raise ValueError("source must be non-empty")
+    return v
+
+
 class EffectIn(BaseModel):
+    """Save-or-update payload for an effect.
+
+    ``source`` is the Lua script. ``params`` is a free-form dict whose
+    keys must match ids declared in the script's ``PARAMS`` table
+    (extras are tolerated for forward compatibility). ``controls`` holds
+    the engine-level fade/intensity envelope."""
+
     name: str
-    effect_type: Literal[
-        "static", "fade", "cycle", "chase", "pulse",
-        "rainbow", "strobe", "sparkle", "wave",
-    ]
+    source: str
     palette_id: Optional[int] = None
     light_ids: list[int] = Field(default_factory=list)
     targets: Optional[list[BulkTarget]] = None
     spread: Literal["across_lights", "across_fixture", "across_zones"] = (
         "across_lights"
     )
-    params: EffectParams = Field(default_factory=EffectParams)
+    params: dict = Field(default_factory=dict)
+    controls: EffectControls = Field(default_factory=EffectControls)
     target_channels: list[str] = Field(default_factory=lambda: ["rgb"])
 
     @field_validator("name")
@@ -664,6 +650,11 @@ class EffectIn(BaseModel):
             raise ValueError("name too long")
         return s
 
+    @field_validator("source")
+    @classmethod
+    def _source(cls, v: str) -> str:
+        return _validate_source(v)
+
     @field_validator("target_channels")
     @classmethod
     def _channels(cls, v: list[str]) -> list[str]:
@@ -674,18 +665,21 @@ class LiveEffectIn(BaseModel):
     """Same as EffectIn but name is optional (generated server-side)."""
 
     name: Optional[str] = None
-    effect_type: Literal[
-        "static", "fade", "cycle", "chase", "pulse",
-        "rainbow", "strobe", "sparkle", "wave",
-    ]
+    source: str
     palette_id: Optional[int] = None
     light_ids: list[int] = Field(default_factory=list)
     targets: Optional[list[BulkTarget]] = None
     spread: Literal["across_lights", "across_fixture", "across_zones"] = (
         "across_lights"
     )
-    params: EffectParams = Field(default_factory=EffectParams)
+    params: dict = Field(default_factory=dict)
+    controls: EffectControls = Field(default_factory=EffectControls)
     target_channels: list[str] = Field(default_factory=lambda: ["rgb"])
+
+    @field_validator("source")
+    @classmethod
+    def _source(cls, v: str) -> str:
+        return _validate_source(v)
 
     @field_validator("target_channels")
     @classmethod
@@ -710,15 +704,37 @@ class SaveLiveRequest(BaseModel):
 class EffectOut(BaseModel):
     id: int
     name: str
-    effect_type: str
+    source: str
+    description: str = ""
+    param_schema: list[dict] = Field(default_factory=list)
     palette_id: Optional[int] = None
     light_ids: list[int]
     targets: list[BulkTarget]
     spread: str
-    params: EffectParams
+    params: dict
+    controls: EffectControls = Field(default_factory=EffectControls)
     target_channels: list[str] = Field(default_factory=lambda: ["rgb"])
     is_active: bool
     builtin: bool
+
+
+class EffectLintRequest(BaseModel):
+    source: str
+
+    @field_validator("source")
+    @classmethod
+    def _source(cls, v: str) -> str:
+        return _validate_source(v)
+
+
+class EffectLintResponse(BaseModel):
+    ok: bool
+    name: str = ""
+    description: str = ""
+    param_schema: list[dict] = Field(default_factory=list)
+    has_render: bool = False
+    has_tick: bool = False
+    error: Optional[dict] = None
 
 
 class ActiveEffect(BaseModel):
@@ -731,7 +747,6 @@ class ActiveEffect(BaseModel):
     id: Optional[int] = None
     handle: str
     name: str
-    effect_type: str
     runtime_s: float
 
 
@@ -945,19 +960,20 @@ class DesignerProposalLight(BaseModel):
 class DesignerEffectProposalBody(BaseModel):
     """Claude-facing shape for an effect proposal in the designer chat.
 
-    Mirrors :class:`EffectIn` except ``light_ids`` / ``targets`` are always
-    resolved client-side against the user's current selection (the rig
-    snapshot does not know what the user has selected)."""
+    ``source`` is the Lua script Claude wrote. Optionally ``builtin``
+    names a builtin script to clone instead, which Claude tends to use
+    when the user just said "give me a fade" without specifying anything
+    custom. ``light_ids`` / ``targets`` are resolved client-side against
+    the user's current selection."""
 
-    effect_type: Literal[
-        "static", "fade", "cycle", "chase", "pulse",
-        "rainbow", "strobe", "sparkle", "wave",
-    ]
+    source: Optional[str] = None
+    builtin: Optional[str] = None
     palette_id: Optional[int] = None
     spread: Literal["across_lights", "across_fixture", "across_zones"] = (
         "across_lights"
     )
-    params: "EffectParams" = Field(default_factory=lambda: EffectParams())
+    params: dict = Field(default_factory=dict)
+    controls: EffectControls = Field(default_factory=EffectControls)
     target_channels: list[str] = Field(default_factory=lambda: ["rgb"])
     light_ids: list[int] = Field(default_factory=list)
     targets: list[BulkTarget] = Field(default_factory=list)
@@ -1098,15 +1114,15 @@ class EffectProposal(BaseModel):
     proposal_id: str
     summary: Optional[str] = None
     name: str
-    effect_type: Literal[
-        "static", "fade", "cycle", "chase", "pulse",
-        "rainbow", "strobe", "sparkle", "wave",
-    ]
+    source: str
+    description: str = ""
+    param_schema: list[dict] = Field(default_factory=list)
     palette_id: Optional[int] = None
     spread: Literal["across_lights", "across_fixture", "across_zones"] = (
         "across_lights"
     )
-    params: EffectParams = Field(default_factory=EffectParams)
+    params: dict = Field(default_factory=dict)
+    controls: EffectControls = Field(default_factory=EffectControls)
     target_channels: list[str] = Field(default_factory=lambda: ["rgb"])
     light_ids: list[int] = Field(default_factory=list)
     targets: list[BulkTarget] = Field(default_factory=list)

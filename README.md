@@ -29,10 +29,13 @@ a Caddy + systemd deployment that fronts everything at
 - Apply a palette to a selection of lights in **cycle**, **gradient**, or
   **random** mode.
 - Turn lights on/off, set individual colors, and bulk-blackout a controller.
-- Run a real-time **effect engine** (static, fade, cycle, chase, pulse,
-  rainbow, strobe, sparkle, wave) with per-effect fade-in/out, spread
-  (across lights / across fixture / across zones), and nine curated
-  built-in effects. Effects are non-destructive: stopping one cleanly
+- Run a real-time **effect engine** powered by sandboxed **Lua scripts**.
+  Every effect — built-in or user-authored — is a Lua source file the
+  engine ticks at 30 Hz inside a locked-down `lupa` runtime (no `io`,
+  `os`, `require`, `package`, `debug`, `load`, or `dofile`; per-call
+  instruction budget). Each script declares its own `PARAMS` table, so
+  the UI auto-generates exactly the right knobs (speed, size, warmth,
+  etc.) per effect. Effects are non-destructive: stopping one cleanly
   restores whatever base color was in place.
 - Every effect carries a **`target_channels`** list that decides which
   logical channels the overlay animates: `rgb` (default) blends into the
@@ -40,14 +43,24 @@ a Caddy + systemd deployment that fronts everything at
   white / amber / UV LEDs **without touching RGB**, and `dimmer` /
   `strobe` animate the master dimmer or strobe faders. This is how
   "keep the wash red but chase a white pulse across the bar" works.
-- **Dedicated `/effects` page** — full-page editor with a simulated
-  preview grid (JS port of the effect math, no DMX required), a
-  "push live" toggle that drives `/api/effects/live` against the
-  currently selected lights, a target-channel chip selector, saved
-  presets with one-click load, and an **inline Claude chat** that
-  iteratively refines the effect (say "faster", "tighter window",
-  "chase only the white channel" and Claude returns a fresh
-  `EffectIn` draft each turn).
+- **Dedicated `/effects` page** — top-down stack of presets dropdown →
+  multi-strip live preview (one strip per active target channel, fed by
+  a 30 Hz websocket from the real engine) → Claude chat (left) and
+  auto-generated script controls (right) → collapsed Lua source editor
+  (CodeMirror 6 with Lua syntax highlighting, lint markers, and
+  `Ctrl+Z` history) → light selection + Push live. Spread, channels,
+  and palette live behind a small "routing" disclosure since they're
+  usually best described to Claude in plain English.
+- **Iterative chat with Claude** that writes and revises Lua. Every
+  proposal is **smoke-tested server-side** (compile + dry-run across
+  several slots × timesteps) before reaching the user; runtime errors
+  are pumped back to Claude as a `tool_result` with targeted hints
+  (e.g. "`ctx.palette:smooth` returns three numbers, not a table") and
+  Claude retries up to 3 times automatically. Streaming SSE events show
+  the in-progress text, partial Lua draft (with a friendly "Drafting
+  effect (1.2 KB) · Theater Chase" status), retry attempts, and a
+  final `script_error` if the script still fails so the user can see
+  what was tried and ask for a fix.
 - Save and recall named **scenes** — snapshots of every light's current
   color/dimmer/on state, scoped per-controller or spanning the whole rig.
   Each controller's header on the Lights page gets a `Restore scene`
@@ -234,8 +247,8 @@ Requires `ANTHROPIC_API_KEY`.
 
 ### Effects (`/api/effects`)
 
-Saved animated presets (cycle/fade/rainbow/etc) plus a transient "live"
-playback path used by the `/effects` page and the Effects dialog.
+Saved Lua-scripted animated presets plus a transient "live" playback
+path used by the `/effects` page.
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
@@ -248,12 +261,36 @@ playback path used by the `/effects` page and the Effects dialog.
 | POST | `/api/effects/{id}/stop` | — | `{ok, stopped}` |
 | POST | `/api/effects/stop-all` | — | `{ok, stopped}` |
 | GET | `/api/effects/active` | — | `ActiveEffect[]` |
+| POST | `/api/effects/lint` | `{source}` | `EffectLintResponse` |
 | POST | `/api/effects/live` | `LiveEffectIn` | `{ok, handle, name}` |
 | POST | `/api/effects/live/{handle}/stop` | — | `{ok}` |
 | POST | `/api/effects/live/{handle}/save` | `{name}` | `Effect` |
+| WS | `/api/effects/preview/ws` | `{source, params, palette, …}` | streams `PreviewFrame`s |
 
-`EffectIn` carries a `target_channels` list that selects which logical
-channel groups the overlay animates:
+```json
+// EffectIn
+{
+  "name": "Theater Chase",
+  "source": "PARAMS = { { id='speed_hz', type='number', min=0, max=25, default=2.0, suffix='Hz' } }\nfunction render(ctx) ... end",
+  "palette_id": 4,
+  "light_ids": [],
+  "targets": [],
+  "spread": "across_lights",
+  "params": { "speed_hz": 2.0 },
+  "controls": { "intensity": 1.0, "fade_in_s": 0.25, "fade_out_s": 0.25 },
+  "target_channels": ["rgb"]
+}
+```
+
+`source` is the Lua script. `params` is a free-form dict whose keys
+match `id`s declared in the script's top-level `PARAMS` table; values
+are clamped against the schema at save time. `controls` are the
+engine-applied envelope (intensity multiplier + fade in/out). The
+script's `param_schema` is parsed once and cached on the row so the UI
+doesn't need to re-compile on every paint.
+
+The `target_channels` list selects which logical channel groups the
+overlay animates:
 
 | Value | Effect on the overlay |
 | --- | --- |
@@ -264,15 +301,105 @@ channel groups the overlay animates:
 | `dimmer` | Animates the master dimmer fader. |
 | `strobe` | Animates the fixture's strobe-rate channel. |
 
-Multiple values may be combined (e.g. `["rgb", "w"]`). `EffectParams`
-ranges are: `speed_hz` 0-25, `offset`/`intensity`/`softness` 0-1,
-`size` 0-16 (strobe duty is separately clamped 0.02-0.98), and
-`fade_in_s`/`fade_out_s` 0-30 seconds.
+Multiple values may be combined (e.g. `["rgb", "w"]`).
+
+#### Lint (`POST /api/effects/lint`)
+
+Compile a Lua source string in the sandbox and return its parsed
+metadata or an error with a line number. Used by the editor to drive
+syntax highlighting + auto-generate the params form. Cheap (~ms);
+called on every keystroke (debounced) and never persists anything.
+
+```json
+// EffectLintResponse
+{
+  "ok": true,
+  "name": "Theater Chase",
+  "description": "Hard-edged chase, every Nth slot lit.",
+  "param_schema": [{ "id": "speed_hz", "type": "number", "min": 0, "max": 25, "default": 2.0 }],
+  "has_render": true,
+  "has_tick": false,
+  "error": null
+}
+```
+
+#### Preview WS (`/api/effects/preview/ws`)
+
+Auth-gated WebSocket. Send the script + params + palette once; the
+server compiles it inside the sandbox and streams `PreviewFrame`s at
+30 Hz:
+
+```json
+{
+  "frame": 273,
+  "t": 9.1,
+  "strips": [
+    { "target": "rgb", "cells": [{ "active": true, "r": 255, "g": 60, "b": 0, "brightness": 1.0 }, …] },
+    { "target": "w",   "cells": [{ "active": true, "brightness": 0.42 }, …] }
+  ]
+}
+```
+
+Send `{ patch: { source?, params?, palette?, target_channels?, intensity? } }`
+to hot-update without dropping the connection. Compile or runtime errors
+arrive as `{ "error": { "message": "...", "line": 12 } }` so the editor
+can underline the failing line.
+
+#### Lua effect API
+
+Every script runs in a sandbox with these globals (and only these
+globals — `io`, `os`, `package`, `require`, `debug`, `load`, `dofile`,
+`loadfile`, and `loadstring` are intentionally absent):
+
+```lua
+-- Optional metadata + auto-generated UI knobs
+NAME = "My Effect"
+DESCRIPTION = "Free-text description shown next to the script controls."
+PARAMS = {
+  { id="speed_hz", label="Speed",  type="number", min=0, max=25, default=1.0, suffix="Hz" },
+  { id="warmth",   label="Warmth", type="number", min=0, max=1,  default=0.5 },
+  { id="mode",     label="Mode",   type="choice", options={"smooth","step"}, default="smooth" },
+}
+
+-- Per-slot pure function (default contract).
+function render(ctx)
+  local p = ctx.params
+  local r, g, b = ctx.palette:smooth(ctx.t * (p.speed_hz or 1) + ctx.i / ctx.n)
+  return { r = r, g = g, b = b, brightness = 1.0 }
+end
+
+-- Or, opt into a whole-frame entry point for stateful / cross-slot effects:
+-- function tick(ctx) ... end
+```
+
+`ctx` carries `t` (seconds since the effect started), `i` / `n` (this
+slot's 0-indexed position and the group size), `frame` (monotonic tick
+counter), `seed` (deterministic per-effect seed), `palette`,
+`params`, and `slot = { light_id, zone_id }`. `render` must return
+`{ r=, g=, b=, brightness= }` with **named** keys (positional values
+fall back gracefully but named is correct), or `{ active = false }` to
+let the base color show through this slot.
+
+Stdlib helpers loaded into every script's env (see
+[backend/app/lua/stdlib.lua](backend/app/lua/stdlib.lua) for the full
+source):
+
+| Helper | Returns |
+| --- | --- |
+| `ctx.palette:smooth(p)` / `:step(p)` / `:get(i)` | three numbers `(r, g, b)` (not a table) |
+| `ctx.palette:size()` | number of palette entries |
+| `color.hsv(h, s, v)` / `color.hex("#RRGGBB")` / `color.mix(...)` | three numbers |
+| `envelope.pulse(p)` / `.wave(p)` / `.chase(p, size, soft)` / `.strobe(p, duty)` | scalar 0..1 |
+| `direction.apply(phase, "forward"\|"reverse"\|"pingpong", cycles_done)` | wrapped phase |
+| `per_index_offset(slider, n)` | per-index step (1.0 = perfect chase) |
+| `noise.hash(...)` / `noise.simplex(x, y)` | deterministic 0..1 |
+| `easing.linear/quad_in/quad_out/quad_inout/cosine` | scalar |
+| `random(seed)` | stateful PRNG with `:next()` and `:int(lo, hi)` |
 
 ### Effect chat (`/api/effect-chat`)
 
-Multi-turn Claude chat for iteratively refining one effect per
-conversation. Mirrors the Designer's SSE contract.
+Multi-turn Claude chat for iteratively refining one Lua-scripted effect
+per conversation.
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
@@ -286,10 +413,38 @@ conversation. Mirrors the Designer's SSE contract.
 | POST | `/api/effect-chat/conversations/{cid}/apply` | `{proposal_id, light_ids[]}` | `{ok, handle, name}` |
 | POST | `/api/effect-chat/conversations/{cid}/save` | `{proposal_id, name?}` | `{ok, id, name}` |
 
-Each assistant turn emits at most one `EffectProposal` (name, effect
-type, palette id, spread, params, target channels). The `apply` endpoint
-plays it live on the supplied light ids; `save` persists it as an
-`Effect` row.
+Each assistant turn forces a single `propose_effect` tool call. Claude
+either references one of the seeded `builtin` scripts or emits raw
+`source` Lua. The router:
+
+1. Sanitizes + compiles the proposal in the sandbox.
+2. Runs `smoke_test_source(...)` (compile + dry-run across 8 slots × 5
+   timesteps) to catch runtime errors that hide behind a clean compile
+   (e.g. indexing the return of `palette:smooth` as if it were a table).
+3. On failure, builds a `tool_result` with a targeted hint and re-runs
+   the model — up to 3 attempts per chat turn.
+4. Stores the final assistant turn (with the `tool_use` block rewritten
+   to the sanitized payload) so subsequent turns replay correctly.
+   Synthesizes `tool_result` placeholders for any prior `tool_use`
+   blocks when replaying history, since Anthropic rejects multi-turn
+   flows otherwise.
+
+The message endpoint streams these SSE events:
+
+- `start` — `{conversation_id}`
+- `text` — `{delta}` incremental prose tokens
+- `tool_start` — `{tool}` Claude has begun constructing the proposal
+- `tool_delta` — `{partial_json}` raw partial JSON for the tool input
+- `retry` — `{attempt, max_attempts, reason}` smoke test failed; retrying
+- `script_error` — `{message, line, attempts}` final attempt still broken
+- `proposal` — `EffectProposal` final sanitized proposal (loaded into
+  the editor; the script is included even if smoke-testing failed so
+  the user can see what Claude tried)
+- `done` — `{conversation}` full persisted `EffectConversation`
+- `error` — `{message}` on API / parse errors
+
+`apply` plays the proposal live on the supplied light ids; `save`
+persists it as an `Effect` row.
 
 ### Scenes (`/api/scenes`)
 
@@ -423,10 +578,13 @@ one of the following payload shapes:
   "kind": "effect",
   "name": "White pulse",
   "effect": {
-    "effect_type": "pulse",
+    "source": "PARAMS = { ... }\nfunction render(ctx) ... end",
+    "description": "Slow white-LED breathing.",
+    "param_schema": [{ "id": "speed_hz", "type": "number", "min": 0, "max": 25, "default": 1.2 }],
     "palette_id": null,
     "spread": "across_lights",
-    "params": { "speed_hz": 1.2, "intensity": 1.0, "size": 1.0 },
+    "params": { "speed_hz": 1.2 },
+    "controls": { "intensity": 1.0, "fade_in_s": 0.25, "fade_out_s": 0.25 },
     "target_channels": ["w"],
     "light_ids": [],
     "targets": []
@@ -465,12 +623,22 @@ Browser --HTTPS--> Caddy --127.0.0.1:8000--> FastAPI (uvicorn)
   restoring the last-known color state for every light.
 - Sessions are signed with `itsdangerous`; the key is persisted at
   `$DMX_DATA_DIR/session.key` so restarts do not log everybody out.
-- The Designer tab streams Claude via `anthropic.Anthropic().messages.stream()`
-  from a worker thread that feeds an `asyncio.Queue`. The FastAPI
-  handler drains the queue as Server-Sent Events; the full assistant
-  message (prose + tool_use) is sanitized and persisted in a single
-  commit at the stream's `done` boundary, so a disconnect mid-stream
-  cleanly drops the turn.
+- `backend/app/lua/` is the sandboxed effect runtime: each `LuaScript`
+  wraps its own `lupa.lua54.LuaRuntime`, loads `stdlib.lua` into a
+  restricted env (no `io`/`os`/`require`/`package`/`debug`/`load`/
+  `dofile`), and gates every `render(ctx)` call with a debug-hook
+  instruction budget so a runaway loop can't peg a CPU. The seeded
+  builtins live as plain `.lua` files under `backend/app/lua/builtins/`
+  — edit them on disk, restart, and the seeder upserts the new source
+  into the matching `Effect` row on next boot.
+- The Designer and effect-chat tabs stream Claude via
+  `anthropic.Anthropic().messages.stream()` from a worker thread that
+  feeds an `asyncio.Queue`. The FastAPI handler drains the queue as
+  Server-Sent Events. The effect-chat orchestrator additionally runs
+  every proposal through `smoke_test_source` and re-streams up to 3
+  attempts per turn before persisting; the full assistant turn is
+  saved in a single commit at the stream's `done` boundary, so a
+  disconnect mid-stream cleanly drops the turn.
 
 ## Built-in palettes
 
@@ -496,17 +664,25 @@ Browser --HTTPS--> Caddy --127.0.0.1:8000--> FastAPI (uvicorn)
 
 ## Built-in effects
 
-| Name | Type | Target channels | Notes |
+Each is a seeded Lua script under
+[backend/app/lua/builtins/](backend/app/lua/builtins/). Read-only in the
+UI; clone any of them to make an editable copy.
+
+| Name | Script | Target channels | Notes |
 | --- | --- | --- | --- |
-| Rainbow Wash | rainbow | `rgb` | Slow full-hue sweep; ignores palette. |
-| Breathing Amber | pulse | `rgb` | Candlelight palette breathing. |
-| Cyberpunk Chase | chase | `rgb` | Neon chase across the rig. |
-| Aurora Fade | fade | `rgb` | Across-fixture aurora crossfade. |
-| Halloween Strobe | strobe | `rgb` | 6 Hz flash on the Halloween palette. |
-| Pastel Sparkle | sparkle | `rgb` | Random pastel flashes per zone. |
-| White LED Chase | chase | `w` | Chases the white LED without touching RGB. |
-| Strobe Pulse (Strobe Channel) | pulse | `strobe` | Pulses the fixture's strobe-rate fader. |
-| UV Accent Wave | wave | `uv` | Slow UV brightness wave. |
+| Rainbow Wash | `rainbow.lua` | `rgb` | Slow full-hue HSV sweep; ignores palette. |
+| Breathing Amber | `pulse.lua` | `rgb` | Candlelight palette breathing. |
+| Cyberpunk Chase | `chase.lua` | `rgb` | Neon chase across the rig. |
+| Aurora Fade | `fade.lua` | `rgb` | Across-fixture aurora crossfade. |
+| Halloween Strobe | `strobe.lua` | `rgb` | 6 Hz flash on the Halloween palette. |
+| Pastel Sparkle | `sparkle.lua` | `rgb` | Random pastel flashes per zone. |
+| White LED Chase | `chase.lua` | `w` | Chases the white LED without touching RGB. |
+| Strobe Pulse (Strobe Channel) | `pulse.lua` | `strobe` | Pulses the fixture's strobe-rate fader. |
+| UV Accent Wave | `wave.lua` | `uv` | Slow UV brightness wave. |
+
+The remaining canonical scripts (`cycle.lua`, `static.lua`) are also
+shipped and available via Clone → edit; the table above lists only the
+ones the seeder upserts as named presets.
 
 ## Built-in light models
 

@@ -10,7 +10,8 @@ from .config import DMX_PASSWORD, SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS, 
 _serializer = URLSafeTimedSerializer(SESSION_SECRET, salt="dmx-session")
 
 
-def _is_authenticated(request: Request) -> bool:
+def _is_authenticated(request) -> bool:
+    """Accepts a Starlette Request OR WebSocket; both expose ``.cookies``."""
     token = request.cookies.get(SESSION_COOKIE_NAME)
     if not token:
         return False
@@ -19,6 +20,11 @@ def _is_authenticated(request: Request) -> bool:
     except (BadSignature, SignatureExpired):
         return False
     return bool(data and data.get("ok"))
+
+
+def is_authenticated_request(request) -> bool:
+    """Public helper used by the websocket preview to gate connections."""
+    return _is_authenticated(request)
 
 
 def require_auth(request: Request) -> None:
