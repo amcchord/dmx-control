@@ -102,6 +102,11 @@ def _migrate() -> None:
                 conn.exec_driver_sql(
                     "ALTER TABLE light ADD COLUMN motion_state JSON"
                 )
+            # light.extra_colors (w2 / w3 / a2 / uv2 aux faders)
+            if "extra_colors" not in cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE light ADD COLUMN extra_colors JSON"
+                )
             # light.notes (designer AI context)
             if "notes" not in cols:
                 conn.exec_driver_sql(
@@ -143,6 +148,7 @@ def _migrate() -> None:
                 "ALTER TABLE light ADD COLUMN mode_id INTEGER",
                 "ALTER TABLE light ADD COLUMN zone_state JSON",
                 "ALTER TABLE light ADD COLUMN motion_state JSON",
+                "ALTER TABLE light ADD COLUMN extra_colors JSON",
                 "ALTER TABLE light ADD COLUMN notes TEXT",
                 "ALTER TABLE controller ADD COLUMN notes TEXT",
                 "ALTER TABLE lightmodelmode ADD COLUMN layout JSON",

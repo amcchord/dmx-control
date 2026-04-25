@@ -8,7 +8,18 @@ import type {
   ZoneColorState,
 } from "./api";
 
-export const COLOR_ROLES: ColorRole[] = ["r", "g", "b", "w", "a", "uv"];
+export const COLOR_ROLES: ColorRole[] = [
+  "r",
+  "g",
+  "b",
+  "w",
+  "w2",
+  "w3",
+  "a",
+  "a2",
+  "uv",
+  "uv2",
+];
 
 export const SHAPES: LayoutShape[] = [
   "single",

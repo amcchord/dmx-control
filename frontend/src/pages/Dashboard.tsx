@@ -269,17 +269,33 @@ export default function Dashboard() {
 
   const layoutOf = (lightId: number) => layoutByLightId.get(lightId) ?? null;
 
-  /** Roles marked "direct" on this light's mode *and* actually present in
-   * the channel list. For "direct" roles we expose a Dashboard slider so
-   * the user can drive W / A / UV independently of the RGB mix. */
+  /** Roles for which the Dashboard renders an independent fader.
+   *
+   *  - Primary W / A / UV are included when the mode's ``color_policy``
+   *    marks them as "direct".
+   *  - Secondary W2 / W3 / A2 / UV2 are included whenever they appear in
+   *    the channel list (they are always direct by design).
+   *  Returned in channel-list order so the sliders line up with the
+   *  physical DMX slot layout. */
   const directRolesFor = (lightId: number): PolicyRole[] => {
     const mode = modeByLightId.get(lightId);
     if (!mode) return [];
     const policy = mode.color_policy ?? {};
-    const channels = new Set(mode.channels);
+    const seen = new Set<PolicyRole>();
     const out: PolicyRole[] = [];
-    for (const role of ["w", "a", "uv"] as PolicyRole[]) {
-      if (channels.has(role) && policy[role] === "direct") out.push(role);
+    for (const role of mode.channels as PolicyRole[]) {
+      if (seen.has(role)) continue;
+      if (role === "w" || role === "a" || role === "uv") {
+        if (policy[role] === "direct") {
+          out.push(role);
+          seen.add(role);
+        }
+        continue;
+      }
+      if (role === "w2" || role === "w3" || role === "a2" || role === "uv2") {
+        out.push(role);
+        seen.add(role);
+      }
     }
     return out;
   };
@@ -1094,17 +1110,126 @@ const DIRECT_ROLE_META: Record<
     swatch: "#f5f5f5",
     help: "White LED fader (not mixed from RGB).",
   },
+  w2: {
+    label: "White 2",
+    swatch: "#f5f5f5",
+    help: "Second white LED (e.g. cool- vs. warm-white pair).",
+  },
+  w3: {
+    label: "White 3",
+    swatch: "#f5f5f5",
+    help: "Third white LED.",
+  },
   a: {
     label: "Amber",
     swatch: "#ffb23d",
     help: "Amber LED fader (not mixed from RGB).",
+  },
+  a2: {
+    label: "Amber 2",
+    swatch: "#ffb23d",
+    help: "Secondary amber LED.",
   },
   uv: {
     label: "UV",
     swatch: "#b44dff",
     help: "Ultraviolet LED fader.",
   },
+  uv2: {
+    label: "UV 2",
+    swatch: "#b44dff",
+    help: "Secondary UV LED.",
+  },
 };
+
+/** Set of aux role names whose value lives in ``Light.extra_colors``
+ * (and zone extras), rather than the flat ``light.w / .a / .uv`` fields. */
+const EXTRA_DIRECT_ROLES = new Set<PolicyRole>(["w2", "w3", "a2", "uv2"]);
+
+type AuxCell = {
+  role: PolicyRole;
+  label: string;
+  color: string;
+  value: number;
+};
+
+const AUX_CHANNEL_ORDER: PolicyRole[] = [
+  "w",
+  "w2",
+  "w3",
+  "a",
+  "a2",
+  "uv",
+  "uv2",
+];
+
+/** Derive one cell per non-RGB color role present in the fixture's mode.
+ *
+ * Role order follows ``AUX_CHANNEL_ORDER`` so the strip layout is stable
+ * regardless of how the user arranged channels in the editor. Values are
+ * pulled from the light's flat fields (for w/a/uv) or ``extra_colors``
+ * (for w2/w3/a2/uv2); missing extras report 0. */
+function computeAuxCells(
+  light: Light,
+  mode: LightModelMode | undefined,
+): AuxCell[] {
+  if (!mode) return [];
+  const present = new Set(mode.channels);
+  const extras = light.extra_colors ?? {};
+  const out: AuxCell[] = [];
+  for (const role of AUX_CHANNEL_ORDER) {
+    if (!present.has(role)) continue;
+    const meta = DIRECT_ROLE_META[role];
+    let value = 0;
+    if (role === "w") value = light.w;
+    else if (role === "a") value = light.a;
+    else if (role === "uv") value = light.uv;
+    else value = extras[role as "w2" | "w3" | "a2" | "uv2"] ?? 0;
+    out.push({
+      role,
+      label: meta.label,
+      color: meta.swatch,
+      value: Math.max(0, Math.min(255, value | 0)),
+    });
+  }
+  return out;
+}
+
+/** Thin strip of per-aux-channel cells.
+ *
+ * When rendered with ``overlay``, sits inside the RGB swatch button
+ * across the bottom edge without intercepting clicks. Otherwise renders
+ * as a standalone row under the zone grid for compound fixtures. */
+function AuxStrip({
+  cells,
+  overlay = false,
+}: {
+  cells: AuxCell[];
+  overlay?: boolean;
+}) {
+  if (cells.length === 0) return null;
+  const wrapCls = overlay
+    ? "pointer-events-none absolute inset-x-0 bottom-0 flex h-3 gap-px"
+    : "flex h-3 gap-px border-t border-line";
+  return (
+    <div className={wrapCls}>
+      {cells.map((c) => (
+        <div
+          key={c.role}
+          title={`${c.label}: ${c.value}`}
+          className="flex-1"
+          style={{
+            background: c.color,
+            // Opacity ranges from a faint floor (so the cell is always
+            // visible) up to full at 255 so a moderate fader still
+            // registers.
+            opacity: 0.08 + (c.value / 255) * 0.92,
+          }}
+        />
+      ))}
+    </div>
+  );
+}
 
 /** Extra sliders rendered inside the color picker modal for any W/A/UV
  * role that the light's mode marks as "direct". For zone pickers we
@@ -1129,7 +1254,18 @@ function DirectChannelSliders({
   directRolesFor: (lightId: number) => PolicyRole[];
   onCommit: (
     lightId: number,
-    patch: { r: number; g: number; b: number; w?: number; a?: number; uv?: number },
+    patch: {
+      r: number;
+      g: number;
+      b: number;
+      w?: number;
+      a?: number;
+      uv?: number;
+      w2?: number;
+      w3?: number;
+      a2?: number;
+      uv2?: number;
+    },
     zoneId?: string,
   ) => void | Promise<void>;
 }) {
@@ -1147,15 +1283,24 @@ function DirectChannelSliders({
   if (roles.length === 0) return null;
 
   // Resolve the current value for a role from the right source: the zone
-  // state for zone pickers, the flat fields for light pickers.
+  // state for zone pickers, the flat fields (or extra_colors) for light
+  // pickers.
   const readValue = (role: PolicyRole): number => {
+    if (EXTRA_DIRECT_ROLES.has(role)) {
+      if (zoneId) {
+        const zs = (light.zone_state ?? {})[zoneId] ?? {};
+        const v = zs[role];
+        if (typeof v === "number") return v;
+      }
+      return (light.extra_colors?.[role as "w2" | "w3" | "a2" | "uv2"] ?? 0) | 0;
+    }
     if (zoneId) {
       const zs = (light.zone_state ?? {})[zoneId] ?? {};
-      const v = zs[role];
+      const v = zs[role as "w" | "a" | "uv"];
       if (typeof v === "number") return v;
-      return light[role];
+      return light[role as "w" | "a" | "uv"];
     }
-    return light[role];
+    return light[role as "w" | "a" | "uv"];
   };
 
   // Build the RGB basis to send with the partial update. Palette / zone
@@ -1254,6 +1399,16 @@ function LightCard({
   const compound = isCompoundLayout(layout);
   const motion = hasMotion(layout);
 
+  // Compute per-card aux channels: the non-RGB color roles present in
+  // the mode's channel list, each with its current byte value. The strip
+  // below the swatch renders one cell per entry so the user sees what
+  // W / A / UV / W2 etc. are actually driving at a glance.
+  const mode =
+    model?.modes.find((x) => x.id === light.mode_id) ??
+    model?.modes.find((x) => x.is_default) ??
+    model?.modes[0];
+  const auxCells = computeAuxCells(light, mode);
+
   const ringCls = selectedAll
     ? "ring-2 ring-accent"
     : hasAnySelection
@@ -1325,7 +1480,13 @@ function LightCard({
           >
             {selectedAll ? "✓" : ""}
           </span>
+          {!off && auxCells.length > 0 && (
+            <AuxStrip cells={auxCells} overlay />
+          )}
         </button>
+      )}
+      {compound && !off && auxCells.length > 0 && (
+        <AuxStrip cells={auxCells} />
       )}
       <div className="flex items-center justify-between gap-2 p-3">
         <div className="flex min-w-0 items-center gap-2">

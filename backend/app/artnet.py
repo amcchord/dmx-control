@@ -133,6 +133,12 @@ def _compute_channel_values(
     w = _resolve_aux("w", state.get("w"), r, g, b, policy)
     a = _resolve_aux("a", state.get("a"), r, g, b, policy)
     uv = _resolve_aux("uv", state.get("uv"), r, g, b, policy)
+    # Extra aux channels are always direct faders (never derived from RGB,
+    # never touched by palette paint). Missing state entries default to 0.
+    w2 = int(state.get("w2", 0) or 0)
+    w3 = int(state.get("w3", 0) or 0)
+    a2 = int(state.get("a2", 0) or 0)
+    uv2 = int(state.get("uv2", 0) or 0)
     dimmer = int(state.get("dimmer", 255))
     on = bool(state.get("on", True))
     if not on:
@@ -170,6 +176,14 @@ def _compute_channel_values(
             values.append(int(round(a * scale)))
         elif role == "uv":
             values.append(int(round(uv * scale)))
+        elif role == "w2":
+            values.append(int(round(w2 * scale)))
+        elif role == "w3":
+            values.append(int(round(w3 * scale)))
+        elif role == "a2":
+            values.append(int(round(a2 * scale)))
+        elif role == "uv2":
+            values.append(int(round(uv2 * scale)))
         elif role == "dimmer":
             values.append(max(0, min(255, dimmer)))
         elif role == "strobe":
@@ -197,17 +211,28 @@ def _compute_channel_values(
 
 def _derive_zone_defaults(
     zs: dict, global_dimmer: int, policy: dict | None = None
-) -> tuple[int, int, int, int, int, int, int, bool]:
-    """Return (r, g, b, w, a, uv, dimmer, on) with fallback derivation."""
+) -> tuple[int, int, int, int, int, int, dict, int, bool]:
+    """Return (r, g, b, w, a, uv, extras, dimmer, on) with fallback derivation.
+
+    ``extras`` is a dict of the optional aux roles (``w2``, ``w3``,
+    ``a2``, ``uv2``) pulled from the zone state. Keys present in the
+    zone dict are copied verbatim (as ints); missing keys are absent
+    from the returned dict so callers can cheaply test membership."""
     r = int(zs.get("r", 0))
     g = int(zs.get("g", 0))
     b = int(zs.get("b", 0))
     w = _resolve_aux("w", zs.get("w"), r, g, b, policy)
     a = _resolve_aux("a", zs.get("a"), r, g, b, policy)
     uv = _resolve_aux("uv", zs.get("uv"), r, g, b, policy)
+    extras: dict[str, int] = {}
+    for role in ("w2", "w3", "a2", "uv2"):
+        raw = zs.get(role)
+        if raw is None:
+            continue
+        extras[role] = max(0, min(255, int(raw)))
     dim = int(zs.get("dimmer", global_dimmer))
     on = bool(zs.get("on", True))
-    return r, g, b, w, a, uv, dim, on
+    return r, g, b, w, a, uv, extras, dim, on
 
 
 def _compute_layout_values(
@@ -227,6 +252,7 @@ def _compute_layout_values(
     motion_state = state.get("motion_state") or {}
 
     # Fallback "flat" state for zones that don't have explicit state yet.
+    flat_extras = state.get("extra_colors") or {}
     fallback = {
         "r": state.get("r", 0),
         "g": state.get("g", 0),
@@ -234,6 +260,10 @@ def _compute_layout_values(
         "w": state.get("w"),
         "a": state.get("a"),
         "uv": state.get("uv"),
+        "w2": flat_extras.get("w2"),
+        "w3": flat_extras.get("w3"),
+        "a2": flat_extras.get("a2"),
+        "uv2": flat_extras.get("uv2"),
         "dimmer": global_dimmer,
         "on": True,
     }
@@ -252,7 +282,7 @@ def _compute_layout_values(
         if not isinstance(zs, dict):
             zs = fallback
 
-        zr, zg, zb, zw, za, zuv, zdim, zon = _derive_zone_defaults(
+        zr, zg, zb, zw, za, zuv, zextras, zdim, zon = _derive_zone_defaults(
             zs, global_dimmer, policy
         )
         if not zon:
@@ -265,6 +295,11 @@ def _compute_layout_values(
         role_vals = {
             "r": zr, "g": zg, "b": zb,
             "w": zw, "a": za, "uv": zuv,
+            # Aux extras default to 0 when not set on the zone.
+            "w2": zextras.get("w2", 0),
+            "w3": zextras.get("w3", 0),
+            "a2": zextras.get("a2", 0),
+            "uv2": zextras.get("uv2", 0),
         }
         for role, off in colors.items():
             if not _in_range(off):
@@ -530,6 +565,7 @@ class ArtNetManager:
                 buf.bindings[light.id] = binding
                 self._light_to_controller[light.id] = ctrl.id
 
+                extras = getattr(light, "extra_colors", {}) or {}
                 values = _render_binding(
                     binding,
                     {
@@ -539,6 +575,11 @@ class ArtNetManager:
                         "w": light.w,
                         "a": light.a,
                         "uv": light.uv,
+                        "w2": extras.get("w2"),
+                        "w3": extras.get("w3"),
+                        "a2": extras.get("a2"),
+                        "uv2": extras.get("uv2"),
+                        "extra_colors": extras,
                         "dimmer": light.dimmer,
                         "on": light.on,
                         "zone_state": getattr(light, "zone_state", {}) or {},

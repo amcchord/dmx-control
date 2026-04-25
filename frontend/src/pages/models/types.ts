@@ -13,8 +13,12 @@ export const ROLES = [
   "g",
   "b",
   "w",
+  "w2",
+  "w3",
   "a",
+  "a2",
   "uv",
+  "uv2",
   "dimmer",
   "strobe",
   "macro",
@@ -33,8 +37,12 @@ export const ROLE_COLORS: Record<string, string> = {
   g: "#4dff6a",
   b: "#4d6aff",
   w: "#f5f5f5",
+  w2: "#f5f5f5",
+  w3: "#f5f5f5",
   a: "#ffb23d",
+  a2: "#ffb23d",
   uv: "#b44dff",
+  uv2: "#b44dff",
   dimmer: "#cfcfcf",
   strobe: "#fff566",
   macro: "#8791a7",
@@ -48,19 +56,42 @@ export const ROLE_COLORS: Record<string, string> = {
   other: "#8791a7",
 };
 
-export const POLICY_ROLES: PolicyRole[] = ["w", "a", "uv"];
+/** Roles whose mix/direct policy the editor exposes as a toggle. Primary
+ * W/A/UV get the full Mix or Direct choice; secondary instances (w2/w3,
+ * a2, uv2) are always direct — listed here only so their presence in the
+ * mode's channel list surfaces in the Color Behavior section. */
+export const POLICY_ROLES: PolicyRole[] = [
+  "w",
+  "w2",
+  "w3",
+  "a",
+  "a2",
+  "uv",
+  "uv2",
+];
+
+/** Extra (always-direct) aux roles. */
+export const EXTRA_POLICY_ROLES: PolicyRole[] = ["w2", "w3", "a2", "uv2"];
 
 /** Human label + hint shown under each W/A/UV toggle. */
 export const POLICY_ROLE_LABEL: Record<PolicyRole, string> = {
   w: "White (W)",
+  w2: "White 2 (W2)",
+  w3: "White 3 (W3)",
   a: "Amber (A)",
+  a2: "Amber 2 (A2)",
   uv: "Ultraviolet (UV)",
+  uv2: "Ultraviolet 2 (UV2)",
 };
 
 export const POLICY_ROLE_HELP: Record<PolicyRole, string> = {
   w: "Many fixtures fire their white LED as a near-strobe accent rather than as part of the color mix. Switch to Direct to expose it as its own fader.",
+  w2: "Second white LED on the fixture (often warm-vs-cool pair). Always an independent fader on the Dashboard.",
+  w3: "Third white channel. Always an independent fader on the Dashboard.",
   a: "Amber can be mixed from R+G to warm up whites, or left as a direct channel for dedicated amber pops.",
+  a2: "Secondary amber channel. Always an independent fader on the Dashboard.",
   uv: "UV rarely benefits from RGB mixing; Direct keeps it under manual / designer control.",
+  uv2: "Secondary UV channel. Always an independent fader on the Dashboard.",
 };
 
 export type ModeDraft = {

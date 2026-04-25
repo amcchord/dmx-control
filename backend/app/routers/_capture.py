@@ -26,6 +26,7 @@ def light_to_state(light: Light) -> SceneLightState:
         uv=int(light.uv or 0),
         dimmer=int(light.dimmer if light.dimmer is not None else 255),
         on=bool(light.on),
+        extra_colors=dict(light.extra_colors or {}),
         zone_state=dict(light.zone_state or {}),
         motion_state=dict(light.motion_state or {}),
     )
@@ -56,6 +57,7 @@ def state_from_rendered(light: Light, rendered: dict) -> SceneLightState:
         uv=int(light.uv or 0),
         dimmer=int(light.dimmer if light.dimmer is not None else 255),
         on=bool(info.get("on", light.on)),
+        extra_colors=dict(light.extra_colors or {}),
         zone_state=zs_out or dict(light.zone_state or {}),
         motion_state=dict(light.motion_state or {}),
     )
@@ -106,11 +108,15 @@ def apply_state_to_light(light: Light, state: dict) -> None:
     light.uv = int(state.get("uv", 0))
     light.dimmer = int(state.get("dimmer", 255))
     light.on = bool(state.get("on", True))
+    # Aux extras: restore any values captured in the snapshot. Missing
+    # dict means the snapshot predates the extras feature — treat as {}.
+    light.extra_colors = dict(state.get("extra_colors") or {})
     light.zone_state = dict(state.get("zone_state") or {})
     light.motion_state = dict(state.get("motion_state") or {})
 
 
 def push_light(light: Light) -> None:
+    extras = dict(light.extra_colors or {})
     manager.set_light_state(
         light.id,
         {
@@ -120,6 +126,11 @@ def push_light(light: Light) -> None:
             "w": light.w,
             "a": light.a,
             "uv": light.uv,
+            "w2": extras.get("w2"),
+            "w3": extras.get("w3"),
+            "a2": extras.get("a2"),
+            "uv2": extras.get("uv2"),
+            "extra_colors": extras,
             "dimmer": light.dimmer,
             "on": light.on,
             "zone_state": dict(light.zone_state or {}),

@@ -154,7 +154,17 @@ export type Controller = {
   notes?: string | null;
 };
 
-export type ColorRole = "r" | "g" | "b" | "w" | "a" | "uv";
+export type ColorRole =
+  | "r"
+  | "g"
+  | "b"
+  | "w"
+  | "w2"
+  | "w3"
+  | "a"
+  | "a2"
+  | "uv"
+  | "uv2";
 
 export type ZoneKind =
   | "pixel"
@@ -215,10 +225,17 @@ export type FixtureLayout = {
 /** W/A/UV channel policy — "mix" (derive from RGB when unspecified) or
  * "direct" (independent fader; never auto-derived and not overwritten by
  * palette paint / effect RGB blending). Roles not present in the mode's
- * channel list are silently dropped server-side. */
-export type PolicyRole = "w" | "a" | "uv";
+ * channel list are silently dropped server-side. Extras (w2/w3/a2/uv2)
+ * are always rendered as direct faders regardless of the stored policy;
+ * they appear here so the editor UI can reason about them uniformly. */
+export type PolicyRole = "w" | "a" | "uv" | "w2" | "w3" | "a2" | "uv2";
 export type ChannelPolicy = "mix" | "direct";
 export type ColorPolicy = Partial<Record<PolicyRole, ChannelPolicy>>;
+
+/** Aux roles beyond the primary W / A / UV. These live in
+ * ``Light.extra_colors`` and are always treated as direct faders. */
+export type ExtraColorRole = "w2" | "w3" | "a2" | "uv2";
+export const EXTRA_COLOR_ROLES: ExtraColorRole[] = ["w2", "w3", "a2", "uv2"];
 
 export type LightModelMode = {
   id: number;
@@ -256,6 +273,10 @@ export type ZoneColorState = {
   w?: number;
   a?: number;
   uv?: number;
+  w2?: number;
+  w3?: number;
+  a2?: number;
+  uv2?: number;
   dimmer?: number;
   on?: boolean;
 };
@@ -283,6 +304,10 @@ export type Light = {
   uv: number;
   dimmer: number;
   on: boolean;
+  /** Extra aux color channels (w2/w3/a2/uv2 -> byte value). Missing keys
+   *  imply 0. Independent faders — not driven by RGB, not touched by
+   *  palettes or effects. */
+  extra_colors?: Partial<Record<ExtraColorRole, number>>;
   zone_state: Record<string, ZoneColorState>;
   motion_state: MotionState;
   notes?: string | null;
@@ -381,6 +406,10 @@ export type ColorRequestBody = {
   w?: number | null;
   a?: number | null;
   uv?: number | null;
+  w2?: number | null;
+  w3?: number | null;
+  a2?: number | null;
+  uv2?: number | null;
   dimmer?: number | null;
   on?: boolean | null;
   zone_id?: string | null;
@@ -493,6 +522,7 @@ export type SceneLightState = {
   uv: number;
   dimmer: number;
   on: boolean;
+  extra_colors?: Partial<Record<ExtraColorRole, number>>;
   zone_state: Record<string, ZoneColorState>;
   motion_state: MotionState;
 };
@@ -810,6 +840,10 @@ export type DesignerProposalLight = {
   w?: number | null;
   a?: number | null;
   uv?: number | null;
+  w2?: number | null;
+  w3?: number | null;
+  a2?: number | null;
+  uv2?: number | null;
   zone_state?: Record<string, ZoneColorState>;
   motion_state?: MotionState;
 };

@@ -396,6 +396,7 @@ class EffectEngine:
         self._palettes_by_id = {p.id: p for p in palettes if p.id is not None}
 
     def _base_state_for(self, light: Light) -> dict:
+        extras = dict(getattr(light, "extra_colors", {}) or {})
         return {
             "r": light.r,
             "g": light.g,
@@ -403,6 +404,11 @@ class EffectEngine:
             "w": light.w,
             "a": light.a,
             "uv": light.uv,
+            "w2": extras.get("w2"),
+            "w3": extras.get("w3"),
+            "a2": extras.get("a2"),
+            "uv2": extras.get("uv2"),
+            "extra_colors": extras,
             "dimmer": light.dimmer,
             "on": light.on,
             "zone_state": dict(light.zone_state or {}),

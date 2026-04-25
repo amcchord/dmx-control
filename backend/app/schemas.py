@@ -13,8 +13,12 @@ CHANNEL_ROLES = {
     "g",
     "b",
     "w",
+    "w2",  # secondary white LED (e.g. warm + cool)
+    "w3",
     "a",  # amber
+    "a2",
     "uv",
+    "uv2",
     "dimmer",
     "strobe",
     "macro",
@@ -36,8 +40,13 @@ CHANNEL_ROLES = {
 # explicitly (defaults to 0 otherwise). Palette paint and effect RGB
 # blending also skip "direct" roles so the user's explicit value is
 # preserved.
-POLICY_ROLES = {"w", "a", "uv"}
+POLICY_ROLES = {"w", "w2", "w3", "a", "a2", "uv", "uv2"}
 CHANNEL_POLICIES = {"mix", "direct"}
+# Extra (non-primary) aux roles — these are always treated as "direct"
+# faders by the renderer: there is no meaningful "mix from RGB" for a
+# second white LED, so the editor surfaces them as direct-only and the
+# policy dict stores an explicit "direct" entry for them.
+EXTRA_COLOR_ROLES = {"w2", "w3", "a2", "uv2"}
 
 
 def _normalize_color_policy(
@@ -309,6 +318,9 @@ class LightOut(BaseModel):
     uv: int
     dimmer: int
     on: bool
+    # Extra aux color channels (w2/w3/a2/uv2 -> byte value). Empty dict
+    # when the fixture has no extras.
+    extra_colors: dict = Field(default_factory=dict)
     # Per-zone colors for compound fixtures (empty dict for simple pars).
     zone_state: dict = Field(default_factory=dict)
     # Motion axes as floats in [0, 1]; empty when the fixture has no motion.
@@ -343,6 +355,13 @@ class ColorRequest(BaseModel):
     w: Optional[int] = None
     a: Optional[int] = None
     uv: Optional[int] = None
+    # Extra aux channels for fixtures with multiple whites / ambers / UVs.
+    # Each is an independent byte fader; the renderer never derives them
+    # from RGB and palette / effect pipelines leave them alone.
+    w2: Optional[int] = None
+    w3: Optional[int] = None
+    a2: Optional[int] = None
+    uv2: Optional[int] = None
     dimmer: Optional[int] = None
     on: Optional[bool] = None
     # When present, only the named zone is updated. When omitted, the request
@@ -354,6 +373,15 @@ class ColorRequest(BaseModel):
     @field_validator("r", "g", "b")
     @classmethod
     def _byte(cls, v: int) -> int:
+        if not (0 <= v <= 255):
+            raise ValueError("must be 0..255")
+        return v
+
+    @field_validator("w2", "w3", "a2", "uv2")
+    @classmethod
+    def _aux_byte(cls, v: Optional[int]) -> Optional[int]:
+        if v is None:
+            return None
         if not (0 <= v <= 255):
             raise ValueError("must be 0..255")
         return v
@@ -725,6 +753,7 @@ class SceneLightState(BaseModel):
     uv: int = 0
     dimmer: int = 255
     on: bool = True
+    extra_colors: dict = Field(default_factory=dict)
     zone_state: dict = Field(default_factory=dict)
     motion_state: dict = Field(default_factory=dict)
 
@@ -905,6 +934,10 @@ class DesignerProposalLight(BaseModel):
     w: Optional[int] = None
     a: Optional[int] = None
     uv: Optional[int] = None
+    w2: Optional[int] = None
+    w3: Optional[int] = None
+    a2: Optional[int] = None
+    uv2: Optional[int] = None
     zone_state: dict = Field(default_factory=dict)
     motion_state: dict = Field(default_factory=dict)
 

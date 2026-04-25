@@ -1,5 +1,6 @@
 import type { ChannelPolicy, ColorPolicy, PolicyRole } from "../../api";
 import {
+  EXTRA_POLICY_ROLES,
   POLICY_ROLES,
   POLICY_ROLE_HELP,
   POLICY_ROLE_LABEL,
@@ -7,6 +8,8 @@ import {
   policyFor,
   type ModeDraft,
 } from "./types";
+
+const EXTRA_SET = new Set<PolicyRole>(EXTRA_POLICY_ROLES);
 
 /** Per-mode "color behavior" editor.
  *
@@ -40,19 +43,22 @@ export default function ColorPolicySection({
         <div>
           <div className="text-sm font-semibold">Color behavior</div>
           <div className="text-xs text-muted">
-            How auxiliary channels (W / A / UV) relate to the RGB color mix.
+            How auxiliary channels (W / A / UV and any secondary W2 / W3 / A2
+            / UV2) relate to the RGB color mix.
           </div>
         </div>
       </div>
       {presentRoles.length === 0 ? (
         <div className="rounded-md bg-bg-card px-3 py-2 text-xs text-muted ring-1 ring-line">
-          This mode has no W, A, or UV channels — nothing to configure. Add one
-          of those roles to the channel list above to unlock these options.
+          This mode has no auxiliary color channels — nothing to configure.
+          Add a W / A / UV role (or a secondary W2 / W3 / A2 / UV2) to the
+          channel list above to unlock these options.
         </div>
       ) : (
         <div className="space-y-2">
           {presentRoles.map((role) => {
             const current = policyFor(draft, role);
+            const isExtra = EXTRA_SET.has(role);
             return (
               <div
                 key={role}
@@ -66,20 +72,29 @@ export default function ColorPolicySection({
                   <span className="text-sm font-medium">
                     {POLICY_ROLE_LABEL[role]}
                   </span>
-                  <span className="ml-auto inline-flex rounded-full bg-bg-elev p-0.5 text-xs ring-1 ring-line">
-                    <PolicyPill
-                      active={current === "mix"}
-                      onClick={() => setRole(role, "mix")}
+                  {isExtra ? (
+                    <span
+                      className="ml-auto rounded-full bg-accent/20 px-2.5 py-0.5 text-xs text-accent ring-1 ring-accent/40"
+                      title="Secondary aux channels are always driven directly — no mixing from RGB."
                     >
-                      Mix from RGB
-                    </PolicyPill>
-                    <PolicyPill
-                      active={current === "direct"}
-                      onClick={() => setRole(role, "direct")}
-                    >
-                      Direct channel
-                    </PolicyPill>
-                  </span>
+                      Direct (always)
+                    </span>
+                  ) : (
+                    <span className="ml-auto inline-flex rounded-full bg-bg-elev p-0.5 text-xs ring-1 ring-line">
+                      <PolicyPill
+                        active={current === "mix"}
+                        onClick={() => setRole(role, "mix")}
+                      >
+                        Mix from RGB
+                      </PolicyPill>
+                      <PolicyPill
+                        active={current === "direct"}
+                        onClick={() => setRole(role, "direct")}
+                      >
+                        Direct channel
+                      </PolicyPill>
+                    </span>
+                  )}
                 </div>
                 <div className="mt-1 text-[11px] text-muted">
                   {POLICY_ROLE_HELP[role]}

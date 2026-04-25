@@ -223,6 +223,65 @@ def test_normalize_empty_input_is_empty():
 
 
 # ---------------------------------------------------------------------------
+# Multi-white / extra aux roles (w2, w3, a2, uv2)
+# ---------------------------------------------------------------------------
+
+
+def test_multi_white_emits_independent_values():
+    """A mode with ``w`` (mix) and ``w2`` (always direct) must emit them
+    separately: W derived from min(R,G,B), W2 exactly as supplied."""
+    channels = ["r", "g", "b", "w", "w2", "a2"]
+    state = {
+        "r": 200,
+        "g": 150,
+        "b": 100,
+        "on": True,
+        "dimmer": 255,
+        "w2": 50,
+        "a2": 25,
+    }
+    values = _compute_channel_values(channels, state)
+    assert values[0] == 200
+    assert values[1] == 150
+    assert values[2] == 100
+    assert values[3] == 100, "W uses default mix-from-RGB (min of R,G,B)"
+    assert values[4] == 50, "W2 passes through the explicit state value"
+    assert values[5] == 25, "A2 passes through the explicit state value"
+
+
+def test_extras_default_to_zero_when_omitted():
+    """Extras must never be derived from RGB; missing state -> 0."""
+    channels = ["r", "g", "b", "w2", "a2", "uv2"]
+    state = {"r": 200, "g": 150, "b": 100, "on": True, "dimmer": 255}
+    values = _compute_channel_values(channels, state)
+    assert values[:3] == [200, 150, 100]
+    assert values[3] == 0
+    assert values[4] == 0
+    assert values[5] == 0
+
+
+def test_extras_respect_dimmer_when_no_dedicated_dimmer_channel():
+    """When the fixture has no ``dimmer`` channel the brightness slider
+    bakes into every output byte — including the aux extras."""
+    channels = ["r", "g", "b", "w2"]
+    state = {"r": 100, "g": 100, "b": 100, "w2": 200, "on": True, "dimmer": 128}
+    values = _compute_channel_values(channels, state)
+    scale = 128 / 255.0
+    assert values[3] == round(200 * scale)
+
+
+def test_channel_roles_include_extras():
+    """Sanity: the role enum exposes the new aux roles so the API and
+    frontend can rely on them."""
+    from app.schemas import CHANNEL_ROLES, EXTRA_COLOR_ROLES, POLICY_ROLES
+
+    for role in ("w2", "w3", "a2", "uv2"):
+        assert role in CHANNEL_ROLES
+        assert role in POLICY_ROLES
+        assert role in EXTRA_COLOR_ROLES
+
+
+# ---------------------------------------------------------------------------
 # seed built-ins
 # ---------------------------------------------------------------------------
 

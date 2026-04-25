@@ -84,6 +84,11 @@ class Light(SQLModel, table=True):
     dimmer: int = 255
     on: bool = True
 
+    # Extra aux color channels for fixtures with multiple whites / ambers /
+    # UVs. Keyed by role ("w2", "w3", "a2", "uv2"); missing keys behave as
+    # 0. Kept as JSON so we can extend without a schema change.
+    extra_colors: dict = Field(default_factory=dict, sa_column=Column(JSON))
+
     # Per-zone color state for compound fixtures.
     # { zone_id: {r,g,b,w,a,uv,dimmer,on} }. Empty/missing => all zones
     # inherit the flat r/g/b/w/a/uv/dimmer/on fallback.

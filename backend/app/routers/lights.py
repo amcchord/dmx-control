@@ -34,10 +34,14 @@ def _to_out(l: Light) -> LightOut:
         uv=l.uv,
         dimmer=l.dimmer,
         on=l.on,
+        extra_colors=dict(l.extra_colors or {}),
         zone_state=dict(l.zone_state or {}),
         motion_state=dict(l.motion_state or {}),
         notes=l.notes,
     )
+
+
+_AUX_ROLES = ("w2", "w3", "a2", "uv2")
 
 
 def _apply_zone_color(zs: dict, req: ColorRequest) -> dict:
@@ -51,6 +55,10 @@ def _apply_zone_color(zs: dict, req: ColorRequest) -> dict:
         zs["a"] = req.a
     if req.uv is not None:
         zs["uv"] = req.uv
+    for role in _AUX_ROLES:
+        val = getattr(req, role)
+        if val is not None:
+            zs[role] = val
     if req.dimmer is not None:
         zs["dimmer"] = req.dimmer
     if req.on is not None:
@@ -99,6 +107,15 @@ def _apply_color(light: Light, req: ColorRequest) -> None:
         light.a = req.a
     if req.uv is not None:
         light.uv = req.uv
+    # Extras: copy any explicitly-set aux channel into the stored dict.
+    # Values not in the request are left alone so sliding W doesn't reset
+    # the user's W2 / W3 / A2 / UV2.
+    extras = dict(light.extra_colors or {})
+    for role in _AUX_ROLES:
+        val = getattr(req, role)
+        if val is not None:
+            extras[role] = int(val)
+    light.extra_colors = extras
     if req.dimmer is not None:
         light.dimmer = req.dimmer
     if req.on is not None:
@@ -109,6 +126,7 @@ def _apply_color(light: Light, req: ColorRequest) -> None:
 
 
 def _push(light: Light) -> None:
+    extras = dict(light.extra_colors or {})
     manager.set_light_state(
         light.id,
         {
@@ -118,6 +136,11 @@ def _push(light: Light) -> None:
             "w": light.w,
             "a": light.a,
             "uv": light.uv,
+            "w2": extras.get("w2"),
+            "w3": extras.get("w3"),
+            "a2": extras.get("a2"),
+            "uv2": extras.get("uv2"),
+            "extra_colors": extras,
             "dimmer": light.dimmer,
             "on": light.on,
             "zone_state": dict(light.zone_state or {}),
@@ -303,6 +326,7 @@ def bulk_color(req: BulkColorRequest, sess: Session = Depends(get_session)) -> d
         whole = ColorRequest(
             r=req.r, g=req.g, b=req.b,
             w=req.w, a=req.a, uv=req.uv,
+            w2=req.w2, w3=req.w3, a2=req.a2, uv2=req.uv2,
             dimmer=req.dimmer, on=req.on,
             motion=req.motion,
         )
@@ -317,6 +341,7 @@ def bulk_color(req: BulkColorRequest, sess: Session = Depends(get_session)) -> d
         zoned = ColorRequest(
             r=req.r, g=req.g, b=req.b,
             w=req.w, a=req.a, uv=req.uv,
+            w2=req.w2, w3=req.w3, a2=req.a2, uv2=req.uv2,
             dimmer=req.dimmer, on=req.on,
             zone_id=t.zone_id,
             motion=req.motion,
