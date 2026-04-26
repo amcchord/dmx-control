@@ -98,6 +98,49 @@ a Caddy + systemd deployment that fronts everything at
   Claude knows the purpose and layout of each fixture when composing
   looks. Notes edit inline on the Controllers modal and the per-light
   edit form.
+- **Photoshop-style layered effects engine.** Multiple effects can run
+  on the rig at the same time as an explicit, z-ordered stack of
+  layers. Each layer carries a `blend_mode` (`normal`, `add`,
+  `multiply`, `screen`, `max`, `min`, `replace`), an `opacity` slider,
+  an optional fixture mask, mute / solo toggles, and per-layer
+  telemetry (last error, error count, last tick ms). The compositor
+  walks layers bottom-up and blends per channel under the same
+  `target_channels` and `color_policy` rules used for static color, so
+  W/A/UV "direct" channels still survive an add/multiply layer above
+  them. When a layer's Lua throws repeatedly, the engine
+  **auto-mutes** it instead of taking the show down with it. Live
+  layer state streams over the `/api/layers/ws` WebSocket so the UI
+  can react instantly without polling.
+- **Responsive SPA with two distinct shells.** Mobile gets a focused
+  operator console — `Now Playing` (live rig hero, master fader, the
+  layer stack with mute/solo/opacity per row, recent scenes/states
+  chips), `Lights` (fixtures grouped per controller; tap to multi-
+  select; bottom action sheet for color, palette, blackout), `Quick
+  FX` (curated grid of presets — short-tap launches a layer, long
+  press configures blend + opacity), `Scenes`, and a `Me` tab with
+  engine telemetry. Desktop adds a persistent side nav (`Operate /
+  Author / Configure`) and a permanent right-hand `Live` rail showing
+  the running layers + master, with the **Effects Composer** as the
+  hero — library / live preview / per-layer inspector / running stack
+  — and a matching **Scene Composer** that captures the current rig
+  state plus the running layer stack into a single applyable scene.
+- **Designer that auto-repairs custom Lua effects.** Claude can call
+  multiple proposal tools in one turn (`propose_rig_design` +
+  `propose_effect`, `propose_palette` + `propose_effect`, etc.), and
+  any custom Lua source the model writes runs through a server-side
+  smoke test before the user sees Apply. When the smoke test fails
+  (or the script doesn't even compile — common when an LLM emits a
+  module-style `local function render` + `return { ... }` block), a
+  focused **Lua refiner sub-agent** kicks off a brief Anthropic call
+  with the broken source plus a targeted diagnostic ("ctx.t not
+  ctx.time_s", "r/g/b are 0..255 ints not 0..1 floats", etc.) and
+  loops up to 3 attempts. Healthy scripts skip the refiner entirely
+  — only failing ones pay the latency cost.
+- **Atomic scene apply with saved layers.** Scenes can carry an
+  ordered layer stack alongside their base snapshot. Applying a
+  scene clears every running layer that touches affected lights,
+  pushes the base state, then starts each saved layer in order — a
+  whole-show recall in one click.
 - Single shared password ("secretsauce" by default) via a signed session
   cookie.
 - Everything persists to SQLite and is restored to the physical rig on
@@ -396,6 +439,105 @@ source):
 | `easing.linear/quad_in/quad_out/quad_inout/cosine` | scalar |
 | `random(seed)` | stateful PRNG with `:next()` and `:int(lo, hi)` |
 
+### Layers (`/api/layers`)
+
+The Photoshop-style compositor. Each entry is one running effect on
+the rig. The engine walks layers in deterministic `(z_index,
+layer_id, handle)` order every tick, blends each layer's overlay
+into the running state per channel, and emits the result to Art-Net.
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| GET | `/api/layers` | — | `EffectLayer[]` |
+| POST | `/api/layers` | `LayerCreate` | `EffectLayer` |
+| PATCH | `/api/layers/{id}` | `LayerPatch` | `EffectLayer` |
+| POST | `/api/layers/reorder` | `{order: [{layer_id, z_index}, ...]}` | `EffectLayer[]` |
+| DELETE | `/api/layers/{id}` | — | 204 |
+| POST | `/api/layers/clear` | — | `{ok, stopped}` |
+| WS | `/api/layers/ws` | — | streams `{type: "layers", layers, health}` |
+
+```json
+// LayerCreate
+{
+  "effect_id": 7,
+  "name": null,                        // optional display override
+  "z_index": null,                     // null = top of stack
+  "blend_mode": "normal",              // normal|add|multiply|screen|max|min|replace
+  "opacity": 1.0,                      // 0..1
+  "intensity": 1.0,                    // 0..1
+  "fade_in_s": 0.25,
+  "fade_out_s": 0.25,
+  "mute": false,
+  "solo": false,
+  "mask_light_ids": [12, 13, 14],      // optional fixture restriction
+  "target_channels": null,             // inherit from effect when null
+  "spread": null,                      // inherit from effect when null
+  "light_ids": null,
+  "targets": null,
+  "palette_id": null,
+  "params_override": { "speed_hz": 1.5 }
+}
+
+// LayerPatch (every field optional)
+{ "opacity": 0.6, "blend_mode": "add", "mute": true }
+
+// EffectLayer (response shape; matches the WS push)
+{
+  "handle": "9b8a...c7",
+  "layer_id": 12,
+  "effect_id": 7,
+  "name": "Warm Pulse",
+  "runtime_s": 14.6,
+  "z_index": 200,
+  "blend_mode": "add",
+  "opacity": 0.6,
+  "intensity": 1.0,
+  "target_channels": ["rgb"],
+  "mute": false,
+  "solo": false,
+  "auto_muted": false,                  // engine flipped this on after N Lua errors
+  "stopping": false,
+  "error": null,
+  "error_count": 0,
+  "last_tick_ms": 0.42,
+  "mask_light_ids": []
+}
+```
+
+`POST /api/effects/{eid}/play` is a backwards-compatible shim that
+stops any existing layer for that effect and creates a fresh layer on
+top — old clients keep working unchanged. Pass an explicit `z_index`
+to `POST /api/layers` to insert mid-stack rather than at the top.
+
+`POST /api/layers/clear` is the **panic stop**: every running layer is
+hard-stopped (no fade) and every persisted layer row deleted. Wired
+to the panic button in both the mobile and desktop chrome.
+
+The WS frame includes a `health` sub-object identical to
+`GET /api/health` (engine tick rate, dropped frames, last tick ms,
+active layer count) so the desktop Live rail can show telemetry
+without a separate poll.
+
+### Health (`/api/health`)
+
+`GET /api/health` returns the engine's live telemetry alongside the
+`{ok: true}` heartbeat:
+
+```json
+{
+  "ok": true,
+  "tick_count": 9213,
+  "dropped_frames": 0,
+  "last_tick_ms": 0.66,
+  "active_layers": 2,
+  "tick_hz": 30.0
+}
+```
+
+The Designer / Effects Composer / Me tab all read from this; the WS
+layer store also embeds a copy in every push so most surfaces never
+need to poll.
+
 ### Effect chat (`/api/effect-chat`)
 
 Multi-turn Claude chat for iteratively refining one Lua-scripted effect
@@ -527,6 +669,26 @@ tokens as they arrive.
 | POST | `/api/designer/conversations/{cid}/apply` | `{proposal_id}` | `{ok, applied}` |
 | POST | `/api/designer/conversations/{cid}/save` | `{proposal_id, name?}` | `{ok, kind, id, name}` |
 
+Claude can call **multiple tools in a single turn** — the persist
+phase walks every `tool_use` block, sanitizes each independently,
+and unions the cleaned proposals into `last_proposal` so prompts
+like "design a cyberpunk theme with a flicker" produce both a rig
+state and an effect on the same turn, each surfaced as its own card
+with independent Apply / Save buttons.
+
+Custom Lua effects ride a **refiner sub-agent** between sanitize
+and persist: every effect proposal's `source` runs through
+`smoke_test_source` (compile + dry-run across multiple slots and
+timesteps; rejects "always-zero" output that LLMs commonly produce
+when they get the ctx field names wrong). On failure, the refiner
+opens a brief Anthropic call dedicated to that one script, feeds
+the diagnostic back as a `tool_result`, and loops up to 3 attempts
+before giving up. Healthy scripts skip Claude entirely. Proposals
+that can't be rescued are dropped and a `refine_dropped` SSE event
+fires so the UI knows to suppress the card. Setting up the refiner
+requires no extra config — same `ANTHROPIC_API_KEY` the designer
+itself uses.
+
 The message endpoint streams these SSE events:
 
 - `start` — `{conversation_id}`
@@ -534,6 +696,8 @@ The message endpoint streams these SSE events:
 - `tool_start` — `{tool}` Claude has begun constructing the proposal
 - `tool_delta` — `{partial_json}` raw partial JSON for the tool input
 - `proposal` — `DesignerProposal[]` final sanitized proposals
+- `refine_dropped` — `{proposal_id, name}` an effect proposal failed
+  smoke-testing + refinement and was excluded
 - `done` — `{conversation}` full persisted `DesignerConversation`
 - `error` — `{message}` on API / parse errors
 
@@ -639,6 +803,28 @@ Browser --HTTPS--> Caddy --127.0.0.1:8000--> FastAPI (uvicorn)
   attempts per turn before persisting; the full assistant turn is
   saved in a single commit at the stream's `done` boundary, so a
   disconnect mid-stream cleanly drops the turn.
+- `backend/app/lua_refiner.py` is the small "fix-this-one-script"
+  sub-agent invoked from the designer's persist phase. It only fires
+  when a custom Lua source fails the smoke test, makes a single
+  `propose_effect` Anthropic call seeded with the broken source plus
+  a targeted diagnostic, and loops up to 3 attempts. Healthy scripts
+  skip the refiner entirely.
+- `backend/app/engine.py` owns the layered compositor. Each
+  `EffectLayer` row spawns one `EffectSpec` in `_active`; the tick
+  loop sorts by `(z_index, layer_id, handle)`, walks bottom-up,
+  computes each layer's per-light overlay, and composites it via
+  `merge_overlay_into_state` using the layer's `blend_mode` and
+  `opacity`. WebSocket subscribers on `/api/layers/ws` get pushed a
+  fresh snapshot whenever the active set changes, with the engine
+  health embedded in every frame.
+- The frontend is one SPA with a viewport-aware shell
+  (`frontend/src/components/shell/AppShell.tsx`) that swaps mobile
+  bottom-tab chrome and desktop side-nav-plus-Live-rail chrome at the
+  Tailwind `md` breakpoint. A single `LayerStoreProvider`
+  (`frontend/src/state/layers.tsx`) opens one reconnecting WebSocket
+  to `/api/layers/ws` and broadcasts to every screen that shows
+  layer state — mobile Now Playing, desktop Live rail, Effects
+  Composer — so the UI never disagrees with itself.
 
 ## Built-in palettes
 
