@@ -229,6 +229,29 @@ export default function EffectsComposer() {
                 >
                   + Layer
                 </button>
+                {!e.builtin && (
+                  <button
+                    onClick={async (ev) => {
+                      ev.stopPropagation();
+                      if (!window.confirm(`Delete "${e.name}"?`)) return;
+                      try {
+                        await Api.deleteEffect(e.id);
+                        if (selectedEffect?.id === e.id) {
+                          setSelectedEffect(null);
+                        }
+                        await refresh();
+                        notify(`Deleted ${e.name}`, "success");
+                      } catch (err) {
+                        notify(String(err), "error");
+                      }
+                    }}
+                    className="invisible inline-flex h-6 w-6 items-center justify-center rounded-full text-muted hover:bg-rose-900/40 hover:text-rose-200 group-hover:visible"
+                    title="Delete preset"
+                    aria-label={`Delete ${e.name}`}
+                  >
+                    {"\u00D7"}
+                  </button>
+                )}
               </li>
             ))}
           </ul>
