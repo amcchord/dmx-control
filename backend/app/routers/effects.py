@@ -31,12 +31,14 @@ from ..effects import (
 from ..engine import (
     EffectSpec,
     build_spec_from_effect,
+    build_spec_from_layer,
     engine,
     new_handle,
 )
+from ..models import EffectLayer
 from ..lua import LuaScript, ScriptError, compile_script
 from ..lua.runtime import merge_with_schema
-from ..models import Effect, Palette
+from ..models import Effect, Palette  # noqa: F401
 from ..schemas import (
     ActiveEffect,
     BulkTarget,
@@ -293,29 +295,83 @@ def lint_effect(payload: EffectLintRequest) -> EffectLintResponse:
 # ---------------------------------------------------------------------------
 # Playback
 # ---------------------------------------------------------------------------
+def _max_z(sess: Session) -> int:
+    rows = sess.exec(select(EffectLayer.z_index)).all()
+    top = 0
+    for v in rows:
+        if isinstance(v, int) and v > top:
+            top = v
+    return top
+
+
 @router.post("/{eid}/play")
 def play_effect(eid: int, sess: Session = Depends(get_session)) -> dict:
+    """Play a saved effect.
+
+    Backwards-compatible shim around the layer system: each call creates
+    a new :class:`EffectLayer` row referencing the effect, pushes it onto
+    the top of the stack, and returns the engine handle. Existing
+    clients (mobile Quick FX, Designer apply) keep working unchanged.
+
+    Idempotent legacy behavior: if a layer for this effect is already
+    running, it is hard-stopped + deleted before pushing the new one.
+    Callers that want stacked layers of the same effect should hit
+    ``POST /api/layers`` instead."""
     row = sess.get(Effect, eid)
     if row is None:
         raise HTTPException(404, "effect not found")
+    existing = sess.exec(
+        select(EffectLayer).where(EffectLayer.effect_id == eid)
+    ).all()
+    for old in existing:
+        engine.stop_by_layer_id(old.id, immediate=True)
+        sess.delete(old)
+    if existing:
+        sess.commit()
     palette = _peek_palette(sess, row.palette_id)
+    layer = EffectLayer(
+        effect_id=row.id,
+        z_index=_max_z(sess) + 100,
+        blend_mode="normal",
+        opacity=1.0,
+        target_channels=list(row.target_channels or ["rgb"]),
+        spread=row.spread,
+        light_ids=list(row.light_ids or []),
+        targets=list(row.targets or []),
+        palette_id=row.palette_id,
+        is_active=True,
+    )
+    sess.add(layer)
+    sess.commit()
+    sess.refresh(layer)
     try:
-        spec = build_spec_from_effect(row, palette)
+        spec = build_spec_from_layer(layer, row, palette)
     except ScriptError as e:
+        sess.delete(layer)
+        sess.commit()
         raise HTTPException(400, {"error": e.to_dict()})
     row.is_active = True
     sess.add(row)
     sess.commit()
     handle = engine.play(spec)
-    return {"ok": True, "handle": handle}
+    return {"ok": True, "handle": handle, "layer_id": layer.id}
 
 
 @router.post("/{eid}/stop")
 def stop_effect(eid: int, sess: Session = Depends(get_session)) -> dict:
+    """Stop every running layer that references this effect."""
     row = sess.get(Effect, eid)
     if row is None:
         raise HTTPException(404, "effect not found")
-    n = engine.stop_by_effect_id(eid)
+    layers = sess.exec(
+        select(EffectLayer).where(EffectLayer.effect_id == eid)
+    ).all()
+    n = 0
+    for layer in layers:
+        n += engine.stop_by_layer_id(layer.id, immediate=True)
+        sess.delete(layer)
+    if n == 0:
+        n = engine.stop_by_effect_id(eid, immediate=True)
     row.is_active = False
     sess.add(row)
     sess.commit()
@@ -324,11 +380,14 @@ def stop_effect(eid: int, sess: Session = Depends(get_session)) -> dict:
 
 @router.post("/stop-all")
 def stop_all(sess: Session = Depends(get_session)) -> dict:
-    n = engine.stop_all()
+    n = engine.stop_all(immediate=True)
     rows = sess.exec(select(Effect).where(Effect.is_active == True)).all()  # noqa: E712
     for r in rows:
         r.is_active = False
         sess.add(r)
+    layers = sess.exec(select(EffectLayer)).all()
+    for layer in layers:
+        sess.delete(layer)
     sess.commit()
     _live_specs.clear()
     _live_palette.clear()

@@ -499,6 +499,117 @@ export type ActiveEffect = {
   runtime_s: number;
 };
 
+/** Photoshop-style blend modes a layer can apply when compositing onto
+ *  the running rig state. ``normal`` matches the legacy single-effect
+ *  cross-fade; everything else is a real blend op (additive, screen,
+ *  multiply, max/min, replace). */
+export type LayerBlendMode =
+  | "normal"
+  | "add"
+  | "multiply"
+  | "screen"
+  | "max"
+  | "min"
+  | "replace";
+
+export const LAYER_BLEND_MODES: LayerBlendMode[] = [
+  "normal",
+  "add",
+  "multiply",
+  "screen",
+  "max",
+  "min",
+  "replace",
+];
+
+/** A running effect layer as seen by the engine.
+ *
+ * Streamed over the layers WebSocket (``/api/layers/ws``) and returned
+ * by ``GET /api/layers``. ``layer_id`` is ``null`` for transient
+ * (unsaved) layers — those exist only in the engine, not in the DB. */
+export type EffectLayer = {
+  handle: string;
+  layer_id: number | null;
+  effect_id: number | null;
+  name: string;
+  runtime_s: number;
+  z_index: number;
+  blend_mode: LayerBlendMode;
+  opacity: number;
+  intensity: number;
+  target_channels: EffectTargetChannel[];
+  mute: boolean;
+  solo: boolean;
+  auto_muted: boolean;
+  stopping: boolean;
+  error?: string | null;
+  error_count: number;
+  last_tick_ms: number;
+  mask_light_ids: number[];
+};
+
+export type LayerCreateInput = {
+  effect_id: number;
+  name?: string;
+  z_index?: number;
+  blend_mode?: LayerBlendMode;
+  opacity?: number;
+  intensity?: number;
+  fade_in_s?: number;
+  fade_out_s?: number;
+  mute?: boolean;
+  solo?: boolean;
+  mask_light_ids?: number[];
+  target_channels?: EffectTargetChannel[];
+  spread?: PaletteSpread;
+  light_ids?: number[];
+  targets?: BulkTarget[];
+  palette_id?: number | null;
+  params_override?: EffectParams;
+};
+
+export type LayerPatchInput = Partial<{
+  name: string;
+  z_index: number;
+  blend_mode: LayerBlendMode;
+  opacity: number;
+  intensity: number;
+  fade_in_s: number;
+  fade_out_s: number;
+  mute: boolean;
+  solo: boolean;
+  mask_light_ids: number[];
+  target_channels: EffectTargetChannel[];
+  params_override: EffectParams;
+}>;
+
+export type EngineHealth = {
+  ok: boolean;
+  tick_count: number;
+  dropped_frames: number;
+  last_tick_ms: number;
+  active_layers: number;
+  tick_hz: number;
+};
+
+export type SceneSavedLayer = {
+  effect_id: number;
+  name?: string | null;
+  z_index?: number | null;
+  blend_mode?: LayerBlendMode;
+  opacity?: number;
+  intensity?: number;
+  fade_in_s?: number;
+  fade_out_s?: number;
+  target_channels?: EffectTargetChannel[];
+  spread?: PaletteSpread;
+  light_ids?: number[];
+  targets?: BulkTarget[];
+  mask_light_ids?: number[];
+  palette_id?: number | null;
+  params_override?: EffectParams;
+};
+
 export type EffectLintError = { message: string; line?: number };
 
 export type EffectLintResponse = {
@@ -572,6 +683,10 @@ export type Scene = {
   controller_id: number;
   cross_controller: boolean;
   lights: SceneLightState[];
+  /** Layers stored alongside this scene. When the scene is applied, the
+   *  base snapshot is pushed first, then each layer is started in
+   *  order on top. Empty for legacy single-snapshot scenes. */
+  layers?: SceneSavedLayer[];
   builtin: boolean;
 };
 
@@ -595,6 +710,9 @@ export type SceneUpdateInput = {
   recapture?: boolean;
   from_rendered?: boolean;
   light_ids?: number[];
+  /** Replace the scene's saved layer stack. ``[]`` drops every saved
+   *  layer; ``undefined`` (the default) leaves them untouched. */
+  layers?: SceneSavedLayer[];
 };
 
 /** A rig-wide snapshot covering every light on every controller.
@@ -765,6 +883,19 @@ export const Api = {
     api.post<{ ok: boolean; applied: number }>(`/api/states/${id}/apply`),
   applyBlackoutState: () =>
     api.post<{ ok: boolean; applied: number }>(`/api/states/blackout/apply`),
+
+  health: () => api.get<EngineHealth>("/api/health"),
+
+  listLayers: () => api.get<EffectLayer[]>("/api/layers"),
+  createLayer: (body: LayerCreateInput) =>
+    api.post<EffectLayer>("/api/layers", body),
+  patchLayer: (id: number, body: LayerPatchInput) =>
+    api.patch<EffectLayer>(`/api/layers/${id}`, body),
+  reorderLayers: (order: { layer_id: number; z_index: number }[]) =>
+    api.post<EffectLayer[]>("/api/layers/reorder", { order }),
+  deleteLayer: (id: number) => api.del<void>(`/api/layers/${id}`),
+  clearLayers: () =>
+    api.post<{ ok: boolean; stopped: number }>(`/api/layers/clear`),
 
   aiStatus: () => api.get<AiStatus>("/api/ai/status"),
   parseManual: (

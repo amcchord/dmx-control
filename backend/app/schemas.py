@@ -750,6 +750,155 @@ class ActiveEffect(BaseModel):
     runtime_s: float
 
 
+# ---------------------------------------------------------------------------
+# Effect layers (Photoshop-style compositing)
+# ---------------------------------------------------------------------------
+BLEND_MODES_VALID = {"normal", "add", "multiply", "screen", "max", "min", "replace"}
+
+
+class LayerCreate(BaseModel):
+    """Push a new layer onto the rig.
+
+    ``effect_id`` is required; transient/preview layers do not go through
+    this endpoint (they ride the existing live-effect path). All
+    layer-owned fields are optional and fall back to sensible defaults
+    that mirror today's single-effect behavior."""
+
+    effect_id: int
+    name: Optional[str] = None
+    z_index: Optional[int] = None
+    blend_mode: Literal["normal", "add", "multiply", "screen", "max", "min", "replace"] = (
+        "normal"
+    )
+    opacity: float = 1.0
+    intensity: float = 1.0
+    fade_in_s: float = 0.25
+    fade_out_s: float = 0.25
+    mute: bool = False
+    solo: bool = False
+    mask_light_ids: list[int] = Field(default_factory=list)
+    target_channels: Optional[list[str]] = None
+    spread: Optional[Literal["across_lights", "across_fixture", "across_zones"]] = None
+    light_ids: Optional[list[int]] = None
+    targets: Optional[list[BulkTarget]] = None
+    palette_id: Optional[int] = None
+    params_override: dict = Field(default_factory=dict)
+
+    @field_validator("opacity", "intensity")
+    @classmethod
+    def _unit(cls, v: float) -> float:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError("must be in [0, 1]")
+        return float(v)
+
+    @field_validator("fade_in_s", "fade_out_s")
+    @classmethod
+    def _fade(cls, v: float) -> float:
+        if not (0.0 <= v <= EFFECT_FADE_MAX_S):
+            raise ValueError(
+                f"fade must be in [0, {EFFECT_FADE_MAX_S:g}] seconds"
+            )
+        return float(v)
+
+    @field_validator("target_channels")
+    @classmethod
+    def _channels(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        if v is None:
+            return None
+        return _validate_target_channels(v)
+
+
+class LayerPatch(BaseModel):
+    """In-place patch to a running layer.
+
+    Every field is optional. Only sent properties are touched; this maps
+    directly onto :meth:`EffectEngine.patch_layer` so opacity sliders,
+    mute/solo toggles, blend dropdowns, and reorder operations all reach
+    the engine through the same entry point."""
+
+    name: Optional[str] = None
+    z_index: Optional[int] = None
+    blend_mode: Optional[
+        Literal["normal", "add", "multiply", "screen", "max", "min", "replace"]
+    ] = None
+    opacity: Optional[float] = None
+    intensity: Optional[float] = None
+    fade_in_s: Optional[float] = None
+    fade_out_s: Optional[float] = None
+    mute: Optional[bool] = None
+    solo: Optional[bool] = None
+    mask_light_ids: Optional[list[int]] = None
+    target_channels: Optional[list[str]] = None
+    params_override: Optional[dict] = None
+
+    @field_validator("opacity", "intensity")
+    @classmethod
+    def _unit(cls, v: Optional[float]) -> Optional[float]:
+        if v is None:
+            return None
+        if not (0.0 <= v <= 1.0):
+            raise ValueError("must be in [0, 1]")
+        return float(v)
+
+    @field_validator("fade_in_s", "fade_out_s")
+    @classmethod
+    def _fade(cls, v: Optional[float]) -> Optional[float]:
+        if v is None:
+            return None
+        if not (0.0 <= v <= EFFECT_FADE_MAX_S):
+            raise ValueError(
+                f"fade must be in [0, {EFFECT_FADE_MAX_S:g}] seconds"
+            )
+        return float(v)
+
+    @field_validator("target_channels")
+    @classmethod
+    def _channels(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        if v is None:
+            return None
+        return _validate_target_channels(v)
+
+
+class LayerReorder(BaseModel):
+    """Bulk z-index update. Each entry is ``{layer_id, z_index}``."""
+
+    order: list[dict]
+
+
+class LayerOut(BaseModel):
+    """Serialized running layer (used by REST + WS layer store)."""
+
+    handle: str
+    layer_id: Optional[int] = None
+    effect_id: Optional[int] = None
+    name: str
+    runtime_s: float = 0.0
+    z_index: int = 100
+    blend_mode: str = "normal"
+    opacity: float = 1.0
+    intensity: float = 1.0
+    target_channels: list[str] = Field(default_factory=lambda: ["rgb"])
+    mute: bool = False
+    solo: bool = False
+    auto_muted: bool = False
+    stopping: bool = False
+    error: Optional[str] = None
+    error_count: int = 0
+    last_tick_ms: float = 0.0
+    mask_light_ids: list[int] = Field(default_factory=list)
+
+
+class HealthOut(BaseModel):
+    """``GET /api/health`` payload (extended with engine telemetry)."""
+
+    ok: bool = True
+    tick_count: int = 0
+    dropped_frames: int = 0
+    last_tick_ms: float = 0.0
+    active_layers: int = 0
+    tick_hz: float = 30.0
+
+
 class SceneLightState(BaseModel):
     """Per-light state captured in a Scene snapshot.
 
@@ -812,6 +961,9 @@ class SceneUpdate(BaseModel):
     from_rendered: bool = False
     # Only consulted when ``recapture`` is true.
     light_ids: Optional[list[int]] = None
+    # Replace the saved layer stack on this scene. ``None`` (the default)
+    # leaves the existing layers untouched; pass ``[]`` to drop them all.
+    layers: Optional[list[dict]] = None
 
     @field_validator("name")
     @classmethod
@@ -824,6 +976,30 @@ class SceneUpdate(BaseModel):
         if len(s) > 128:
             raise ValueError("name too long")
         return s
+
+
+class SceneSavedLayer(BaseModel):
+    """One layer spec saved alongside a scene's base snapshot.
+
+    Mirrors :class:`LayerCreate` minus the runtime-only fields. Loaded
+    by the Scene Composer and pushed onto the engine in order when the
+    scene is applied."""
+
+    effect_id: int
+    name: Optional[str] = None
+    z_index: Optional[int] = None
+    blend_mode: str = "normal"
+    opacity: float = 1.0
+    intensity: float = 1.0
+    fade_in_s: float = 0.25
+    fade_out_s: float = 0.25
+    target_channels: list[str] = Field(default_factory=lambda: ["rgb"])
+    spread: str = "across_lights"
+    light_ids: list[int] = Field(default_factory=list)
+    targets: list[BulkTarget] = Field(default_factory=list)
+    mask_light_ids: list[int] = Field(default_factory=list)
+    palette_id: Optional[int] = None
+    params_override: dict = Field(default_factory=dict)
 
 
 class SceneOut(BaseModel):
@@ -840,6 +1016,7 @@ class SceneOut(BaseModel):
     controller_id: int
     cross_controller: bool
     lights: list[SceneLightState] = Field(default_factory=list)
+    layers: list[dict] = Field(default_factory=list)
     builtin: bool = False
 
 

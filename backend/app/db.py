@@ -152,6 +152,12 @@ def _migrate() -> None:
                 conn.exec_driver_sql(
                     "ALTER TABLE effect ADD COLUMN param_schema JSON"
                 )
+            # scene.layers (saved layer stack on top of the base snapshot).
+            scene_cols = _table_columns(conn, "scene")
+            if scene_cols and "layers" not in scene_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE scene ADD COLUMN layers JSON"
+                )
         else:
             # Best-effort for other backends; swallow errors if column already exists.
             for stmt in (
@@ -168,6 +174,7 @@ def _migrate() -> None:
                 "ALTER TABLE effect ADD COLUMN target_channels JSON",
                 "ALTER TABLE effect ADD COLUMN source TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE effect ADD COLUMN param_schema JSON",
+                "ALTER TABLE scene ADD COLUMN layers JSON",
             ):
                 try:
                     conn.execute(text(stmt))

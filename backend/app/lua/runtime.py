@@ -632,13 +632,20 @@ def smoke_test_source(
         # the entry point exists. Scripts with neither render nor tick
         # have already failed compile so we won't reach here.
         return None
-    n = 8
+    # Probe across multiple t / i / n combinations. Any healthy effect
+    # produces non-zero color at SOME point in this grid — a chase that
+    # blanks a slot still has other slots lit, a strobe still flashes
+    # at multiple of the probed t values, etc. A script that returns
+    # all zeros across all probes is almost certainly broken (wrong
+    # ctx field names, units mismatch, missing brightness scaling).
+    saw_color = False
+    last_result: Optional[dict[str, Any]] = None
     for t in (0.0, 0.25, 0.7, 1.5, 3.3):
-        for i in range(n):
+        for i in range(n_probes := 8):
             ctx = script.new_table()
             ctx["t"] = float(t)
             ctx["i"] = i
-            ctx["n"] = n
+            ctx["n"] = n_probes
             ctx["frame"] = int(t * 30)
             ctx["seed"] = 1
             ctx["palette"] = pal
@@ -651,9 +658,46 @@ def smoke_test_source(
             slot_tbl["zone_id"] = None
             ctx["slot"] = slot_tbl
             try:
-                script.render_slot(ctx)
+                result = script.render_slot(ctx)
             except ScriptError as e:
                 return e
             except Exception as e:  # pragma: no cover - defensive
                 return ScriptError(str(e))
+            if isinstance(result, dict):
+                last_result = result
+                if not result.get("active", False):
+                    continue
+                rr = int(result.get("r", 0) or 0)
+                gg = int(result.get("g", 0) or 0)
+                bb = int(result.get("b", 0) or 0)
+                bri = result.get("brightness", 1.0)
+                if (rr + gg + bb) > 0 and (
+                    not isinstance(bri, (int, float)) or bri > 0
+                ):
+                    saw_color = True
+
+    if not saw_color:
+        # Tailor the diagnostic to the most common Claude/LLM failure:
+        # reading from nonexistent ctx fields (``ctx.time_s`` instead
+        # of ``ctx.t``) so every slot returns 0,0,0 while still passing
+        # the no-exception smoke. Surface enough hints that the refiner
+        # can produce a meaningful fix.
+        sample = ""
+        if isinstance(last_result, dict):
+            sample = (
+                f" Last sample: r={last_result.get('r')}, "
+                f"g={last_result.get('g')}, b={last_result.get('b')}, "
+                f"brightness={last_result.get('brightness')}, "
+                f"active={last_result.get('active')}."
+            )
+        return ScriptError(
+            "render() always returned zero color and/or zero "
+            "brightness across the smoke probe. The script likely "
+            "reads from a ctx field that doesn't exist (the correct "
+            "names are ctx.t / ctx.i / ctx.n — NOT ctx.time_s, "
+            "ctx.index, ctx.count) or returns r/g/b as 0..1 floats "
+            "instead of 0..255 integers. Be explicit: ``return { r = "
+            "INT(0..255), g = INT(0..255), b = INT(0..255), "
+            "brightness = FLOAT(0..1), active = true }``." + sample
+        )
     return None

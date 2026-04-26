@@ -186,13 +186,87 @@ class Scene(SQLModel, table=True):
     controllers as well. ``lights`` is a list of per-light state dicts
     captured at save time; each dict mirrors the writable fields on
     :class:`Light` (r/g/b/w/a/uv/dimmer/on + zone_state + motion_state)
-    plus the ``light_id`` key used to restore."""
+    plus the ``light_id`` key used to restore.
+
+    ``layers`` is an optional list of layer specs that should be pushed on
+    top of the base snapshot when the scene is applied. Each entry is a
+    dict shaped roughly like:
+        {effect_id, blend_mode, opacity, mask_light_ids,
+         target_channels, params_override, intensity, fade_in_s,
+         fade_out_s, palette_id, light_ids, targets, spread}
+    Existing scenes load with ``layers=[]`` (apply behaves as before)."""
 
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
     controller_id: int = Field(foreign_key="controller.id", index=True)
     cross_controller: bool = False
     lights: list[dict] = Field(default_factory=list, sa_column=Column(JSON))
+    layers: list[dict] = Field(default_factory=list, sa_column=Column(JSON))
+
+
+class EffectLayer(SQLModel, table=True):
+    """A running effect instance composited onto the rig.
+
+    Layers separate the *definition* of an effect (a row in :class:`Effect`
+    with Lua source + schema) from a *running instance* on the rig. The
+    engine renders all layers in deterministic ``(z_index, id)`` order and
+    composites their contributions according to ``blend_mode``,
+    ``opacity``, and the layer's mask / target channels.
+
+    ``effect_id`` may be null for live, transient layers (e.g. an effect
+    that the user is iterating on in the chat composer). When set, the
+    layer reads its Lua source from the referenced :class:`Effect` row;
+    ``params_override`` lets callers tweak knobs without editing the saved
+    preset.
+
+    ``mask_light_ids`` is an optional subset of ``light_ids`` / ``targets``
+    that further restricts which fixtures see this layer. Empty means "no
+    extra masking" (every light covered by the effect's targets is in
+    play). ``solo`` and ``mute`` are mixer-style toggles surfaced in the
+    UI; the engine treats any solo'd layer as "only solo'd layers
+    contribute" until solo is cleared.
+
+    Telemetry fields (``last_error``, ``error_count``, ``last_tick_ms``)
+    are best-effort and overwritten by the engine on every tick."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    effect_id: Optional[int] = Field(
+        default=None, foreign_key="effect.id", index=True
+    )
+    name: Optional[str] = Field(default=None)
+    z_index: int = 100
+    blend_mode: str = "normal"
+    opacity: float = 1.0
+    mask_light_ids: list[int] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+    target_channels: list[str] = Field(
+        default_factory=lambda: ["rgb"], sa_column=Column(JSON)
+    )
+    intensity: float = 1.0
+    fade_in_s: float = 0.25
+    fade_out_s: float = 0.25
+    solo: bool = False
+    mute: bool = False
+    enabled: bool = True
+    is_active: bool = True
+    palette_id: Optional[int] = Field(
+        default=None, foreign_key="palette.id", index=True
+    )
+    light_ids: list[int] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+    targets: list[dict] = Field(
+        default_factory=list, sa_column=Column(JSON)
+    )
+    spread: str = "across_lights"
+    params_override: dict = Field(
+        default_factory=dict, sa_column=Column(JSON)
+    )
+    last_error: Optional[str] = Field(default=None)
+    last_tick_ms: float = 0.0
+    error_count: int = 0
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 class DesignerConversation(SQLModel, table=True):

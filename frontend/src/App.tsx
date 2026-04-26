@@ -2,18 +2,28 @@ import React from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { AuthProvider, useAuth } from "./auth";
 import { ToastProvider } from "./toast";
+import AppShell from "./components/shell/AppShell";
+import { LayerStoreProvider } from "./state/layers";
+import { SelectionProvider } from "./state/selection";
+import { UndoProvider } from "./state/undo";
+
 import Login from "./pages/Login";
-import Dashboard from "./pages/Dashboard";
+import NowPlaying from "./pages/operate/NowPlaying";
+import LightsOperate from "./pages/operate/Lights";
+import QuickFx from "./pages/operate/QuickFx";
+import ScenesOperate from "./pages/operate/Scenes";
+import Me from "./pages/operate/Me";
+
+import EffectsComposer from "./pages/author/EffectsComposer";
+import SceneComposer from "./pages/author/SceneComposer";
+
 import Controllers from "./pages/Controllers";
 import ControllerDetail from "./pages/ControllerDetail";
 import Models from "./pages/Models";
 import ModelEditor from "./pages/ModelEditor";
 import Palettes from "./pages/Palettes";
-import Effects from "./pages/Effects";
-import Scenes from "./pages/Scenes";
 import Designer from "./pages/Designer";
 import ApiDocs from "./pages/ApiDocs";
-import Nav from "./components/Nav";
 
 function Protected({ children }: { children: React.ReactNode }) {
   const { authenticated } = useAuth();
@@ -31,14 +41,17 @@ function Protected({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
-function Layout({ children }: { children: React.ReactNode }) {
+function ProtectedShell({ children }: { children: React.ReactNode }) {
   return (
-    <div className="flex min-h-full flex-col">
-      <Nav />
-      <main className="mx-auto w-full max-w-6xl flex-1 px-4 pb-20 pt-6 sm:px-6 lg:px-8">
-        {children}
-      </main>
-    </div>
+    <Protected>
+      <SelectionProvider>
+        <LayerStoreProvider>
+          <UndoProvider>
+            <AppShell>{children}</AppShell>
+          </UndoProvider>
+        </LayerStoreProvider>
+      </SelectionProvider>
+    </Protected>
   );
 }
 
@@ -48,119 +61,159 @@ export default function App() {
       <ToastProvider>
         <Routes>
           <Route path="/login" element={<Login />} />
+
+          {/* Operate */}
           <Route
             path="/"
             element={
-              <Protected>
-                <Layout>
-                  <Dashboard />
-                </Layout>
-              </Protected>
+              <ProtectedShell>
+                <NowPlaying />
+              </ProtectedShell>
             }
           />
           <Route
-            path="/controllers"
+            path="/lights"
             element={
-              <Protected>
-                <Layout>
-                  <Controllers />
-                </Layout>
-              </Protected>
+              <ProtectedShell>
+                <LightsOperate />
+              </ProtectedShell>
             }
           />
           <Route
-            path="/controllers/:id"
+            path="/quick-fx"
             element={
-              <Protected>
-                <Layout>
-                  <ControllerDetail />
-                </Layout>
-              </Protected>
-            }
-          />
-          <Route
-            path="/models"
-            element={
-              <Protected>
-                <Layout>
-                  <Models />
-                </Layout>
-              </Protected>
-            }
-          />
-          <Route
-            path="/models/new"
-            element={
-              <Protected>
-                <Layout>
-                  <ModelEditor />
-                </Layout>
-              </Protected>
-            }
-          />
-          <Route
-            path="/models/:id/edit"
-            element={
-              <Protected>
-                <Layout>
-                  <ModelEditor />
-                </Layout>
-              </Protected>
-            }
-          />
-          <Route
-            path="/palettes"
-            element={
-              <Protected>
-                <Layout>
-                  <Palettes />
-                </Layout>
-              </Protected>
-            }
-          />
-          <Route
-            path="/effects"
-            element={
-              <Protected>
-                <Layout>
-                  <Effects />
-                </Layout>
-              </Protected>
+              <ProtectedShell>
+                <QuickFx />
+              </ProtectedShell>
             }
           />
           <Route
             path="/scenes"
             element={
-              <Protected>
-                <Layout>
-                  <Scenes />
-                </Layout>
-              </Protected>
+              <ProtectedShell>
+                <ScenesOperate />
+              </ProtectedShell>
             }
           />
           <Route
-            path="/designer"
+            path="/me"
             element={
-              <Protected>
-                <Layout>
-                  <Designer />
-                </Layout>
-              </Protected>
+              <ProtectedShell>
+                <Me />
+              </ProtectedShell>
             }
           />
+
+          {/* Author */}
+          <Route
+            path="/author/effects"
+            element={
+              <ProtectedShell>
+                <EffectsComposer />
+              </ProtectedShell>
+            }
+          />
+          <Route
+            path="/author/palettes"
+            element={
+              <ProtectedShell>
+                <Palettes />
+              </ProtectedShell>
+            }
+          />
+          <Route
+            path="/author/scenes"
+            element={
+              <ProtectedShell>
+                <SceneComposer />
+              </ProtectedShell>
+            }
+          />
+          <Route
+            path="/author/designer"
+            element={
+              <ProtectedShell>
+                <Designer />
+              </ProtectedShell>
+            }
+          />
+
+          {/* Configure */}
+          <Route
+            path="/config/controllers"
+            element={
+              <ProtectedShell>
+                <Controllers />
+              </ProtectedShell>
+            }
+          />
+          <Route
+            path="/config/controllers/:id"
+            element={
+              <ProtectedShell>
+                <ControllerDetail />
+              </ProtectedShell>
+            }
+          />
+          <Route
+            path="/config/models"
+            element={
+              <ProtectedShell>
+                <Models />
+              </ProtectedShell>
+            }
+          />
+          <Route
+            path="/config/models/new"
+            element={
+              <ProtectedShell>
+                <ModelEditor />
+              </ProtectedShell>
+            }
+          />
+          <Route
+            path="/config/models/:id/edit"
+            element={
+              <ProtectedShell>
+                <ModelEditor />
+              </ProtectedShell>
+            }
+          />
+
           <Route
             path="/api-docs"
             element={
-              <Protected>
-                <Layout>
-                  <ApiDocs />
-                </Layout>
-              </Protected>
+              <ProtectedShell>
+                <ApiDocs />
+              </ProtectedShell>
             }
           />
+
+          {/* Legacy redirects keep old links and bookmarks alive. */}
+          <Route path="/effects" element={<Navigate to="/author/effects" replace />} />
+          <Route path="/palettes" element={<Navigate to="/author/palettes" replace />} />
+          <Route path="/designer" element={<Navigate to="/author/designer" replace />} />
+          <Route path="/controllers" element={<Navigate to="/config/controllers" replace />} />
+          <Route path="/controllers/:id" element={<RedirectControllerLegacy />} />
+          <Route path="/models" element={<Navigate to="/config/models" replace />} />
+          <Route path="/models/new" element={<Navigate to="/config/models/new" replace />} />
+          <Route path="/models/:id/edit" element={<RedirectModelLegacy />} />
+
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </ToastProvider>
     </AuthProvider>
   );
+}
+
+function RedirectControllerLegacy() {
+  const { pathname } = useLocation();
+  const id = pathname.split("/").pop();
+  return <Navigate to={`/config/controllers/${id}`} replace />;
+}
+
+function RedirectModelLegacy() {
+  const { pathname } = useLocation();
+  const id = pathname.split("/")[2];
+  return <Navigate to={`/config/models/${id}/edit`} replace />;
 }

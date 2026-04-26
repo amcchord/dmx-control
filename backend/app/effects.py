@@ -1,4 +1,4 @@
-"""Effect overlay assembly + base/overlay merging.
+"""Effect overlay assembly + per-layer compositing.
 
 The math that was once a giant ``compute_effect_outputs`` switch over
 ``effect_type`` strings has moved into Lua scripts (see
@@ -8,10 +8,27 @@ The math that was once a giant ``compute_effect_outputs`` switch over
   into one or more per-group lists of ``TargetSlot``.
 * :func:`compute_lua_overlays` - call the spec's :class:`LuaScript` for
   every slot, building a per-light :class:`LightOverlay`.
-* :func:`merge_overlay_into_state` - blend a per-light overlay onto the
-  fixture's base DB state (RGB / W / A / UV / dimmer / strobe).
+* :func:`merge_overlay_into_state` - composite a per-light overlay onto
+  the running state per channel using the layer's ``blend_mode`` and
+  ``opacity`` (the engine seeds the running state from the fixture's
+  base DB row and then walks the layer stack bottom-to-top).
 * :class:`LightOverlay` / :class:`TargetSlot` - shared dataclasses.
-"""
+
+Blend modes (:data:`BLEND_MODES`):
+
+  ``normal``   - linear cross-fade (matches legacy single-effect merge)
+  ``add``      - additive: ``out = clamp(below + overlay * opacity)``
+  ``multiply`` - ``out = below * mix(1, overlay, opacity)`` (darken)
+  ``screen``   - inverted multiply (lighten)
+  ``max``      - per-channel max (brightest wins)
+  ``min``      - per-channel min (darkest wins)
+  ``replace``  - overwrite (ignore below; ``opacity`` still scales the
+                 transition between below and overlay)
+
+Each blend operates per channel, so RGB/W/A/UV/dimmer/strobe all combine
+correctly under the same compositor; aux channels honor the mode's
+``color_policy`` so a "direct" white fader is never derived from RGB
+when an effect only writes RGB above it."""
 
 from __future__ import annotations
 
@@ -248,8 +265,55 @@ def compute_lua_overlays(
 
 
 # ---------------------------------------------------------------------------
-# Overlay merge
+# Blend modes
 # ---------------------------------------------------------------------------
+BLEND_MODES = ("normal", "add", "multiply", "screen", "max", "min", "replace")
+
+
+def _clamp_byte(v: float) -> int:
+    if v <= 0.0:
+        return 0
+    if v >= 255.0:
+        return 255
+    return int(round(v))
+
+
+def _blend_byte(below: int, overlay: int, mode: str, opacity: float) -> int:
+    """Composite a single 0-255 channel value.
+
+    The ``opacity`` (combined effect intensity * fade envelope * layer
+    opacity) controls how much of the ``mode`` operation contributes to
+    the final value; at opacity 0 we always return ``below``, at opacity
+    1 we return the pure ``mode`` result. This keeps fade in/out smooth
+    regardless of which blend mode the layer uses."""
+    o = max(0.0, min(1.0, float(opacity)))
+    if o <= 0.0:
+        return int(below)
+    a = float(below)
+    b = float(overlay)
+    if mode == "normal":
+        out = a * (1.0 - o) + b * o
+    elif mode == "replace":
+        out = a * (1.0 - o) + b * o
+    elif mode == "add":
+        out = a + b * o
+    elif mode == "multiply":
+        # `b/255` blended with 1.0 by opacity, then multiplies `a`.
+        m = (1.0 - o) + o * (b / 255.0)
+        out = a * m
+    elif mode == "screen":
+        # 1 - (1-a)(1-b) projected through opacity.
+        screened = 255.0 - (255.0 - a) * (255.0 - b) / 255.0
+        out = a * (1.0 - o) + screened * o
+    elif mode == "max":
+        out = a * (1.0 - o) + max(a, b) * o
+    elif mode == "min":
+        out = a * (1.0 - o) + min(a, b) * o
+    else:
+        out = a * (1.0 - o) + b * o
+    return _clamp_byte(out)
+
+
 def _scalar_from_rgb(r: int, g: int, b: int) -> int:
     """Collapse an RGB triple to a 0-255 scalar for aux-channel overlays."""
     return max(0, min(255, max(int(r), int(g), int(b))))
@@ -262,13 +326,17 @@ def merge_overlay_into_state(
     fade_weight: float,
     color_policy: dict | None = None,
     target_channels: Optional[list[str]] = None,
+    blend_mode: str = "normal",
+    layer_opacity: float = 1.0,
 ) -> dict:
-    """Produce a rendered state dict for one light.
+    """Composite ``overlay`` onto ``base_state`` for one light.
 
-    ``base_state`` is the light's current DB-backed state (flat r/g/b/w/a/uv
-    + zone_state + motion_state). ``fade_weight`` is the effect's current
-    fade-in/out envelope in [0, 1]. The result has the same shape the
-    ArtNet renderer expects."""
+    Walks each writable channel and applies :func:`_blend_byte` using the
+    layer's ``blend_mode``. Effective opacity per channel is the product
+    of the overlay's per-slot brightness, ``fade_weight`` (engine fade
+    envelope), and ``layer_opacity`` (Photoshop-style mixer slider). The
+    result has the same shape the ArtNet renderer expects so it can flow
+    straight back into the running tick state for the next layer."""
     out = dict(base_state)
     zone_state = dict(base_state.get("zone_state") or {})
     policy = color_policy or {}
@@ -276,24 +344,44 @@ def merge_overlay_into_state(
     if not tc:
         tc = {"rgb"}
     touches_rgb = "rgb" in tc
+    mode = blend_mode if blend_mode in BLEND_MODES else "normal"
+    lop = max(0.0, min(1.0, float(layer_opacity)))
 
-    def _mix(a: int, b: int, w: float) -> int:
-        w = max(0.0, min(1.0, w))
-        return max(0, min(255, int(round(a * (1.0 - w) + b * w))))
+    # When a layer contributes any output, force the fixture-level
+    # ``on`` flag on for this frame. Otherwise the Art-Net renderer
+    # short-circuits to all-zero in ``_compute_*_values`` whenever
+    # ``light.on`` is False — and operators expect a freshly-pushed
+    # effect to win against a stale blackout. The base DB ``on`` flag
+    # is unchanged; only the rendered state for this tick is forced.
+    has_contribution = (
+        overlay.flat is not None
+        and (lop * fade_weight) > 0.0
+    ) or any(
+        (lop * fade_weight) > 0.0 for _ in overlay.zones.values()
+    )
+    if has_contribution:
+        out["on"] = True
 
     flat_zone_ids = set(zone_ids)
     if overlay.flat is not None:
         r, g, b, eff = overlay.flat
-        eff *= fade_weight
+        eff = max(0.0, min(1.0, eff * fade_weight)) * lop
         scalar = _scalar_from_rgb(r, g, b)
         if touches_rgb:
-            out["r"] = _mix(int(base_state.get("r", 0)), int(r), eff)
-            out["g"] = _mix(int(base_state.get("g", 0)), int(g), eff)
-            out["b"] = _mix(int(base_state.get("b", 0)), int(b), eff)
+            out["r"] = _blend_byte(int(base_state.get("r", 0)), int(r), mode, eff)
+            out["g"] = _blend_byte(int(base_state.get("g", 0)), int(g), mode, eff)
+            out["b"] = _blend_byte(int(base_state.get("b", 0)), int(b), mode, eff)
             if base_state.get("w") is not None and policy.get("w") != "direct":
-                out["w"] = _mix(int(base_state.get("w", 0)), min(r, g, b), eff)
+                out["w"] = _blend_byte(
+                    int(base_state.get("w", 0)), int(min(r, g, b)), mode, eff
+                )
             if base_state.get("a") is not None and policy.get("a") != "direct":
-                out["a"] = _mix(int(base_state.get("a", 0)), min(r, g) // 2, eff)
+                out["a"] = _blend_byte(
+                    int(base_state.get("a", 0)),
+                    int(min(r, g) // 2),
+                    mode,
+                    eff,
+                )
             for zid in flat_zone_ids:
                 if zid in overlay.zones:
                     continue
@@ -301,34 +389,34 @@ def merge_overlay_into_state(
                 zr = int(zs.get("r", base_state.get("r", 0)))
                 zg = int(zs.get("g", base_state.get("g", 0)))
                 zb = int(zs.get("b", base_state.get("b", 0)))
-                zs["r"] = _mix(zr, r, eff)
-                zs["g"] = _mix(zg, g, eff)
-                zs["b"] = _mix(zb, b, eff)
+                zs["r"] = _blend_byte(zr, r, mode, eff)
+                zs["g"] = _blend_byte(zg, g, mode, eff)
+                zs["b"] = _blend_byte(zb, b, mode, eff)
                 zs["on"] = True
                 zone_state[zid] = zs
         for aux in ("w", "a", "uv"):
             if aux not in tc:
                 continue
             base_aux = int(base_state.get(aux) or 0)
-            out[aux] = _mix(base_aux, scalar, eff)
+            out[aux] = _blend_byte(base_aux, scalar, mode, eff)
         if "dimmer" in tc:
             base_dim = int(base_state.get("dimmer") or 0)
-            out["dimmer"] = _mix(base_dim, scalar, eff)
+            out["dimmer"] = _blend_byte(base_dim, scalar, mode, eff)
         if "strobe" in tc:
             base_strobe = int(base_state.get("strobe") or 0)
-            out["strobe"] = _mix(base_strobe, scalar, eff)
+            out["strobe"] = _blend_byte(base_strobe, scalar, mode, eff)
 
     for zid, (r, g, b, eff) in overlay.zones.items():
-        eff *= fade_weight
+        eff = max(0.0, min(1.0, eff * fade_weight)) * lop
         if not touches_rgb:
             continue
         zs = dict(zone_state.get(zid) or {})
         zr = int(zs.get("r", base_state.get("r", 0)))
         zg = int(zs.get("g", base_state.get("g", 0)))
         zb = int(zs.get("b", base_state.get("b", 0)))
-        zs["r"] = _mix(zr, r, eff)
-        zs["g"] = _mix(zg, g, eff)
-        zs["b"] = _mix(zb, b, eff)
+        zs["r"] = _blend_byte(zr, r, mode, eff)
+        zs["g"] = _blend_byte(zg, g, mode, eff)
+        zs["b"] = _blend_byte(zb, b, mode, eff)
         zs["on"] = True
         zone_state[zid] = zs
 

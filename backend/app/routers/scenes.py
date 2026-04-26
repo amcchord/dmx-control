@@ -12,16 +12,20 @@ row."""
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
+log = logging.getLogger(__name__)
+
 from ..artnet import manager
 from ..auth import AuthDep
 from ..db import get_session
-from ..engine import engine
-from ..models import Controller, Light, Scene
+from ..engine import build_spec_from_layer, engine
+from ..lua import ScriptError
+from ..models import Controller, Effect, EffectLayer, Light, Palette, Scene
 from ..schemas import (
     SceneCreate,
     SceneLightState,
@@ -48,6 +52,7 @@ def _row_to_out(row: Scene) -> SceneOut:
         controller_id=row.controller_id,
         cross_controller=bool(row.cross_controller),
         lights=[SceneLightState(**l) for l in (row.lights or [])],
+        layers=list(row.layers or []),
         builtin=False,
     )
 
@@ -64,6 +69,7 @@ def _virtual_blackout(controller: Controller) -> SceneOut:
         controller_id=controller.id,
         cross_controller=False,
         lights=[],
+        layers=[],
         builtin=True,
     )
 
@@ -185,6 +191,12 @@ def update_scene(
             light_ids=payload.light_ids,
             from_rendered=payload.from_rendered,
         )
+    if payload.layers is not None:
+        # Replace the saved layer stack wholesale; entries are stored as
+        # JSON dicts and validated lazily at apply time.
+        row.layers = [
+            dict(entry) for entry in payload.layers if isinstance(entry, dict)
+        ]
     sess.add(row)
     sess.commit()
     sess.refresh(row)
@@ -205,19 +217,31 @@ def delete_scene(sid: int, sess: Session = Depends(get_session)) -> None:
 # ---------------------------------------------------------------------------
 @router.post("/{sid}/apply")
 def apply_scene(sid: int, sess: Session = Depends(get_session)) -> dict:
+    """Atomically apply a scene: clear running layers, push the saved
+    base snapshot onto every covered light, then start each saved layer
+    on top in the order it was authored.
+
+    Old single-snapshot scenes (no ``layers``) behave like before."""
     row = sess.get(Scene, sid)
     if row is None:
         raise HTTPException(404, "scene not found")
 
     by_id = {int(entry["light_id"]): entry for entry in (row.lights or [])}
-    if not by_id:
-        return {"ok": True, "applied": 0}
+    saved_layers = list(row.layers or [])
+    affected = set(by_id.keys())
 
-    # Stop any running effect that overlaps this scene so the restored
-    # static colours actually stick.
-    engine.stop_affecting(set(by_id.keys()))
+    # Atomic swap: stop everything that touches these lights so the
+    # snapshot lands clean; if any saved layer fails to compile we keep
+    # the static base (no half-applied stack).
+    engine.stop_affecting(affected, immediate=True)
+    if not by_id and not saved_layers:
+        return {"ok": True, "applied": 0, "layers": 0}
 
-    lights = sess.exec(select(Light).where(Light.id.in_(list(by_id.keys())))).all()
+    lights = (
+        sess.exec(select(Light).where(Light.id.in_(list(affected)))).all()
+        if affected
+        else []
+    )
     applied = 0
     for light in lights:
         entry = by_id.get(light.id)
@@ -229,7 +253,57 @@ def apply_scene(sid: int, sess: Session = Depends(get_session)) -> dict:
     sess.commit()
     for light in lights:
         push_light(light)
-    return {"ok": True, "applied": applied}
+
+    # Push every saved layer.
+    started = 0
+    if saved_layers:
+        z = 100
+        for spec in saved_layers:
+            if not isinstance(spec, dict):
+                continue
+            try:
+                effect_id = int(spec.get("effect_id"))
+            except (TypeError, ValueError):
+                continue
+            effect = sess.get(Effect, effect_id)
+            if effect is None:
+                log.warning("scene %s references missing effect %s", sid, effect_id)
+                continue
+            layer = EffectLayer(
+                effect_id=effect_id,
+                z_index=int(spec.get("z_index") or z),
+                blend_mode=str(spec.get("blend_mode") or "normal"),
+                opacity=float(spec.get("opacity") or 1.0),
+                intensity=float(spec.get("intensity") or 1.0),
+                fade_in_s=float(spec.get("fade_in_s") or 0.25),
+                fade_out_s=float(spec.get("fade_out_s") or 0.25),
+                target_channels=list(
+                    spec.get("target_channels")
+                    or effect.target_channels
+                    or ["rgb"]
+                ),
+                spread=str(spec.get("spread") or effect.spread or "across_lights"),
+                light_ids=list(spec.get("light_ids") or []),
+                targets=list(spec.get("targets") or []),
+                palette_id=spec.get("palette_id") or effect.palette_id,
+                params_override=dict(spec.get("params_override") or {}),
+                mask_light_ids=list(spec.get("mask_light_ids") or []),
+                is_active=True,
+            )
+            sess.add(layer)
+            sess.flush()
+            palette = None
+            pid = layer.palette_id
+            if pid is not None:
+                palette = sess.get(Palette, pid)
+            try:
+                engine.play(build_spec_from_layer(layer, effect, palette))
+                started += 1
+                z = layer.z_index + 100
+            except ScriptError:
+                sess.delete(layer)
+        sess.commit()
+    return {"ok": True, "applied": applied, "layers": started}
 
 
 @router.post("/blackout/{cid}/apply")

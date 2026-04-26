@@ -43,7 +43,7 @@ from .effects import (
 )
 from .lua import LuaScript, ScriptError, compile_script, get_builtin_source
 from .lua.runtime import merge_with_schema
-from .models import Effect, Light, LightModelMode, Palette
+from .models import Effect, EffectLayer, Light, LightModelMode, Palette
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +57,13 @@ class EffectSpec:
 
     We copy effect rows into EffectSpec so that callers editing the DB
     don't mutate a running effect mid-frame. To apply edits, stop +
-    re-play the effect (the router does this automatically on update)."""
+    re-play the effect (the router does this automatically on update).
+
+    Layer-aware fields (``layer_id``, ``z_index``, ``blend_mode``,
+    ``opacity``, ``mask_light_ids``, ``solo``, ``mute``) are populated
+    when the spec was built from an :class:`EffectLayer` row; legacy
+    callers that play a bare :class:`Effect` row default these fields
+    to "single layer with normal blending"."""
 
     handle: str
     effect_id: Optional[int]  # None for transient live effects
@@ -72,6 +78,13 @@ class EffectSpec:
     fade_in_s: float = 0.25
     fade_out_s: float = 0.25
     target_channels: list[str] = field(default_factory=lambda: ["rgb"])
+    layer_id: Optional[int] = None
+    z_index: int = 100
+    blend_mode: str = "normal"
+    opacity: float = 1.0
+    mask_light_ids: list[int] = field(default_factory=list)
+    solo: bool = False
+    mute: bool = False
 
     @property
     def script_meta(self) -> dict[str, Any]:
@@ -93,6 +106,14 @@ class RunState:
     touched: set[int] = field(default_factory=set)
     # Frames-since-start counter (cheap script-side seed).
     frame: int = 0
+    # Layer telemetry surfaced via ``active_snapshot`` and the WS layer
+    # store. ``last_error`` is sticky until the engine renders a clean
+    # tick again so the UI can flag a failing layer until the user
+    # acknowledges it.
+    last_error: Optional[str] = None
+    last_tick_ms: float = 0.0
+    error_count: int = 0
+    auto_muted: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +193,86 @@ def build_spec_from_effect(
     )
 
 
+def build_spec_from_layer(
+    layer: EffectLayer,
+    effect: Optional[Effect],
+    palette: Optional[Palette],
+) -> EffectSpec:
+    """Compile + snapshot an :class:`EffectLayer` for engine playback.
+
+    The layer's ``params_override`` shallow-merges over the referenced
+    effect row's ``params``; everything else (blend_mode, opacity,
+    mask, z_index, etc.) is layer-owned and not stored on the effect.
+    Layers without an ``effect_id`` (live transient layers) are not
+    supported by this builder — callers should construct the
+    :class:`EffectSpec` directly in that case."""
+    if effect is None:
+        raise ScriptError(
+            f"layer {layer.id} references missing effect {layer.effect_id}"
+        )
+    src = _resolve_source(effect)
+    script = compile_script(src, chunkname=f"=layer[{layer.id}]")
+    schema = list(script.meta.param_schema)
+    raw_params = dict(effect.params or {})
+    raw_params.update(layer.params_override or {})
+    intensity_legacy, fade_in_legacy, fade_out_legacy, params = _split_params(
+        raw_params, schema
+    )
+    # Layer rows own intensity/fade outright; legacy values from the
+    # effect row are only used when the layer hasn't set them.
+    intensity = float(layer.intensity)
+    if intensity != 1.0:
+        pass
+    elif intensity_legacy != 1.0:
+        intensity = intensity_legacy
+    fade_in = float(layer.fade_in_s)
+    if fade_in == 0.25 and fade_in_legacy != 0.25:
+        fade_in = fade_in_legacy
+    fade_out = float(layer.fade_out_s)
+    if fade_out == 0.25 and fade_out_legacy != 0.25:
+        fade_out = fade_out_legacy
+
+    colors = _resolve_palette_colors(palette)
+    light_ids = list(layer.light_ids or effect.light_ids or [])
+    targets = list(layer.targets or effect.targets or [])
+    if not light_ids and not targets:
+        try:
+            with Session(db_engine) as sess:
+                rows = sess.exec(select(Light.id)).all()
+                light_ids = [r for r in rows if r is not None]
+        except Exception:
+            log.exception(
+                "failed to resolve 'all lights' for layer %s", layer.id
+            )
+
+    target_channels = list(
+        layer.target_channels or effect.target_channels or ["rgb"]
+    )
+
+    return EffectSpec(
+        handle=new_handle(),
+        effect_id=effect.id,
+        name=layer.name or effect.name,
+        script=script,
+        palette_colors=colors,
+        light_ids=light_ids,
+        targets=targets,
+        spread=layer.spread or effect.spread,
+        params=params,
+        intensity=intensity,
+        fade_in_s=fade_in,
+        fade_out_s=fade_out,
+        target_channels=target_channels,
+        layer_id=layer.id,
+        z_index=int(layer.z_index),
+        blend_mode=str(layer.blend_mode or "normal"),
+        opacity=float(layer.opacity),
+        mask_light_ids=list(layer.mask_light_ids or []),
+        solo=bool(layer.solo),
+        mute=bool(layer.mute),
+    )
+
+
 def _split_params(
     raw: dict[str, Any], schema: list[dict[str, Any]]
 ) -> tuple[float, float, float, dict[str, Any]]:
@@ -208,7 +309,6 @@ class EffectEngine:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         self._active: dict[str, RunState] = {}
-        self._pending_starts: list[EffectSpec] = []
         self._pending_stops: list[str] = []
         self._pending_stop_all: bool = False
 
@@ -216,6 +316,15 @@ class EffectEngine:
         self._lights_by_id: dict[int, Light] = {}
         self._modes_by_id: dict[int, LightModelMode] = {}
         self._palettes_by_id: dict[int, Palette] = {}
+
+        # Telemetry (engine-wide, surfaced on /api/health).
+        self._tick_count: int = 0
+        self._dropped_frames: int = 0
+        self._last_tick_ms: float = 0.0
+        self._auto_mute_threshold: int = 5
+
+        # WS subscribers — async callbacks invoked when layer state changes.
+        self._listeners: set[asyncio.Queue[dict]] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -245,25 +354,36 @@ class EffectEngine:
     # Public API (thread-safe)
     # ------------------------------------------------------------------
     def play(self, spec: EffectSpec) -> str:
-        with self._lock:
-            if spec.effect_id is not None:
-                for handle, rs in list(self._active.items()):
-                    if (
-                        rs.spec.effect_id == spec.effect_id
-                        and rs.fade_out_start is None
-                    ):
-                        self._pending_stops.append(handle)
-            self._pending_starts.append(spec)
-            return spec.handle
+        """Add a layer to the running stack.
 
-    def stop_by_handle(self, handle: str) -> bool:
+        Two semantic shifts from the pre-layer engine:
+
+        * No auto-stop of other instances of the same effect — every
+          layer is an explicit instance, so two ``+ Wash`` clicks land
+          two stacked layers (use blend/opacity to control how they
+          combine).
+        * Synchronous registration: the new spec is in ``_active`` the
+          moment this returns, so callers can read it back via
+          ``layer_snapshot()`` without waiting for the next tick.
+        """
         with self._lock:
-            if handle in self._active:
+            self._active[spec.handle] = RunState(
+                spec=spec, started_at=time.monotonic()
+            )
+        self._broadcast_layers()
+        return spec.handle
+
+    def stop_by_handle(self, handle: str, immediate: bool = False) -> bool:
+        with self._lock:
+            if handle not in self._active:
+                return False
+            if immediate:
+                self._active.pop(handle, None)
+            else:
                 self._pending_stops.append(handle)
-                return True
-            return False
+            return True
 
-    def stop_by_effect_id(self, effect_id: int) -> int:
+    def stop_by_effect_id(self, effect_id: int, immediate: bool = False) -> int:
         with self._lock:
             hits = [
                 h
@@ -271,19 +391,26 @@ class EffectEngine:
                 if rs.spec.effect_id == effect_id
                 and rs.fade_out_start is None
             ]
-            self._pending_stops.extend(hits)
+            if immediate:
+                for h in hits:
+                    self._active.pop(h, None)
+            else:
+                self._pending_stops.extend(hits)
             return len(hits)
 
-    def stop_all(self) -> int:
+    def stop_all(self, immediate: bool = False) -> int:
         with self._lock:
             n = len([
                 rs for rs in self._active.values()
                 if rs.fade_out_start is None
             ])
-            self._pending_stop_all = True
+            if immediate:
+                self._active.clear()
+            else:
+                self._pending_stop_all = True
             return n
 
-    def stop_affecting(self, light_ids: set[int]) -> int:
+    def stop_affecting(self, light_ids: set[int], immediate: bool = False) -> int:
         if not light_ids:
             return 0
         targets = set(light_ids)
@@ -301,21 +428,71 @@ class EffectEngine:
                     covers |= rs.touched
                 if not covers or covers & targets:
                     hits.append(handle)
-            self._pending_stops.extend(hits)
+            if immediate:
+                for h in hits:
+                    self._active.pop(h, None)
+            else:
+                self._pending_stops.extend(hits)
             return len(hits)
 
+    def patch_layer(self, handle: str, patch: dict) -> bool:
+        """Apply a property patch to an active layer (mute/solo/
+        opacity/blend_mode/z_index/intensity/mask_light_ids).
+
+        Patches apply synchronously under the engine lock so callers
+        can read the new state back immediately. The compositor reads
+        layer state inside ``_tick`` under the same lock so there's no
+        mid-frame race."""
+        with self._lock:
+            rs = self._active.get(handle)
+            if rs is None:
+                return False
+            self._apply_layer_patch(rs, dict(patch))
+        self._broadcast_layers()
+        return True
+
     def active_snapshot(self) -> list[dict]:
+        return self.layer_snapshot()
+
+    def layer_snapshot(self) -> list[dict]:
+        """Snapshot of every active layer (used by the WS layer store)."""
         now = time.monotonic()
         with self._lock:
-            return [
-                {
-                    "id": rs.spec.effect_id,
+            out: list[dict] = []
+            for handle, rs in self._active.items():
+                spec = rs.spec
+                out.append({
                     "handle": handle,
-                    "name": rs.spec.name,
+                    "id": spec.effect_id,
+                    "layer_id": spec.layer_id,
+                    "name": spec.name,
                     "runtime_s": max(0.0, now - rs.started_at),
-                }
-                for handle, rs in self._active.items()
-            ]
+                    "z_index": spec.z_index,
+                    "blend_mode": spec.blend_mode,
+                    "opacity": spec.opacity,
+                    "intensity": spec.intensity,
+                    "target_channels": list(spec.target_channels),
+                    "mute": spec.mute or rs.auto_muted,
+                    "solo": spec.solo,
+                    "auto_muted": rs.auto_muted,
+                    "stopping": rs.fade_out_start is not None,
+                    "error": rs.last_error,
+                    "error_count": rs.error_count,
+                    "last_tick_ms": rs.last_tick_ms,
+                    "mask_light_ids": list(spec.mask_light_ids),
+                })
+            out.sort(key=lambda l: (l["z_index"], l["layer_id"] or 0, l["handle"]))
+            return out
+
+    def health_snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "tick_count": self._tick_count,
+                "dropped_frames": self._dropped_frames,
+                "last_tick_ms": self._last_tick_ms,
+                "active_layers": len(self._active),
+                "tick_hz": TICK_HZ,
+            }
 
     def is_effect_active(self, effect_id: int) -> bool:
         with self._lock:
@@ -324,6 +501,54 @@ class EffectEngine:
                 and rs.fade_out_start is None
                 for rs in self._active.values()
             )
+
+    def stop_by_layer_id(self, layer_id: int, immediate: bool = False) -> int:
+        with self._lock:
+            hits = [
+                h for h, rs in self._active.items()
+                if rs.spec.layer_id == layer_id and rs.fade_out_start is None
+            ]
+            if immediate:
+                for h in hits:
+                    self._active.pop(h, None)
+            else:
+                self._pending_stops.extend(hits)
+            return len(hits)
+
+    def find_handle_for_layer(self, layer_id: int) -> Optional[str]:
+        with self._lock:
+            for handle, rs in self._active.items():
+                if rs.spec.layer_id == layer_id:
+                    return handle
+            return None
+
+    # ------------------------------------------------------------------
+    # WS broadcast plumbing
+    # ------------------------------------------------------------------
+    def subscribe(self, q: asyncio.Queue) -> None:
+        with self._lock:
+            self._listeners.add(q)
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        with self._lock:
+            self._listeners.discard(q)
+
+    def _broadcast_layers(self) -> None:
+        if self._loop is None:
+            return
+        snapshot = {
+            "type": "layers",
+            "layers": self.layer_snapshot(),
+            "health": self.health_snapshot(),
+        }
+        with self._lock:
+            queues = list(self._listeners)
+        for q in queues:
+            try:
+                self._loop.call_soon_threadsafe(q.put_nowait, snapshot)
+            except Exception:
+                # Queue closed/full — drop silently; caller will reconnect.
+                pass
 
     # ------------------------------------------------------------------
     # Tick loop
@@ -353,18 +578,15 @@ class EffectEngine:
                 log.exception("effect engine shutdown cleanup failed")
 
     def _tick(self) -> None:
-        now = time.monotonic()
+        tick_start = time.monotonic()
+        now = tick_start
 
         with self._lock:
-            starts = self._pending_starts
             stops = self._pending_stops
             stop_all = self._pending_stop_all
-            self._pending_starts = []
             self._pending_stops = []
             self._pending_stop_all = False
-
-        for spec in starts:
-            self._active[spec.handle] = RunState(spec=spec, started_at=now)
+            self._tick_count += 1
 
         if stop_all:
             for rs in self._active.values():
@@ -375,21 +597,44 @@ class EffectEngine:
             if rs and rs.fade_out_start is None:
                 rs.fade_out_start = now
 
+        layers_changed = bool(stops or stop_all)
+
         if not self._active:
+            if layers_changed:
+                self._broadcast_layers()
             return
 
         self._refresh_snapshots()
 
-        per_light: dict[
-            int, list[tuple[LightOverlay, float, list[str]]]
-        ] = {}
+        # Deterministic bottom-up layer order: lower z_index renders
+        # first; ties broken by layer_id then handle.
+        ordered = sorted(
+            self._active.items(),
+            key=lambda it: (
+                it[1].spec.z_index,
+                it[1].spec.layer_id or 0,
+                it[0],
+            ),
+        )
+
+        any_solo = any(
+            rs.spec.solo for _, rs in ordered if not rs.spec.mute
+        )
+
+        per_layer_overlays: list[
+            tuple[str, RunState, dict[int, LightOverlay], float]
+        ] = []
         completed_handles: list[str] = []
 
-        for handle, rs in list(self._active.items()):
+        for handle, rs in ordered:
             spec = rs.spec
+            if spec.mute or rs.auto_muted:
+                continue
+            if any_solo and not spec.solo:
+                continue
+
             fade_in = float(spec.fade_in_s)
             fade_out = float(spec.fade_out_s)
-
             age = max(0.0, now - rs.started_at)
             fade_weight = 1.0
             if fade_in > 0.0 and age < fade_in:
@@ -405,47 +650,71 @@ class EffectEngine:
                 if fade_weight <= 0.0:
                     completed_handles.append(handle)
 
-            t = age
+            layer_start = time.monotonic()
             try:
                 overlays = compute_lua_overlays(
                     spec=spec,
-                    t=t,
+                    t=age,
                     frame=rs.frame,
                     lights_by_id=self._lights_by_id,
                     modes_by_id=self._modes_by_id,
                 )
             except ScriptError as e:
+                rs.error_count += 1
+                rs.last_error = str(e)
                 log.warning(
-                    "effect %s (%s) script error: %s; auto-stopping",
-                    spec.effect_id, spec.name, e,
+                    "layer %s (%s) script error #%d: %s",
+                    spec.layer_id or spec.effect_id, spec.name,
+                    rs.error_count, e,
                 )
-                if rs.fade_out_start is None:
-                    rs.fade_out_start = now
+                # Auto-mute after repeated failures so a bad script
+                # can't take the rest of the rig down with it.
+                if rs.error_count >= self._auto_mute_threshold:
+                    rs.auto_muted = True
+                    log.warning(
+                        "auto-muting layer %s after %d errors",
+                        spec.layer_id or spec.effect_id, rs.error_count,
+                    )
                 continue
+            rs.last_tick_ms = (time.monotonic() - layer_start) * 1000.0
+            rs.last_error = None
             rs.frame += 1
 
+            mask = set(spec.mask_light_ids or [])
+            if mask:
+                overlays = {
+                    lid: ov for lid, ov in overlays.items() if lid in mask
+                }
             rs.touched = set(overlays.keys())
-            tc = list(spec.target_channels or ["rgb"])
-            effective = fade_weight * spec.intensity
-            for lid, ov in overlays.items():
-                per_light.setdefault(lid, []).append((ov, effective, tc))
+            effective = fade_weight * max(0.0, min(1.0, spec.intensity))
+            per_layer_overlays.append((handle, rs, overlays, effective))
 
-        for lid, contributions in per_light.items():
+        # Aggregate the set of lights touched anywhere in the stack.
+        touched_lights: set[int] = set()
+        for _, _, overlays, _ in per_layer_overlays:
+            touched_lights.update(overlays.keys())
+
+        # Composite bottom-to-top per light.
+        for lid in touched_lights:
             light = self._lights_by_id.get(lid)
             if light is None:
                 continue
-            base_state = self._base_state_for(light)
-            state = base_state
             zone_ids = set(zone_ids_for_light(light, self._modes_by_id))
             policy = self._policy_for_light(light)
-            for overlay, fade_weight, target_channels in contributions:
+            state = self._base_state_for(light)
+            for _, rs, overlays, eff in per_layer_overlays:
+                ov = overlays.get(lid)
+                if ov is None:
+                    continue
                 state = merge_overlay_into_state(
                     state,
-                    overlay,
+                    ov,
                     zone_ids,
-                    fade_weight,
+                    eff,
                     policy,
-                    target_channels,
+                    list(rs.spec.target_channels or ["rgb"]),
+                    blend_mode=rs.spec.blend_mode,
+                    layer_opacity=rs.spec.opacity,
                 )
             manager.set_light_state_deferred(lid, state)
 
@@ -461,7 +730,7 @@ class EffectEngine:
                 if rs is None:
                     continue
                 for lid in rs.touched:
-                    if lid not in still_covered and lid not in per_light:
+                    if lid not in still_covered and lid not in touched_lights:
                         to_restore.add(lid)
             for lid in to_restore:
                 light = self._lights_by_id.get(lid)
@@ -470,8 +739,64 @@ class EffectEngine:
                 manager.set_light_state_deferred(
                     lid, self._base_state_for(light)
                 )
+            layers_changed = True
 
         manager.flush_dirty()
+
+        elapsed_ms = (time.monotonic() - tick_start) * 1000.0
+        with self._lock:
+            self._last_tick_ms = elapsed_ms
+            if elapsed_ms > (1000.0 / TICK_HZ) * 1.5:
+                self._dropped_frames += 1
+
+        if layers_changed:
+            self._broadcast_layers()
+
+    def _apply_layer_patch(self, rs: RunState, patch: dict) -> None:
+        """Apply a runtime patch to a layer's spec.
+
+        Only a small whitelist of fields can change at runtime; ignore
+        everything else so a sloppy client can't replace the layer's
+        Lua source out from under us mid-tick."""
+        spec = rs.spec
+        if "mute" in patch:
+            spec.mute = bool(patch["mute"])
+            if not spec.mute:
+                rs.auto_muted = False
+                rs.error_count = 0
+        if "solo" in patch:
+            spec.solo = bool(patch["solo"])
+        if "opacity" in patch:
+            try:
+                spec.opacity = max(0.0, min(1.0, float(patch["opacity"])))
+            except (TypeError, ValueError):
+                pass
+        if "intensity" in patch:
+            try:
+                spec.intensity = max(0.0, min(1.0, float(patch["intensity"])))
+            except (TypeError, ValueError):
+                pass
+        if "blend_mode" in patch:
+            mode = patch["blend_mode"]
+            if isinstance(mode, str):
+                spec.blend_mode = mode
+        if "z_index" in patch:
+            try:
+                spec.z_index = int(patch["z_index"])
+            except (TypeError, ValueError):
+                pass
+        if "mask_light_ids" in patch:
+            ids = patch.get("mask_light_ids") or []
+            if isinstance(ids, list):
+                spec.mask_light_ids = [
+                    int(x) for x in ids if isinstance(x, (int, float))
+                ]
+        if "target_channels" in patch:
+            tc = patch.get("target_channels") or []
+            if isinstance(tc, list):
+                spec.target_channels = [
+                    str(x) for x in tc if isinstance(x, str)
+                ] or ["rgb"]
 
     # ------------------------------------------------------------------
     # DB snapshot helpers

@@ -64,6 +64,7 @@ from ..lua import (
     get_builtin_source,
 )
 from ..lua.runtime import merge_with_schema
+from .. import lua_refiner
 from ..schemas import (
     DesignerApplyRequest,
     DesignerConversationCreate,
@@ -319,8 +320,22 @@ def _build_effect_tool_schema() -> dict[str, Any]:
                                 "type": "string",
                                 "description": (
                                     "Custom Lua script. Must define "
-                                    "render(ctx) or tick(ctx). See the "
-                                    "Lua effect API in the system prompt."
+                                    "render(ctx) or tick(ctx). ctx fields "
+                                    "are EXACTLY: ctx.t (seconds), ctx.i "
+                                    "(slot index, 0..n-1), ctx.n (slot "
+                                    "count), ctx.frame, ctx.seed, "
+                                    "ctx.palette, ctx.params, ctx.slot — "
+                                    "NOT ctx.time_s / ctx.index / "
+                                    "ctx.count. render() MUST return "
+                                    "{ r = INT(0..255), g = INT(0..255), "
+                                    "b = INT(0..255), brightness = "
+                                    "FLOAT(0..1), active = true } using "
+                                    "named keys. ctx.palette helpers "
+                                    "(:smooth, :step, :get) and "
+                                    "color.hsv / color.hex return THREE "
+                                    "numbers (r, g, b), not a table. "
+                                    "Use ``local r, g, b = "
+                                    "ctx.palette:smooth(p)``."
                                 ),
                             },
                             "palette_id": {"type": "integer"},
@@ -400,6 +415,20 @@ _SYSTEM_INTRO = (
     "look, use propose_rig_design. If they ask for 'colors' or a "
     "palette, use propose_palette. If they ask for motion, use "
     "propose_effect.\n\n"
+    "You CAN and SHOULD call multiple tools in a single turn when the "
+    "request implies more than one thing. For example, 'design a "
+    "cyberpunk theme with a flicker' should be ONE turn that calls "
+    "BOTH propose_rig_design (the static cyberpunk wash) AND "
+    "propose_effect (the flicker overlay). 'Sunset show with a chase' "
+    "= propose_rig_design + propose_effect. 'Build a halloween palette "
+    "and a strobe' = propose_palette + propose_effect. The UI shows "
+    "every proposal as its own card; the user picks which to apply.\n\n"
+    "When you need a custom Lua effect, the server runs a smoke test "
+    "and a refiner sub-agent on your script before showing it to the "
+    "user — but it's still cheaper and more reliable to start from a "
+    "builtin (chase / pulse / strobe / sparkle / wave / fade / "
+    "rainbow / cycle / static) and just override params. Only emit "
+    "raw ``source`` when no builtin can express the look.\n\n"
     "Rules:\n"
     "- Only reference light_id / controller_id / palette_id values that "
     "exist in the rig snapshot.\n"
@@ -659,6 +688,86 @@ def _sanitize_effect_controls(raw: Any) -> dict[str, float]:
     return out
 
 
+async def _refine_effect_proposal(
+    prop: dict[str, Any],
+    sess: Session,
+    *,
+    sse_queue: Optional[asyncio.Queue],
+) -> Optional[dict[str, Any]]:
+    """Smoke-test an effect proposal's Lua script; on failure, hand it
+    to :func:`app.lua_refiner.refine_lua_source` and substitute the
+    returned source/params. Returns ``None`` when the script can't be
+    rescued.
+
+    Runs the (sync, blocking) Anthropic call in a worker thread so the
+    SSE event loop keeps draining its queue."""
+    body = prop.get("effect")
+    if not isinstance(body, dict):
+        return prop
+    source = body.get("source")
+    if not isinstance(source, str) or not source.strip():
+        return None
+
+    palette_id = body.get("palette_id")
+    palette_colors: list[str] = ["#FFFFFF"]
+    if isinstance(palette_id, int):
+        pal = sess.get(Palette, palette_id)
+        if pal and pal.colors:
+            palette_colors = list(pal.colors)
+
+    req = lua_refiner.RefineRequest(
+        proposal_id=str(prop.get("proposal_id") or ""),
+        name=str(prop.get("name") or "Effect"),
+        source=source,
+        params=dict(body.get("params") or {}),
+        summary=str(prop.get("notes") or ""),
+        palette_colors=palette_colors,
+    )
+    result = await asyncio.to_thread(lua_refiner.refine_lua_source, req)
+    if result.attempts > 0 and sse_queue is not None:
+        # Surface progress to the UI so the user knows we paused to
+        # validate the script. Best-effort: drop on a full queue.
+        try:
+            sse_queue.put_nowait(
+                (
+                    "refine",
+                    {
+                        "proposal_id": req.proposal_id,
+                        "name": req.name,
+                        "attempts": result.attempts,
+                        "ok": result.ok,
+                    },
+                )
+            )
+        except asyncio.QueueFull:
+            pass
+    if not result.ok:
+        log.warning(
+            "designer dropping effect proposal %r after %d refine "
+            "attempts: %s",
+            req.name, result.attempts,
+            result.error.message if result.error else "unknown",
+        )
+        return None
+
+    # Re-compile so we can refresh the schema in case the refined
+    # script declared different PARAMS than the original.
+    try:
+        script = compile_script(result.source, chunkname="=designer-refined")
+    except ScriptError:
+        return None
+    new_body = dict(body)
+    new_body["source"] = result.source
+    new_body["params"] = merge_with_schema(
+        list(script.meta.param_schema), result.params
+    )
+    new_body["param_schema"] = list(script.meta.param_schema)
+    new_body["description"] = script.meta.description
+    out = dict(prop)
+    out["effect"] = new_body
+    return out
+
+
 def _sanitize_effect_proposal(
     raw: Any,
     *,
@@ -691,10 +800,18 @@ def _sanitize_effect_proposal(
             source = get_builtin_source(builtin.strip())
     if source is None:
         return None
+    # Try to compile so we can stash the parsed param schema. If the
+    # compile fails (e.g. Claude wrote a module-style script with a
+    # ``return { render = render }`` block), fall through with a stub
+    # schema and rely on the refiner sub-agent to repair the source.
     try:
         script = compile_script(source, chunkname="=designer")
+        param_schema_raw = list(script.meta.param_schema)
+        description = script.meta.description
     except ScriptError:
-        return None
+        script = None
+        param_schema_raw = []
+        description = ""
 
     spread = raw.get("spread")
     if spread not in _SPREAD_SET:
@@ -716,16 +833,14 @@ def _sanitize_effect_proposal(
                 if c not in seen:
                     seen.append(c)
             tc = seen
-    params = merge_with_schema(
-        list(script.meta.param_schema), raw.get("params") or {}
-    )
+    params = merge_with_schema(param_schema_raw, raw.get("params") or {})
     controls = _sanitize_effect_controls(raw.get("controls"))
     notes = raw.get("notes")
     notes_str = str(notes).strip()[:500] if notes else None
     body: dict[str, Any] = {
         "source": source,
-        "param_schema": list(script.meta.param_schema),
-        "description": script.meta.description,
+        "param_schema": list(param_schema_raw),
+        "description": description,
         "palette_id": palette_id,
         "spread": spread,
         "params": params,
@@ -1548,32 +1663,92 @@ async def stream_message(
         # Persist the turn and emit proposal + done.
         assistant_msg = {"role": "assistant", "content": final_content_blocks}
         user_msg = {"role": "user", "content": user_text}
-        proposals_clean: list[dict[str, Any]] = []
-        summary_text = ""
-        for block in final_content_blocks:
-            if (
-                block.get("type") == "tool_use"
-                and block.get("name") in _DESIGNER_TOOL_NAMES
-            ):
-                summary_text, proposals_clean = _sanitize_tool_payload(
-                    block.get("input"), sess, tool_name=block.get("name"),
-                )
-                break
 
-        # Rewrite the tool_use input in place with the sanitized payload so
-        # the stored history matches what we'll later Apply/Save on. The
-        # stored shape is always the same ("summary" + "proposals") even
-        # though the raw Claude input differs per tool.
+        # Claude can call multiple tools in a single turn (e.g.
+        # ``propose_rig_design`` + ``propose_effect`` for "design a
+        # cyberpunk theme with a flicker"). Walk every tool_use block,
+        # sanitize each independently, and rewrite each block's input
+        # in place with the cleaned slice — then merge the slices into
+        # one unified ``proposals_clean`` list for ``last_proposal`` so
+        # Apply/Save can find every proposal the UI shows. Earlier code
+        # broke after the first tool, which silently dropped any extra
+        # tool's proposals and surfaced "unknown proposal_id" errors.
+        proposals_clean: list[dict[str, Any]] = []
+        summary_parts: list[str] = []
+        seen_pids: set[str] = set()
         for block in final_content_blocks:
             if (
-                block.get("type") == "tool_use"
-                and block.get("name") in _DESIGNER_TOOL_NAMES
+                block.get("type") != "tool_use"
+                or block.get("name") not in _DESIGNER_TOOL_NAMES
             ):
-                block["input"] = {
-                    "summary": summary_text,
-                    "proposals": proposals_clean,
-                }
-                break
+                continue
+            block_summary, block_proposals = _sanitize_tool_payload(
+                block.get("input"), sess, tool_name=block.get("name"),
+            )
+            # Drop duplicate proposal_ids across tools so the apply
+            # lookup remains unambiguous.
+            unique: list[dict[str, Any]] = []
+            for prop in block_proposals:
+                pid = str(prop.get("proposal_id") or "")
+                if not pid or pid in seen_pids:
+                    continue
+                seen_pids.add(pid)
+                unique.append(prop)
+            block["input"] = {
+                "summary": block_summary,
+                "proposals": unique,
+            }
+            if block_summary:
+                summary_parts.append(block_summary)
+            proposals_clean.extend(unique)
+        summary_text = "\n\n".join(s for s in summary_parts if s)
+
+        # Run the Lua refiner sub-agent on every effect proposal whose
+        # script doesn't pass the smoke test. This catches runtime
+        # errors that ``compile_script`` alone would let through (nil
+        # lookups, palette helper misuse, etc.) so the user never sees
+        # an Apply that 400s on a broken script. The refiner is happy
+        # to no-op when the script is fine, so the cost on healthy
+        # turns is just one local smoke run per effect.
+        refined_proposals: list[dict[str, Any]] = []
+        for prop in proposals_clean:
+            if prop.get("kind") != "effect":
+                refined_proposals.append(prop)
+                continue
+            refined = await _refine_effect_proposal(prop, sess, sse_queue=None)
+            if refined is None:
+                # Couldn't get the script clean; drop the card rather
+                # than hand the user something un-applyable.
+                yield _sse_event(
+                    "refine_dropped",
+                    {
+                        "proposal_id": prop.get("proposal_id"),
+                        "name": prop.get("name"),
+                    },
+                )
+                continue
+            refined_proposals.append(refined)
+        proposals_clean = refined_proposals
+
+        # Mirror the refined payloads back into the assistant's stored
+        # tool_use blocks so message history matches what's applyable.
+        for block in final_content_blocks:
+            inp = block.get("input")
+            if not isinstance(inp, dict):
+                continue
+            existing = inp.get("proposals")
+            if not isinstance(existing, list):
+                continue
+            kept_ids = {p.get("proposal_id") for p in proposals_clean}
+            inp["proposals"] = [
+                next(
+                    (rp for rp in proposals_clean
+                     if rp.get("proposal_id") == ep.get("proposal_id")),
+                    ep,
+                )
+                for ep in existing
+                if ep.get("proposal_id") in kept_ids
+            ]
 
         try:
             refreshed = sess.get(DesignerConversation, conversation_id)
