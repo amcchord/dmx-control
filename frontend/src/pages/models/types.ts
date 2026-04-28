@@ -1,6 +1,7 @@
 import type {
   ChannelPolicy,
   ColorPolicy,
+  ColorTable,
   FixtureLayout,
   LightModel,
   LightModelMode,
@@ -23,6 +24,7 @@ export const ROLES = [
   "strobe",
   "macro",
   "speed",
+  "color",
   "pan",
   "pan_fine",
   "tilt",
@@ -47,6 +49,7 @@ export const ROLE_COLORS: Record<string, string> = {
   strobe: "#fff566",
   macro: "#8791a7",
   speed: "#8791a7",
+  color: "#e066c4",
   pan: "#6ba2ff",
   pan_fine: "#4e7bc9",
   tilt: "#6ba2ff",
@@ -103,6 +106,7 @@ export type ModeDraft = {
   is_default: boolean;
   layout: FixtureLayout | null;
   color_policy: ColorPolicy;
+  color_table: ColorTable | null;
 };
 
 export type Form = {
@@ -114,6 +118,14 @@ export type Form = {
 let _modeKeyCounter = 0;
 export const newModeKey = () => `m-${Date.now()}-${++_modeKeyCounter}`;
 
+const cloneColorTable = (t?: ColorTable | null): ColorTable | null => {
+  if (!t || !Array.isArray(t.entries) || !t.entries.length) return null;
+  return {
+    entries: t.entries.map((e) => ({ ...e })),
+    ...(typeof t.off_below === "number" ? { off_below: t.off_below } : {}),
+  };
+};
+
 export const toDraft = (m: LightModelMode): ModeDraft => ({
   key: `m-${m.id}`,
   id: m.id,
@@ -122,6 +134,7 @@ export const toDraft = (m: LightModelMode): ModeDraft => ({
   is_default: m.is_default,
   layout: m.layout ?? null,
   color_policy: { ...(m.color_policy ?? {}) },
+  color_table: cloneColorTable(m.color_table),
 });
 
 export const blankForm = (): Form => {
@@ -136,6 +149,7 @@ export const blankForm = (): Form => {
         is_default: true,
         layout: null,
         color_policy: {},
+        color_table: null,
       },
     ],
     activeKey: key,
@@ -153,6 +167,7 @@ export const fromModel = (m: LightModel): Form => {
           is_default: true,
           layout: null,
           color_policy: {} as ColorPolicy,
+          color_table: null,
         },
       ];
   return {
@@ -172,6 +187,11 @@ export const draftsToPayload = (
     is_default: d.is_default,
     layout: d.layout ?? null,
     color_policy: { ...d.color_policy },
+    // Drop the table when the mode has no `color` slot — server will
+    // do the same, but keeping it consistent makes the payload smaller
+    // and avoids stale tables when a user removes the `color` channel.
+    color_table:
+      d.color_table && d.channels.includes("color") ? d.color_table : null,
   }));
 
 /** Return the current policy for one role on a draft, defaulting to "mix". */

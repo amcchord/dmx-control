@@ -45,6 +45,7 @@ def _mode_out(row: LightModelMode) -> LightModelModeOut:
         is_default=row.is_default,
         layout=row.layout,
         color_policy=dict(row.color_policy or {}),
+        color_table=row.color_table if isinstance(row.color_table, dict) else None,
     )
 
 
@@ -103,6 +104,9 @@ def _create_modes(
             is_default=mode.is_default,
             layout=mode.layout if isinstance(mode.layout, dict) else None,
             color_policy=dict(mode.color_policy or {}),
+            color_table=(
+                mode.color_table if isinstance(mode.color_table, dict) else None
+            ),
         )
         sess.add(row)
         created.append(row)
@@ -150,6 +154,11 @@ def update_model(
     seen_ids: set[int] = set()
     for mode_in in incoming:
         layout = mode_in.layout if isinstance(mode_in.layout, dict) else None
+        color_table = (
+            mode_in.color_table
+            if isinstance(mode_in.color_table, dict)
+            else None
+        )
         if mode_in.id is not None and mode_in.id in existing:
             row = existing[mode_in.id]
             row.name = mode_in.name
@@ -158,6 +167,7 @@ def update_model(
             row.is_default = mode_in.is_default
             row.layout = layout
             row.color_policy = dict(mode_in.color_policy or {})
+            row.color_table = color_table
             sess.add(row)
             seen_ids.add(mode_in.id)
         else:
@@ -169,6 +179,7 @@ def update_model(
                 is_default=mode_in.is_default,
                 layout=layout,
                 color_policy=dict(mode_in.color_policy or {}),
+                color_table=color_table,
             )
             sess.add(row)
 
@@ -241,6 +252,11 @@ def clone_model(mid: int, sess: Session = Depends(get_session)) -> LightModelOut
                 is_default=mode.is_default,
                 layout=mode.layout if isinstance(mode.layout, dict) else None,
                 color_policy=dict(mode.color_policy or {}),
+                color_table=(
+                    mode.color_table
+                    if isinstance(mode.color_table, dict)
+                    else None
+                ),
             )
         )
     sess.commit()
@@ -280,6 +296,11 @@ def add_mode(
         is_default=payload.is_default,
         layout=payload.layout if isinstance(payload.layout, dict) else None,
         color_policy=dict(payload.color_policy or {}),
+        color_table=(
+            payload.color_table
+            if isinstance(payload.color_table, dict)
+            else None
+        ),
     )
     sess.add(row)
     sess.flush()
@@ -320,6 +341,11 @@ def update_mode(
     row.channel_count = len(payload.channels)
     row.layout = payload.layout if isinstance(payload.layout, dict) else None
     row.color_policy = dict(payload.color_policy or {})
+    row.color_table = (
+        payload.color_table
+        if isinstance(payload.color_table, dict)
+        else None
+    )
     if payload.is_default and not row.is_default:
         for r in _modes_for(sess, mid):
             if r.id != mode_id and r.is_default:

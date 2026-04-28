@@ -155,7 +155,7 @@ function LayoutBody({
   };
 
   const setGlobal = (
-    key: "dimmer" | "strobe" | "macro" | "speed",
+    key: "dimmer" | "strobe" | "macro" | "speed" | "color",
     val: number | null,
   ) => {
     const next: NonNullable<FixtureLayout["globals"]> = {
@@ -285,6 +285,8 @@ function LayoutPreview({
   const fill = (z: FixtureZone): string => {
     const hasRGB = z.colors.r != null && z.colors.g != null && z.colors.b != null;
     if (hasRGB) return "linear-gradient(135deg,#ff4d4d,#4dff6a,#4d6aff)";
+    if (z.colors.color != null)
+      return "linear-gradient(135deg,#ff4d4d,#ffd54d,#4dff6a,#4d6aff,#e066c4)";
     if (z.colors.w != null) return "#f5f5f5";
     if (z.colors.a != null) return "#ffb23d";
     if (z.colors.uv != null) return "#b44dff";
@@ -642,7 +644,7 @@ function GlobalsBlock({
   channels: string[];
   globals: NonNullable<FixtureLayout["globals"]>;
   onChange: (
-    key: "dimmer" | "strobe" | "macro" | "speed",
+    key: "dimmer" | "strobe" | "macro" | "speed" | "color",
     val: number | null,
   ) => void;
 }) {
@@ -677,6 +679,13 @@ function GlobalsBlock({
           value={(globals.speed as number | null | undefined) ?? null}
           filterRole="speed"
           onChange={(v) => onChange("speed", v)}
+        />
+        <ChannelPicker
+          label="Color (indexed)"
+          channels={channels}
+          value={(globals.color as number | null | undefined) ?? null}
+          filterRole="color"
+          onChange={(v) => onChange("color", v)}
         />
       </div>
     </div>

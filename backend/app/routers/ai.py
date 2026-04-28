@@ -46,7 +46,11 @@ _ZONE_KINDS = [
     "global",
     "other",
 ]
-_COLOR_ROLES = ["r", "g", "b", "w", "a", "uv"]
+# Roles that can be referenced from a zone's ``colors`` map. Includes
+# ``color`` so fixtures whose per-cell control is a single indexed-color
+# byte (e.g. Blizzard StormChaser 20CH) can be modeled as multi-zone with
+# a shared color_table.
+_COLOR_ROLES = ["r", "g", "b", "w", "a", "uv", "color"]
 
 
 def _build_tool_schema() -> dict[str, Any]:
@@ -129,7 +133,70 @@ def _build_tool_schema() -> dict[str, Any]:
             "strobe": {"type": "integer", "minimum": 0},
             "macro": {"type": "integer", "minimum": 0},
             "speed": {"type": "integer", "minimum": 0},
+            "color": {
+                "type": "integer",
+                "minimum": 0,
+                "description": (
+                    "Offset of a fixture-wide indexed-color slot (a single "
+                    "wheel byte that drives the whole fixture). Use only "
+                    "when the same color affects every LED. Pair with "
+                    "``color_table`` on the mode."
+                ),
+            },
         },
+    }
+
+    color_table_entry_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "description": (
+            "One preset in the fixture's indexed-color palette. ``lo`` and "
+            "``hi`` are the inclusive DMX byte range that selects this "
+            "preset (per the manual). ``r``/``g``/``b`` are the entry's "
+            "representative RGB, used for nearest-match snapping from "
+            "logical RGB."
+        ),
+        "properties": {
+            "lo": {"type": "integer", "minimum": 0, "maximum": 255},
+            "hi": {"type": "integer", "minimum": 0, "maximum": 255},
+            "name": {"type": "string"},
+            "r": {"type": "integer", "minimum": 0, "maximum": 255},
+            "g": {"type": "integer", "minimum": 0, "maximum": 255},
+            "b": {"type": "integer", "minimum": 0, "maximum": 255},
+        },
+        "required": ["lo", "hi", "r", "g", "b"],
+    }
+
+    color_table_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "description": (
+            "Indexed-color lookup table for this mode. Include only when "
+            "the mode has at least one ``color`` channel slot (per-cell or "
+            "fixture-wide). Every ``color`` slot in the mode shares this "
+            "single table — model the StormChaser-style 'one palette across "
+            "16 cells' shape with one mode-level table and per-cell zones "
+            "whose ``colors.color`` points at each cell's DMX offset."
+        ),
+        "properties": {
+            "entries": {
+                "type": "array",
+                "items": color_table_entry_schema,
+                "minItems": 1,
+                "maxItems": 64,
+            },
+            "off_below": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255,
+                "description": (
+                    "On dimmerless wheel fixtures, force the 'off' entry "
+                    "when the requested logical RGB has max(r,g,b) below "
+                    "this threshold. Default 0 disables the force-off."
+                ),
+            },
+        },
+        "required": ["entries"],
     }
 
     layout_schema = {
@@ -194,6 +261,7 @@ def _build_tool_schema() -> dict[str, Any]:
                                 ),
                             },
                             "layout": layout_schema,
+                            "color_table": color_table_schema,
                             "notes": {"type": "string"},
                         },
                         "required": ["name", "channels"],
@@ -217,30 +285,54 @@ _SYSTEM_PROMPT = (
     f"Only use these role tokens: {', '.join(_ROLE_LIST)}. Pick the closest "
     "match: 'r','g','b' for RGB color channels; 'w' for white; 'a' for amber; "
     "'uv' for ultraviolet; 'dimmer' for an intensity/master dimmer channel; "
-    "'strobe' for strobe/shutter; 'macro' for color macros or built-in "
-    "programs; 'speed' for program/strobe speed; 'pan'/'tilt' for moving-head "
-    "position (use 'pan_fine'/'tilt_fine' for 16-bit fine-adjustment bytes); "
-    "'zoom'/'focus' for moving-head optics; "
+    "'strobe' for strobe/shutter; 'macro' for AUTO PROGRAMS / chases / "
+    "sound-active programs (a channel that triggers built-in animations, "
+    "with NO fixed mapping from byte value to a single color); "
+    "'color' for an INDEXED-COLOR slot (a channel where the byte selects "
+    "from a fixed palette of preset colors — e.g. '0-15 Off, 16-31 Red, "
+    "32-47 Green, ...'). Always pair every 'color' slot with a "
+    "``color_table`` on the mode (see below); never use 'macro' for color "
+    "selection. 'speed' for program/strobe speed; 'pan'/'tilt' for "
+    "moving-head position (use 'pan_fine'/'tilt_fine' for 16-bit fine-"
+    "adjustment bytes); 'zoom'/'focus' for moving-head optics; "
     "'other' for anything that doesn't fit (e.g. sound sensitivity, "
     "dimmer curve). Always record the channel count and order faithfully even "
     "if you have to use 'other'. Return a ``notes`` field for any caveats you "
     "couldn't express in structured form. Do not invent modes — only include "
     "ones explicitly documented.\n\n"
+    "Indexed color (``color_table``): when a mode documents per-channel "
+    "byte ranges that select discrete preset colors (e.g. 'Cell N "
+    "Effects: 000-015 No Function, 016-031 Red, 032-047 Green, 048-063 "
+    "Blue, ...'), tag the affected slots with role 'color' and emit a "
+    "single mode-level ``color_table`` covering every entry. The same "
+    "table is shared by every 'color' slot in the mode — when the same "
+    "palette repeats across multiple cells (e.g. Blizzard StormChaser "
+    "20CH has 16 'Section N' channels each driven from one palette), "
+    "you only emit ONE ``color_table`` and reference each cell as a zone "
+    "whose ``colors.color`` points at that cell's 0-based offset. Always "
+    "include an explicit 'Off' (or 'No Function' / 'Blackout') entry "
+    "when the manual lists one — its ``r``/``g``/``b`` should all be 0. "
+    "For preset names without numeric RGB, use sensible approximations "
+    "from the name (Aqua≈(0,192,192), Lime≈(128,255,0), Pink≈(255,128,"
+    "192), 'Med. Blue'≈(32,64,192), 'Lt. Blue'≈(128,192,255), etc.).\n\n"
     "Compound fixtures: whenever a mode addresses multiple physical "
     "sub-elements independently (pixel bars, rings, moving-head boards, "
-    "multi-eye fixtures), also populate the per-mode ``layout`` object. Each "
-    "independently-controllable sub-element is a ``zone``; its ``colors`` "
-    "map records the 0-based channel index (within this mode's channel "
-    "list) for each color role it exposes. Use ``shape: 'linear'`` with "
-    "``cols`` for pixel bars, ``shape: 'grid'`` with ``rows``/``cols`` for "
-    "matrix panels, ``shape: 'ring'`` for halos, and ``shape: 'cluster'`` "
-    "for heterogeneous moving heads (name zones like 'Beam', 'Ball', 'Board "
+    "multi-eye fixtures, multi-cell strips), also populate the per-mode "
+    "``layout`` object. Each independently-controllable sub-element is a "
+    "``zone``; its ``colors`` map records the 0-based channel index "
+    "(within this mode's channel list) for each color role it exposes — "
+    "including 'color' for cells whose only color control is a single "
+    "indexed byte. Use ``shape: 'linear'`` with ``cols`` for pixel bars, "
+    "``shape: 'grid'`` with ``rows``/``cols`` for matrix panels, "
+    "``shape: 'ring'`` for halos, and ``shape: 'cluster'`` for "
+    "heterogeneous moving heads (name zones like 'Beam', 'Ball', 'Board "
     "1'). Use ``shape: 'single'`` (or omit ``layout`` entirely) for fixtures "
     "that address all their LEDs as one block. Record motion axes under "
     "``layout.motion`` (with ``pan_degrees``/``tilt_degrees`` when the "
     "manual documents the range) and fixture-wide channels (master dimmer, "
-    "global strobe, macro/program, speed) under ``layout.globals``. All "
-    "channel indices are 0-based offsets within the mode's channel list."
+    "global strobe, macro/program, speed, fixture-wide indexed color) "
+    "under ``layout.globals``. All channel indices are 0-based offsets "
+    "within the mode's channel list."
 )
 
 
@@ -318,15 +410,67 @@ async def parse_manual(file: UploadFile) -> dict[str, Any]:
         log.warning("Anthropic error: %s", exc)
         raise HTTPException(502, "Claude request failed") from exc
 
+    stop_reason = getattr(message, "stop_reason", None)
+    usage = getattr(message, "usage", None)
+    output_tokens = getattr(usage, "output_tokens", None) if usage else None
+
+    # When max_tokens hits mid tool_use, the Anthropic SDK still returns a
+    # tool_use block — but the partial JSON usually deserializes as ``{}``
+    # or a dict with required fields missing. _sanitize then quietly drops
+    # everything and the UI sees an empty success. Surface this as a real
+    # error so the user understands what happened.
+    if stop_reason == "max_tokens":
+        log.warning(
+            "parse_manual: hit max_tokens cap (output_tokens=%s); "
+            "raise the cap or simplify the manual",
+            output_tokens,
+        )
+        raise HTTPException(
+            502,
+            "Claude ran out of output tokens before finishing the response. "
+            "Try uploading a shorter manual or a single relevant page.",
+        )
+
     payload = _extract_tool_use(message)
     if payload is None:
+        log.warning(
+            "parse_manual: no tool_use block (stop_reason=%s, "
+            "output_tokens=%s)",
+            stop_reason,
+            output_tokens,
+        )
         raise HTTPException(
             502,
             "Claude did not return structured output. Try a clearer manual "
             "or a different page.",
         )
 
-    return _sanitize(payload)
+    result = _sanitize(payload)
+    n_modes = len(result.get("modes") or [])
+    if n_modes == 0:
+        # Tool_use was emitted but nothing survived sanitization. Log the
+        # raw input so we can diagnose without re-uploading.
+        try:
+            raw_repr = repr(payload)[:1000]
+        except Exception:
+            raw_repr = "<unrepresentable>"
+        log.warning(
+            "parse_manual: sanitization yielded 0 modes "
+            "(stop_reason=%s, output_tokens=%s, raw_keys=%s, raw=%s)",
+            stop_reason,
+            output_tokens,
+            sorted(payload.keys()) if isinstance(payload, dict) else None,
+            raw_repr,
+        )
+    else:
+        log.info(
+            "parse_manual: %d modes (stop_reason=%s, output_tokens=%s)",
+            n_modes,
+            stop_reason,
+            output_tokens,
+        )
+
+    return result
 
 
 async def _run_anthropic(client, content: list[dict[str, Any]]):
@@ -336,7 +480,12 @@ async def _run_anthropic(client, content: list[dict[str, Any]]):
     def _do_call():
         return client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=4096,
+            # Opus 4.7's new tokenizer uses up to ~35% more output tokens
+            # than 4.6, and complex pixel-bar / multi-zone fixtures emit
+            # large layout JSON. 4096 truncated mid tool_use on the OK-062
+            # manual; 32768 leaves comfortable headroom inside Opus 4.7's
+            # 128K output cap.
+            max_tokens=32768,
             system=_SYSTEM_PROMPT,
             tools=[_build_tool_schema()],
             tool_choice={"type": "tool", "name": _TOOL_NAME},
@@ -445,7 +594,7 @@ def _sanitize_layout(
     globals_: dict[str, Any] = {}
     raw_globals = raw_layout.get("globals") or {}
     if isinstance(raw_globals, dict):
-        for key in ("dimmer", "strobe", "macro", "speed"):
+        for key in ("dimmer", "strobe", "macro", "speed", "color"):
             idx = _clean_index(raw_globals.get(key), channel_count)
             if idx is not None:
                 globals_[key] = idx
@@ -463,6 +612,69 @@ def _sanitize_layout(
     if globals_:
         layout["globals"] = globals_
     return layout
+
+
+_MAX_COLOR_TABLE_ENTRIES = 64
+
+
+def _sanitize_color_table(
+    raw_table: Any, channels: list[str]
+) -> dict[str, Any] | None:
+    """Best-effort pass-through of Claude's color_table.
+
+    Returns None when the table is unusable (missing entries, every entry
+    invalid) OR when the mode has no ``color`` slot for the table to drive
+    (it would be silently ignored at render time)."""
+    if not isinstance(raw_table, dict):
+        return None
+    if "color" not in channels:
+        return None
+    raw_entries = raw_table.get("entries")
+    if not isinstance(raw_entries, list):
+        return None
+    cleaned: list[dict[str, Any]] = []
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            continue
+        try:
+            lo = int(raw_entry.get("lo"))
+            hi = int(raw_entry.get("hi"))
+            r = int(raw_entry.get("r"))
+            g = int(raw_entry.get("g"))
+            b = int(raw_entry.get("b"))
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= lo <= 255 and 0 <= hi <= 255):
+            continue
+        if not (0 <= r <= 255 and 0 <= g <= 255 and 0 <= b <= 255):
+            continue
+        if hi < lo:
+            lo, hi = hi, lo
+        name = raw_entry.get("name")
+        name_str = str(name).strip()[:32] if isinstance(name, str) else ""
+        cleaned.append(
+            {"lo": lo, "hi": hi, "name": name_str, "r": r, "g": g, "b": b}
+        )
+        if len(cleaned) >= _MAX_COLOR_TABLE_ENTRIES:
+            break
+    if not cleaned:
+        return None
+    cleaned.sort(key=lambda e: (e["lo"], e["hi"]))
+    # Drop any later entries that overlap an already-accepted one (keeps
+    # the earlier, manufacturer-documented range; mirrors the schema-side
+    # validator's rejection of overlaps).
+    deduped: list[dict[str, Any]] = []
+    for e in cleaned:
+        if deduped and e["lo"] <= deduped[-1]["hi"]:
+            continue
+        deduped.append(e)
+
+    out: dict[str, Any] = {"entries": deduped}
+    raw_off = raw_table.get("off_below")
+    if isinstance(raw_off, int) and not isinstance(raw_off, bool):
+        if 0 <= raw_off <= 255:
+            out["off_below"] = raw_off
+    return out
 
 
 def _sanitize(raw: dict[str, Any]) -> dict[str, Any]:
@@ -498,12 +710,16 @@ def _sanitize(raw: dict[str, Any]) -> dict[str, Any]:
         notes = raw_mode.get("notes")
         notes_str = str(notes).strip()[:500] if notes else None
         layout = _sanitize_layout(raw_mode.get("layout"), len(channels))
+        color_table = _sanitize_color_table(
+            raw_mode.get("color_table"), channels
+        )
         cleaned_modes.append(
             {
                 "name": name,
                 "channels": channels,
                 "notes": notes_str or None,
                 "layout": layout,
+                "color_table": color_table,
             }
         )
 

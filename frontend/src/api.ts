@@ -164,7 +164,12 @@ export type ColorRole =
   | "a"
   | "a2"
   | "uv"
-  | "uv2";
+  | "uv2"
+  /** Indexed-color slot — the byte selects from the mode's
+   *  ``color_table`` (see :class:`ColorTable`). Resolved at render time
+   *  to the closest entry's representative byte; fixtures that expose
+   *  this role appear as fake-RGB lights to the rest of the app. */
+  | "color";
 
 export type ZoneKind =
   | "pixel"
@@ -211,6 +216,9 @@ export type FixtureGlobals = {
   strobe?: number | null;
   macro?: number | null;
   speed?: number | null;
+  /** Offset of a fixture-wide indexed-color slot (a single wheel byte
+   *  driving the whole fixture). Pair with ``color_table`` on the mode. */
+  color?: number | null;
 };
 
 export type FixtureLayout = {
@@ -237,6 +245,32 @@ export type ColorPolicy = Partial<Record<PolicyRole, ChannelPolicy>>;
 export type ExtraColorRole = "w2" | "w3" | "a2" | "uv2";
 export const EXTRA_COLOR_ROLES: ExtraColorRole[] = ["w2", "w3", "a2", "uv2"];
 
+/** One entry in a fixture's indexed-color lookup table. ``lo``/``hi``
+ * are the inclusive DMX byte range that selects this preset (per the
+ * manufacturer's documentation); the renderer emits the midpoint. The
+ * ``r``/``g``/``b`` triplet is the entry's representative color used
+ * for nearest-match snapping from the light's logical RGB. */
+export type ColorTableEntry = {
+  lo: number;
+  hi: number;
+  name?: string;
+  r: number;
+  g: number;
+  b: number;
+};
+
+/** Per-mode indexed-color lookup. Drives every ``color`` slot in the
+ * mode the same way (per-cell in the StormChaser, fixture-wide in
+ * single-wheel pars). When set, the renderer resolves each frame's
+ * logical RGB to the closest entry and emits its midpoint byte. */
+export type ColorTable = {
+  entries: ColorTableEntry[];
+  /** When the mode has no ``dimmer`` channel and the requested logical
+   *  RGB has ``max(r,g,b) < off_below``, the renderer forces the
+   *  off-marked entry (representative RGB 0,0,0). 0 disables. */
+  off_below?: number;
+};
+
 export type LightModelMode = {
   id: number;
   name: string;
@@ -245,6 +279,7 @@ export type LightModelMode = {
   is_default: boolean;
   layout?: FixtureLayout | null;
   color_policy?: ColorPolicy;
+  color_table?: ColorTable | null;
 };
 
 export type LightModelModeInput = {
@@ -254,6 +289,7 @@ export type LightModelModeInput = {
   is_default: boolean;
   layout?: FixtureLayout | null;
   color_policy?: ColorPolicy;
+  color_table?: ColorTable | null;
 };
 
 export type LightModel = {
@@ -376,6 +412,7 @@ export type ParsedMode = {
   channels: string[];
   notes?: string | null;
   layout?: FixtureLayout | null;
+  color_table?: ColorTable | null;
 };
 
 export type ParsedManual = {
@@ -939,6 +976,9 @@ export const Api = {
         handle?: string;
         kind?: "palette" | "effect";
         id?: number;
+        /** EffectLayer.id when an effect proposal was played as a
+         *  transient layer (so the run shows in the Live rail). */
+        layer_id?: number;
       }>(`/api/designer/conversations/${cid}/apply`, { proposal_id }),
     saveProposal: (
       cid: number,
@@ -954,6 +994,18 @@ export const Api = {
         proposal_id,
         name: name ?? null,
       }),
+    critiqueProposal: (
+      cid: number,
+      proposal_id: string,
+      user_request?: string,
+    ) =>
+      api.post<DesignerCritiqueResponse>(
+        `/api/designer/conversations/${cid}/critique`,
+        {
+          proposal_id,
+          user_request: user_request ?? null,
+        },
+      ),
     streamMessage: streamDesignerMessage,
   },
 
@@ -981,14 +1033,31 @@ export const Api = {
       proposal_id: string,
       light_ids: number[] = [],
     ) =>
-      api.post<{ ok: boolean; handle: string; name: string }>(
-        `/api/effect-chat/conversations/${cid}/apply`,
-        { proposal_id, light_ids },
-      ),
+      api.post<{
+        ok: boolean;
+        handle: string;
+        name: string;
+        layer_id?: number;
+      }>(`/api/effect-chat/conversations/${cid}/apply`, {
+        proposal_id,
+        light_ids,
+      }),
     saveProposal: (cid: number, proposal_id: string, name?: string) =>
       api.post<{ ok: boolean; id: number; name: string }>(
         `/api/effect-chat/conversations/${cid}/save`,
         { proposal_id, name: name ?? null },
+      ),
+    critiqueProposal: (
+      cid: number,
+      proposal_id: string,
+      user_request?: string,
+    ) =>
+      api.post<DesignerCritiqueResponse>(
+        `/api/effect-chat/conversations/${cid}/critique`,
+        {
+          proposal_id,
+          user_request: user_request ?? null,
+        },
       ),
     streamMessage: streamEffectChatMessage,
   },
@@ -1054,6 +1123,10 @@ export type DesignerConversation = {
   updated_at: string;
   messages: DesignerMessage[];
   last_proposals: DesignerProposal[];
+  /** Cached self-critique payloads keyed by ``proposal_id`` so the UI
+   *  can re-render verification panels after a page reload without
+   *  re-spending Anthropic tokens. */
+  last_critique?: Record<string, DesignerCritique> | null;
 };
 
 export type DesignerConversationSummary = {
@@ -1061,6 +1134,44 @@ export type DesignerConversationSummary = {
   name: string;
   message_count: number;
   updated_at: string;
+};
+
+// ---------------------------------------------------------------------------
+// Designer self-critique ("double-check")
+// ---------------------------------------------------------------------------
+export type DesignerCritiqueVerdict =
+  | "looks_good"
+  | "minor_issues"
+  | "needs_review"
+  | "regenerate";
+
+export type DesignerCritiqueSeverity = "low" | "med" | "high";
+
+export type DesignerCritiqueCoverage = {
+  requirement: string;
+  addressed: boolean;
+  evidence?: string | null;
+};
+
+export type DesignerCritiqueRisk = {
+  issue: string;
+  severity: DesignerCritiqueSeverity;
+};
+
+export type DesignerCritique = {
+  intent_summary: string;
+  coverage: DesignerCritiqueCoverage[];
+  risks: DesignerCritiqueRisk[];
+  suggestions: string[];
+  verdict: DesignerCritiqueVerdict;
+  confidence: number;
+  usage?: { input_tokens?: number; output_tokens?: number } | null;
+};
+
+export type DesignerCritiqueResponse = {
+  ok: boolean;
+  proposal_id: string;
+  critique: DesignerCritique;
 };
 
 export type DesignerStreamHandlers = {
@@ -1112,6 +1223,8 @@ export type EffectConversationData = {
   updated_at: string;
   messages: EffectChatMessage[];
   last_proposal: EffectProposal | null;
+  /** Cached self-critique payloads keyed by ``proposal_id``. */
+  last_critique?: Record<string, DesignerCritique> | null;
 };
 
 export type EffectConversationSummary = {

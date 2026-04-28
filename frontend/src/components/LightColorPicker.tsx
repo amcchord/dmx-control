@@ -3,6 +3,8 @@ import { HexColorPicker } from "react-colorful";
 import {
   Api,
   ColorRequestBody,
+  ColorTable,
+  ColorTableEntry,
   ExtraColorRole,
   Light,
   LightModel,
@@ -66,6 +68,16 @@ export default function LightColorPicker({
   // value renders as the fallback for any zone that doesn't override.
   const directRoles = useMemo<AuxSliderEntry[]>(
     () => commonAuxRoles(lights, models),
+    [lights, models],
+  );
+  // For fixtures with an indexed-color mode (Blizzard StormChaser etc.),
+  // surface the discrete preset palette as quick-pick swatches under the
+  // hex wheel. The wheel still works (renderer snaps RGB -> nearest
+  // entry); the swatches are just a faster way to land on a preset
+  // exactly. Only shown when every selected fixture shares the same
+  // table.
+  const sharedColorTable = useMemo<ColorTable | null>(
+    () => commonColorTable(lights, models),
     [lights, models],
   );
 
@@ -181,6 +193,34 @@ export default function LightColorPicker({
           {on ? "ON" : "OFF"}
         </button>
       </div>
+
+      {sharedColorTable && uniquePresetEntries(sharedColorTable).length > 0 && (
+        <div className="rounded-md bg-bg-elev p-2 ring-1 ring-line">
+          <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-muted">
+            <span>Indexed presets</span>
+            <span>Click to snap</span>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {uniquePresetEntries(sharedColorTable).map((e, i) => {
+              const presetHex = entryHex(e);
+              return (
+                <button
+                  key={i}
+                  type="button"
+                  className="h-7 w-7 rounded ring-1 ring-line transition hover:ring-accent"
+                  style={{ background: presetHex }}
+                  title={
+                    e.name
+                      ? `${e.name} (${e.lo}-${e.hi})`
+                      : `${e.lo}-${e.hi} → ${presetHex}`
+                  }
+                  onClick={() => onHexCommit(presetHex)}
+                />
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       <div>
         <div className="mb-1 flex items-baseline justify-between">
@@ -474,6 +514,67 @@ function auxToBody(
       (out as Record<"w" | "a" | "uv", number>)[role as "w" | "a" | "uv"] =
         value;
     }
+  }
+  return out;
+}
+
+/** Return the color table shared by every selected light, or null if
+ * any fixture in the selection is missing the table or holds a
+ * different one (we can't show a single coherent preset row when the
+ * palettes disagree). */
+function commonColorTable(
+  lights: Light[],
+  models: LightModel[],
+): ColorTable | null {
+  if (lights.length === 0) return null;
+  const modelById = new Map<number, LightModel>(
+    models.map((m) => [m.id, m]),
+  );
+  let shared: ColorTable | null = null;
+  let sharedKey: string | null = null;
+  for (const l of lights) {
+    const model = modelById.get(l.model_id);
+    if (!model) return null;
+    const mode =
+      l.mode_id != null
+        ? model.modes.find((m) => m.id === l.mode_id)
+        : (model.modes.find((m) => m.is_default) ?? model.modes[0]);
+    if (!mode) return null;
+    const t = mode.color_table;
+    if (!t || !t.entries?.length) return null;
+    const key = JSON.stringify(t.entries.map((e) => [e.lo, e.hi, e.r, e.g, e.b]));
+    if (sharedKey == null) {
+      shared = t;
+      sharedKey = key;
+    } else if (key !== sharedKey) {
+      return null;
+    }
+  }
+  return shared;
+}
+
+const entryHex = (e: ColorTableEntry): string =>
+  "#" +
+  [e.r, e.g, e.b]
+    .map((c) =>
+      Math.max(0, Math.min(255, Math.round(c)))
+        .toString(16)
+        .padStart(2, "0"),
+    )
+    .join("")
+    .toUpperCase();
+
+/** Some manuals split a color into multiple ranges (e.g. light blue
+ * appears twice for chase animations). Dedupe by representative RGB so
+ * the swatch row stays compact. */
+function uniquePresetEntries(table: ColorTable): ColorTableEntry[] {
+  const seen = new Set<string>();
+  const out: ColorTableEntry[] = [];
+  for (const e of table.entries) {
+    const key = `${e.r}-${e.g}-${e.b}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(e);
   }
   return out;
 }

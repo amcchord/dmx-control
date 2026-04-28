@@ -64,6 +64,10 @@ class LightBinding:
     # W/A/UV policy ({"w":"direct", ...}). Missing keys default to "mix"
     # which preserves the historical "derive from RGB" renderer behavior.
     color_policy: dict | None = None
+    # Indexed-color lookup driving every "color" slot in this mode (see
+    # schemas.ColorTable). None => slot emits 0 (matches today's macro
+    # behavior for legacy fixtures with no table).
+    color_table: dict | None = None
 
 
 class UniverseBuffer:
@@ -92,6 +96,102 @@ def _policy_for(policy: dict | None, role: str) -> str:
     return "mix"
 
 
+def _color_table_entries(table: dict | None) -> list[dict]:
+    """Pull the entries list out of a stored color_table, defensively."""
+    if not isinstance(table, dict):
+        return []
+    raw = table.get("entries")
+    if not isinstance(raw, list):
+        return []
+    return [e for e in raw if isinstance(e, dict)]
+
+
+def _entry_is_off(entry: dict) -> bool:
+    """An entry counts as the "off" slot when its representative RGB is
+    black. Manuals consistently document this as "No Function" / "Blackout"
+    sitting in the lowest byte range, so this heuristic is reliable."""
+    return int(entry.get("r", 0) | entry.get("g", 0) | entry.get("b", 0)) == 0
+
+
+def _entry_midpoint(entry: dict) -> int:
+    lo = max(0, min(255, int(entry.get("lo", 0))))
+    hi = max(0, min(255, int(entry.get("hi", lo))))
+    if hi < lo:
+        hi = lo
+    return (lo + hi) // 2
+
+
+def _pick_color_byte(
+    r: int,
+    g: int,
+    b: int,
+    table: dict | None,
+    on: bool,
+    has_dimmer: bool,
+) -> int:
+    """Map a logical (r,g,b) onto the closest entry's midpoint byte.
+
+    Behavior:
+      * No table or no entries -> 0 (matches the historical macro slot).
+      * not on -> the "off"-marked entry's midpoint (or 0).
+      * No dedicated dimmer channel and ``max(r,g,b) < off_below`` -> off.
+      * Otherwise pick the entry minimizing squared RGB distance to the
+        clamped (r,g,b) and emit its midpoint.
+    """
+    entries = _color_table_entries(table)
+    if not entries:
+        return 0
+
+    # Helper: midpoint for the "off" entry, falling back to 0.
+    off_midpoint = 0
+    for e in entries:
+        if _entry_is_off(e):
+            off_midpoint = _entry_midpoint(e)
+            break
+
+    if not on:
+        return off_midpoint
+
+    rr = max(0, min(255, int(r)))
+    gg = max(0, min(255, int(g)))
+    bb = max(0, min(255, int(b)))
+
+    if not has_dimmer:
+        off_below = int(table.get("off_below", 0) or 0) if isinstance(table, dict) else 0
+        if off_below > 0 and max(rr, gg, bb) < off_below:
+            return off_midpoint
+
+    best_idx = 0
+    best_d2 = None
+    for i, e in enumerate(entries):
+        er = int(e.get("r", 0))
+        eg = int(e.get("g", 0))
+        eb = int(e.get("b", 0))
+        dr, dg, db_ = rr - er, gg - eg, bb - eb
+        d2 = dr * dr + dg * dg + db_ * db_
+        if best_d2 is None or d2 < best_d2:
+            best_d2 = d2
+            best_idx = i
+    return _entry_midpoint(entries[best_idx])
+
+
+def _byte_to_color_rgb(byte: int, table: dict | None) -> tuple[int, int, int] | None:
+    """Reverse of :func:`_pick_color_byte`: which entry's range contains
+    ``byte``? Used by :func:`_decode_binding` to render a swatch on the
+    dashboard. Returns ``None`` if the table is missing or the byte falls
+    outside every range."""
+    entries = _color_table_entries(table)
+    if not entries:
+        return None
+    bv = max(0, min(255, int(byte)))
+    for e in entries:
+        lo = int(e.get("lo", 0))
+        hi = int(e.get("hi", lo))
+        if lo <= bv <= hi:
+            return int(e.get("r", 0)), int(e.get("g", 0)), int(e.get("b", 0))
+    return None
+
+
 def _resolve_aux(
     role: str,
     raw: object,
@@ -118,14 +218,19 @@ def _resolve_aux(
 
 
 def _compute_channel_values(
-    channels: list[str], state: dict, policy: dict | None = None
+    channels: list[str],
+    state: dict,
+    policy: dict | None = None,
+    color_table: dict | None = None,
 ) -> list[int]:
     """Map a light's logical state dict into DMX channel values ordered by role.
 
     Flat (non-compound) path: iterates ``channels`` and emits one byte per
     slot. For compound fixtures use :func:`_compute_layout_values` instead.
     ``policy`` is an optional {role: "mix"|"direct"} map from the mode;
-    see :func:`_resolve_aux`.
+    see :func:`_resolve_aux`. ``color_table`` is the mode's optional
+    indexed-color lookup; when present, ``color`` slots are driven by
+    :func:`_pick_color_byte`.
     """
     r = int(state.get("r", 0))
     g = int(state.get("g", 0))
@@ -192,6 +297,17 @@ def _compute_channel_values(
             values.append(0)
         elif role == "speed":
             values.append(0)
+        elif role == "color":
+            values.append(
+                _pick_color_byte(
+                    int(round(r * scale)),
+                    int(round(g * scale)),
+                    int(round(b * scale)),
+                    color_table,
+                    True,  # `on` already short-circuited above
+                    has_dimmer,
+                )
+            )
         elif role == "pan":
             values.append(_coarse_byte(mpan))
         elif role == "pan_fine":
@@ -236,7 +352,11 @@ def _derive_zone_defaults(
 
 
 def _compute_layout_values(
-    channels: list[str], layout: dict, state: dict, policy: dict | None = None
+    channels: list[str],
+    layout: dict,
+    state: dict,
+    policy: dict | None = None,
+    color_table: dict | None = None,
 ) -> list[int]:
     """Compound-fixture renderer: writes zone/motion/global values into a
     bytes-like list sized to the mode's channel count."""
@@ -304,6 +424,22 @@ def _compute_layout_values(
         for role, off in colors.items():
             if not _in_range(off):
                 continue
+            if role == "color":
+                # Indexed-color slot: emit the wheel byte for this zone's
+                # logical RGB (after the zone-dimmer scale, when present),
+                # snapped to the nearest table entry. The mode's
+                # color_table is shared across every zone with a "color"
+                # slot, matching the StormChaser shape (16 cells, one
+                # palette).
+                vals[off] = _pick_color_byte(
+                    int(round(zr * scale)),
+                    int(round(zg * scale)),
+                    int(round(zb * scale)),
+                    color_table,
+                    True,  # `on` already short-circuited above
+                    has_zone_dim,
+                )
+                continue
             v = role_vals.get(role, 0)
             vals[off] = max(0, min(255, int(round(v * scale))))
         if has_zone_dim:
@@ -334,7 +470,7 @@ def _compute_layout_values(
         else:
             vals[fine_off] = max(0, min(255, int(round(v * 255))))
 
-    # Globals — dimmer/strobe/macro/speed at explicit offsets.
+    # Globals — dimmer/strobe/macro/speed/color at explicit offsets.
     globals_ = layout.get("globals") or {}
     dim_off = globals_.get("dimmer")
     if _in_range(dim_off):
@@ -343,6 +479,23 @@ def _compute_layout_values(
         off = globals_.get(role)
         if _in_range(off):
             vals[off] = 0
+    # A fixture-wide indexed color slot (a single wheel that drives the
+    # whole fixture): pick from the flat fallback RGB.
+    color_off = globals_.get("color")
+    if _in_range(color_off):
+        has_global_dim = _in_range(dim_off)
+        scale = 1.0 if has_global_dim else max(0, min(255, global_dimmer)) / 255.0
+        fr = int(state.get("r", 0))
+        fg = int(state.get("g", 0))
+        fb = int(state.get("b", 0))
+        vals[color_off] = _pick_color_byte(
+            int(round(fr * scale)),
+            int(round(fg * scale)),
+            int(round(fb * scale)),
+            color_table,
+            True,
+            has_global_dim,
+        )
 
     return vals
 
@@ -352,10 +505,17 @@ def _render_binding(binding: LightBinding, state: dict) -> list[int]:
     otherwise fall back to the flat channel emission."""
     if binding.layout:
         return _compute_layout_values(
-            binding.channels, binding.layout, state, binding.color_policy
+            binding.channels,
+            binding.layout,
+            state,
+            binding.color_policy,
+            binding.color_table,
         )
     return _compute_channel_values(
-        binding.channels, state, binding.color_policy
+        binding.channels,
+        state,
+        binding.color_policy,
+        binding.color_table,
     )
 
 
@@ -387,6 +547,8 @@ def _decode_binding(binding: "LightBinding", buf: bytearray) -> dict:
     flat_b = 0
     any_nonzero = False
 
+    color_table = binding.color_table
+
     layout = binding.layout
     if layout:
         zones = layout.get("zones") or []
@@ -399,6 +561,16 @@ def _decode_binding(binding: "LightBinding", buf: bytearray) -> dict:
             r = _get(colors.get("r")) or 0
             g = _get(colors.get("g")) or 0
             b = _get(colors.get("b")) or 0
+            # If the zone is driven by an indexed color slot, reverse the
+            # wheel byte back into the representative RGB so the dashboard
+            # swatch matches the actual rendered preset.
+            color_off = colors.get("color")
+            if color_off is not None:
+                cv = _get(color_off)
+                if cv is not None:
+                    decoded = _byte_to_color_rgb(cv, color_table)
+                    if decoded is not None:
+                        r, g, b = decoded
             dim = _get(zone.get("dimmer"))
             # Bake a per-zone dimmer into RGB so the on-screen swatch
             # reflects what the fixture actually emits.
@@ -417,8 +589,19 @@ def _decode_binding(binding: "LightBinding", buf: bytearray) -> dict:
             # whole-card swatch also animates.
             bright = max(zone_state.values(), key=lambda s: max(s["r"], s["g"], s["b"]))
             flat_r, flat_g, flat_b = bright["r"], bright["g"], bright["b"]
-        # Apply the global dimmer to the flat fallback if present.
         globals_ = layout.get("globals") or {}
+        # If the fixture has a single global color slot, decode it as the
+        # flat fallback (the swatch shows the wheel-selected preset).
+        gcolor_off = globals_.get("color")
+        if gcolor_off is not None:
+            gv = _get(gcolor_off)
+            if gv is not None:
+                decoded = _byte_to_color_rgb(gv, color_table)
+                if decoded is not None:
+                    flat_r, flat_g, flat_b = decoded
+                    if (flat_r | flat_g | flat_b) > 0:
+                        any_nonzero = True
+        # Apply the global dimmer to the flat fallback if present.
         gdim = _get(globals_.get("dimmer"))
         if gdim is not None:
             scale = gdim / 255.0
@@ -434,6 +617,7 @@ def _decode_binding(binding: "LightBinding", buf: bytearray) -> dict:
         # Flat fixture: walk channels and pick up the first r/g/b. Apply
         # any dimmer we see.
         dim = 255
+        color_byte = None
         for i, role in enumerate(channels):
             v = int(buf[start + i]) if 0 <= start + i < len(buf) else 0
             if role == "r" and flat_r == 0:
@@ -444,8 +628,17 @@ def _decode_binding(binding: "LightBinding", buf: bytearray) -> dict:
                 flat_b = v
             elif role == "dimmer":
                 dim = v
+            elif role == "color" and color_byte is None:
+                color_byte = v
             if v != 0:
                 any_nonzero = True
+        # Indexed-color-only mode (no separate r/g/b channels): decode the
+        # wheel byte back into the entry's representative RGB so the
+        # swatch reflects what the fixture is actually emitting.
+        if color_byte is not None and "r" not in channels and "g" not in channels and "b" not in channels:
+            decoded = _byte_to_color_rgb(color_byte, color_table)
+            if decoded is not None:
+                flat_r, flat_g, flat_b = decoded
         if dim != 255 and "dimmer" in channels:
             # The "dimmer" channel already scales the fixture at the
             # hardware level; reflect that brightness in the swatch too.
@@ -540,11 +733,17 @@ class ArtNetManager:
                         if isinstance(mode.color_policy, dict)
                         else {}
                     )
+                    color_table = (
+                        dict(mode.color_table)
+                        if isinstance(mode.color_table, dict)
+                        else None
+                    )
                 else:
                     channels = list(model.channels)
                     channel_count = model.channel_count
                     layout = None
                     policy = {}
+                    color_table = None
                 ctrl, buf = self._controllers[light.controller_id]
                 start = light.start_address - 1  # DMX is 1-indexed; buffer is 0-indexed
                 if start < 0 or start + channel_count > UNIVERSE_SIZE:
@@ -561,6 +760,7 @@ class ArtNetManager:
                     channels=channels,
                     layout=layout,
                     color_policy=policy,
+                    color_table=color_table,
                 )
                 buf.bindings[light.id] = binding
                 self._light_to_controller[light.id] = ctrl.id

@@ -60,6 +60,17 @@ class LightModelMode(SQLModel, table=True):
     # palette painting or effect RGB blending). Missing keys imply "mix"
     # so existing rows behave identically after the migration.
     color_policy: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    # Optional indexed-color lookup. When set, every ``color`` slot in
+    # this mode's channel list (and every zone whose ``colors`` map names
+    # ``color``) is driven by mapping the light's logical RGB to the
+    # nearest entry in this table at render time. Shape:
+    #   {"entries": [{"lo", "hi", "name", "r", "g", "b"}, ...],
+    #    "off_below": int}
+    # See :class:`schemas.ColorTable`. Null for fixtures with no indexed
+    # color channel.
+    color_table: Optional[dict] = Field(
+        default=None, sa_column=Column(JSON, nullable=True)
+    )
 
 
 class Light(SQLModel, table=True):
@@ -280,7 +291,16 @@ class DesignerConversation(SQLModel, table=True):
 
     ``last_proposal`` caches the most recent structured output so Apply/
     Save can target proposals by ``proposal_id`` even after the page has
-    been reloaded."""
+    been reloaded.
+
+    ``last_layer_id`` is the ``EffectLayer.id`` of the most recent
+    transient layer started by an effect-kind apply for this chat; on a
+    new "Play" we stop+delete the prior row before pushing a new one so
+    transient layers don't pile up.
+
+    ``last_critique`` is the latest self-critique payload keyed by
+    ``proposal_id``; used to render the verification panel after a
+    page reload."""
 
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = ""
@@ -292,6 +312,10 @@ class DesignerConversation(SQLModel, table=True):
     last_proposal: Optional[dict] = Field(
         default=None, sa_column=Column(JSON, nullable=True)
     )
+    last_layer_id: Optional[int] = Field(default=None, nullable=True)
+    last_critique: Optional[dict] = Field(
+        default=None, sa_column=Column(JSON, nullable=True)
+    )
 
 
 class EffectConversation(SQLModel, table=True):
@@ -301,7 +325,10 @@ class EffectConversation(SQLModel, table=True):
     forced to call is ``propose_effect`` and the persisted
     ``last_proposal`` always holds one ``EffectIn``-shaped dict under a
     ``proposal`` key. Kept separate from designer conversations to keep
-    the two contracts independent."""
+    the two contracts independent.
+
+    ``last_layer_id`` / ``last_critique`` mirror :class:`DesignerConversation`
+    and are documented there."""
 
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = ""
@@ -311,6 +338,10 @@ class EffectConversation(SQLModel, table=True):
         default_factory=list, sa_column=Column(JSON)
     )
     last_proposal: Optional[dict] = Field(
+        default=None, sa_column=Column(JSON, nullable=True)
+    )
+    last_layer_id: Optional[int] = Field(default=None, nullable=True)
+    last_critique: Optional[dict] = Field(
         default=None, sa_column=Column(JSON, nullable=True)
     )
 

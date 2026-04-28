@@ -8,6 +8,7 @@ import {
 } from "../api";
 import { useToast } from "../toast";
 import ColorPolicySection from "./models/ColorPolicySection";
+import ColorTablePanel from "./models/ColorTablePanel";
 import LayoutPanel from "./models/LayoutPanel";
 import ManualPicker from "./models/ManualPicker";
 import ModelThumbnail from "./models/ModelThumbnail";
@@ -170,6 +171,7 @@ export default function ModelEditor() {
           is_default: f.modes.length === 0,
           layout: null,
           color_policy: {},
+          color_table: null,
         },
       ],
       activeKey: key,
@@ -336,9 +338,14 @@ export default function ModelEditor() {
           is_default: i === 0,
           layout: pm.layout ?? null,
           color_policy: {},
+          color_table: pm.color_table ?? null,
         }));
         if (modes.length === 0) {
-          toast.push("Claude returned no modes", "error");
+          toast.push(
+            "Claude couldn't extract any modes from this manual. Try " +
+              "re-uploading or use a clearer page.",
+            "error",
+          );
         } else {
           setForm({
             name: parsed.suggested_name || "",
@@ -389,6 +396,7 @@ export default function ModelEditor() {
                   ...m,
                   channels: [...pm.channels],
                   layout: pm.layout ?? m.layout,
+                  color_table: pm.color_table ?? m.color_table,
                 })
               : m,
           );
@@ -400,6 +408,7 @@ export default function ModelEditor() {
             is_default: false,
             layout: pm.layout ?? null,
             color_policy: {},
+            color_table: pm.color_table ?? null,
           });
         }
       }
@@ -758,6 +767,14 @@ export default function ModelEditor() {
                   draft={activeMode}
                   onChange={(next) =>
                     setModeField(activeMode.key, "color_policy", next)
+                  }
+                />
+
+                <ColorTablePanel
+                  channels={activeMode.channels}
+                  table={activeMode.color_table}
+                  onChange={(next) =>
+                    setModeField(activeMode.key, "color_table", next)
                   }
                 />
 

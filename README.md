@@ -10,9 +10,22 @@ a Caddy + systemd deployment that fronts everything at
 
 - Add, edit, and delete **Art-Net controllers** (IP, port, net/subnet/universe).
 - Define **light models** as ordered lists of channel roles
-  (`r`, `g`, `b`, `w`, `a`, `uv`, `dimmer`, `strobe`, `macro`, `speed`, `pan`,
-  `tilt`, `other`), so any fixture from a 3-channel RGB par to a 7-channel
-  RGBWA+UV+dimmer bar is a first-class citizen.
+  (`r`, `g`, `b`, `w`, `a`, `uv`, `dimmer`, `strobe`, `macro`, `speed`,
+  `color`, `pan`, `tilt`, `other`), so any fixture from a 3-channel RGB par
+  to a 7-channel RGBWA+UV+dimmer bar is a first-class citizen.
+- **Indexed-color fixtures as fake-RGB lights.** Many older or smaller
+  fixtures (e.g. Blizzard StormChaser Supercell 20CH mode) expose a single
+  DMX byte that selects from a fixed palette of preset colors instead of
+  separate R/G/B sliders. Tag those slots with the `color` role and attach
+  a per-mode **color table** (a list of `{lo, hi, name, r, g, b}` entries
+  documenting the manufacturer's byte ranges + representative RGB). The
+  Art-Net renderer projects each frame's logical RGB onto the closest
+  preset and emits the matching byte, so palettes, effects, scenes, and
+  the color picker all "just work" on these fixtures — every consumer
+  treats the light as ordinary RGB. Compound fixtures with one indexed
+  byte per cell (StormChaser-style 16 cells × 1 byte) become 16-zone
+  fixtures sharing one mode-level table. The Claude PDF manual parser
+  auto-extracts the table and pre-fills the editor for review.
 - Place **lights** on controllers at a specific DMX start address, with a
   "create N in a row" helper that auto-spaces by the model's channel count.
 - Maintain a library of **color palettes** — 17 built-ins (Cyberpunk Neon,
@@ -228,7 +241,33 @@ Every other endpoint requires the session cookie.
 | DELETE | `/api/models/{id}` | — | 204 |
 | POST | `/api/models/{id}/clone` | — | `LightModel` |
 
-Channel roles: `r, g, b, w, a, uv, dimmer, strobe, macro, speed, pan, tilt, other`.
+Channel roles: `r, g, b, w, w2, w3, a, a2, uv, uv2, dimmer, strobe, macro,
+speed, color, pan, pan_fine, tilt, tilt_fine, zoom, focus, other`. The
+`color` role marks an indexed-color slot driven by the mode's
+`color_table` (see below).
+
+Each `LightModelMode` may carry an optional `color_table`:
+
+```json
+{
+  "entries": [
+    { "lo": 0,  "hi": 15, "name": "Off",  "r": 0,   "g": 0, "b": 0 },
+    { "lo": 16, "hi": 31, "name": "Red",  "r": 255, "g": 0, "b": 0 },
+    { "lo": 32, "hi": 47, "name": "Green","r": 0,   "g": 255,"b": 0 }
+  ],
+  "off_below": 0
+}
+```
+
+The renderer maps each frame's logical `(r, g, b)` to the nearest entry
+by Euclidean RGB distance and emits the midpoint of that entry's range
+on every `color`-tagged slot in the mode (per-cell or fixture-wide via
+`layout.globals.color`). Multi-cell fixtures share a single mode-level
+table — model the StormChaser-style "16 cells, one palette" shape with
+one table plus 16 zones whose `colors.color` points at each cell's
+offset. `off_below` (0–255, default 0) forces the off-marked entry on
+dimmerless fixtures whose requested RGB has `max(r,g,b)` below the
+threshold so dim colors actually go dark.
 
 ### Lights (`/api/lights`)
 

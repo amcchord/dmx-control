@@ -129,6 +129,12 @@ def _migrate() -> None:
                 conn.exec_driver_sql(
                     "ALTER TABLE lightmodelmode ADD COLUMN color_policy JSON"
                 )
+            # lightmodelmode.color_table (indexed-color lookup for the
+            # ``color`` channel role; see schemas.ColorTable)
+            if "color_table" not in mode_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE lightmodelmode ADD COLUMN color_table JSON"
+                )
             # palette.entries (per-color {r,g,b,w?,a?,uv?} payload).
             pal_cols = _table_columns(conn, "palette")
             if "entries" not in pal_cols:
@@ -158,6 +164,32 @@ def _migrate() -> None:
                 conn.exec_driver_sql(
                     "ALTER TABLE scene ADD COLUMN layers JSON"
                 )
+            # designerconversation.last_layer_id / last_critique
+            # (transient layer tracking + self-critique cache for the
+            # AI Designer chat).
+            dc_cols = _table_columns(conn, "designerconversation")
+            if dc_cols and "last_layer_id" not in dc_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE designerconversation "
+                    "ADD COLUMN last_layer_id INTEGER"
+                )
+            if dc_cols and "last_critique" not in dc_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE designerconversation "
+                    "ADD COLUMN last_critique JSON"
+                )
+            # Same for the effect-chat conversation.
+            ec_cols = _table_columns(conn, "effectconversation")
+            if ec_cols and "last_layer_id" not in ec_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE effectconversation "
+                    "ADD COLUMN last_layer_id INTEGER"
+                )
+            if ec_cols and "last_critique" not in ec_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE effectconversation "
+                    "ADD COLUMN last_critique JSON"
+                )
         else:
             # Best-effort for other backends; swallow errors if column already exists.
             for stmt in (
@@ -170,11 +202,16 @@ def _migrate() -> None:
                 "ALTER TABLE controller ADD COLUMN notes TEXT",
                 "ALTER TABLE lightmodelmode ADD COLUMN layout JSON",
                 "ALTER TABLE lightmodelmode ADD COLUMN color_policy JSON",
+                "ALTER TABLE lightmodelmode ADD COLUMN color_table JSON",
                 "ALTER TABLE palette ADD COLUMN entries JSON",
                 "ALTER TABLE effect ADD COLUMN target_channels JSON",
                 "ALTER TABLE effect ADD COLUMN source TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE effect ADD COLUMN param_schema JSON",
                 "ALTER TABLE scene ADD COLUMN layers JSON",
+                "ALTER TABLE designerconversation ADD COLUMN last_layer_id INTEGER",
+                "ALTER TABLE designerconversation ADD COLUMN last_critique JSON",
+                "ALTER TABLE effectconversation ADD COLUMN last_layer_id INTEGER",
+                "ALTER TABLE effectconversation ADD COLUMN last_critique JSON",
             ):
                 try:
                     conn.execute(text(stmt))

@@ -23,6 +23,7 @@ CHANNEL_ROLES = {
     "strobe",
     "macro",
     "speed",
+    "color",  # indexed-color channel; resolved via the mode's color_table
     "pan",
     "pan_fine",
     "tilt",
@@ -89,6 +90,118 @@ def _validate_channel_list(v: list[str]) -> list[str]:
     if bad:
         raise ValueError(f"unknown channel role(s): {bad}")
     return v
+
+
+# ---------------------------------------------------------------------------
+# Color table (indexed-color channel lookup)
+# ---------------------------------------------------------------------------
+# Some fixtures expose a single DMX byte that selects from a fixed palette
+# of preset colors (e.g. the Blizzard StormChaser's "Cell N" channels with
+# 0-15 Off, 16-31 Red, 32-47 Green, ...). We tag those slots with the
+# ``color`` channel role and attach a mode-level :class:`ColorTable` that
+# the renderer uses to project each frame's logical RGB onto the closest
+# preset's representative byte. The same table is shared by every ``color``
+# slot in the mode (matching the StormChaser shape: 16 cells, one palette).
+
+MAX_COLOR_TABLE_ENTRIES = 64
+
+
+class ColorTableEntry(BaseModel):
+    """One entry in a fixture's indexed-color lookup table.
+
+    ``lo``/``hi`` are the inclusive byte range that selects this preset
+    on the DMX wire (per the manufacturer's documentation); the renderer
+    emits the midpoint. ``r``/``g``/``b`` are the entry's representative
+    color used for nearest-match snapping from logical RGB."""
+
+    lo: int
+    hi: int
+    name: str = ""
+    r: int
+    g: int
+    b: int
+
+    @field_validator("lo", "hi", "r", "g", "b")
+    @classmethod
+    def _byte(cls, v: int) -> int:
+        if not (0 <= v <= 255):
+            raise ValueError("must be 0..255")
+        return v
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        s = (v or "").strip()
+        if len(s) > 32:
+            raise ValueError("entry name too long (max 32 chars)")
+        return s
+
+    @model_validator(mode="after")
+    def _range(self) -> "ColorTableEntry":
+        if self.lo > self.hi:
+            raise ValueError("lo must be <= hi")
+        return self
+
+
+class ColorTable(BaseModel):
+    """Per-mode indexed-color lookup. Drives every ``color`` slot in the
+    mode the same way (see :class:`ColorTableEntry`)."""
+
+    entries: list[ColorTableEntry]
+    # When the mode has no separate dimmer channel and the requested
+    # logical RGB has ``max(r,g,b) < off_below``, the renderer forces the
+    # "off" entry. Lets the existing dimmer-bake-into-RGB path actually
+    # go dark on dimmerless wheel fixtures. Default 0 disables.
+    off_below: int = 0
+
+    @field_validator("off_below")
+    @classmethod
+    def _ofb(cls, v: int) -> int:
+        if not (0 <= v <= 255):
+            raise ValueError("off_below must be 0..255")
+        return v
+
+    @field_validator("entries")
+    @classmethod
+    def _entries(cls, v: list[ColorTableEntry]) -> list[ColorTableEntry]:
+        if not v:
+            raise ValueError("color table must have at least one entry")
+        if len(v) > MAX_COLOR_TABLE_ENTRIES:
+            raise ValueError(
+                f"too many color table entries "
+                f"(max {MAX_COLOR_TABLE_ENTRIES})"
+            )
+        # Sort by lo for stable storage and cheap overlap checking.
+        sorted_entries = sorted(v, key=lambda e: (e.lo, e.hi))
+        for prev, cur in zip(sorted_entries, sorted_entries[1:]):
+            if cur.lo <= prev.hi:
+                raise ValueError(
+                    f"overlapping color table ranges: "
+                    f"[{prev.lo}-{prev.hi}] and [{cur.lo}-{cur.hi}]"
+                )
+        return sorted_entries
+
+
+def _normalize_color_table(
+    table: Optional[ColorTable | dict], channels: list[str]
+) -> Optional[dict]:
+    """Validate a color table against a channel list.
+
+    Returns ``None`` when there is nothing to store: either the table is
+    empty/unset or the mode has no ``color`` slot for it to drive (such a
+    table would be silently ignored at render time, so don't persist it).
+    """
+    if table is None:
+        return None
+    if isinstance(table, dict):
+        # Allow callers to pass through Claude's raw payload.
+        try:
+            table = ColorTable.model_validate(table)
+        except Exception as exc:  # pragma: no cover - re-raise as ValueError
+            raise ValueError(str(exc)) from exc
+    if "color" not in channels:
+        return None
+    return table.model_dump()
 
 
 class LoginRequest(BaseModel):
@@ -165,6 +278,10 @@ class LightModelModeIn(BaseModel):
     layout: Optional[dict] = None
     # Per-role W/A/UV policy — see :func:`_normalize_color_policy`.
     color_policy: Optional[dict] = None
+    # Optional indexed-color lookup table — see :class:`ColorTable`.
+    # Applies to every ``color`` slot in this mode; ignored (dropped) when
+    # the channel list contains no ``color`` entries.
+    color_table: Optional[ColorTable | dict] = None
 
     @field_validator("name")
     @classmethod
@@ -186,6 +303,11 @@ class LightModelModeIn(BaseModel):
         self.color_policy = _normalize_color_policy(
             self.color_policy, self.channels
         )
+        # Normalize the color table here too so downstream consumers see a
+        # plain dict (or None) and never a Pydantic instance.
+        self.color_table = _normalize_color_table(
+            self.color_table, self.channels
+        )
         return self
 
 
@@ -197,6 +319,7 @@ class LightModelModeOut(BaseModel):
     is_default: bool
     layout: Optional[dict] = None
     color_policy: dict[str, str] = Field(default_factory=dict)
+    color_table: Optional[dict] = None
 
 
 class LightModelIn(BaseModel):
@@ -1199,6 +1322,7 @@ class DesignerConversationOut(BaseModel):
     updated_at: str
     messages: list[DesignerMessageOut] = Field(default_factory=list)
     last_proposals: list[DesignerProposal] = Field(default_factory=list)
+    last_critique: Optional[dict] = None
 
 
 class DesignerConversationCreate(BaseModel):
@@ -1226,6 +1350,54 @@ class DesignerApplyRequest(BaseModel):
 class DesignerSaveRequest(BaseModel):
     proposal_id: str
     name: Optional[str] = None
+
+
+# ---- Self-critique ("double-check") --------------------------------------
+
+DesignerCritiqueVerdict = Literal[
+    "looks_good", "minor_issues", "needs_review", "regenerate"
+]
+DesignerCritiqueSeverity = Literal["low", "med", "high"]
+
+
+class DesignerCritiqueCoverage(BaseModel):
+    """One requirement extracted from the user's request and whether the
+    proposal addresses it."""
+
+    requirement: str
+    addressed: bool
+    evidence: Optional[str] = None
+
+
+class DesignerCritiqueRisk(BaseModel):
+    issue: str
+    severity: DesignerCritiqueSeverity = "low"
+
+
+class DesignerCritique(BaseModel):
+    """Structured QA review of a proposal.
+
+    Filled by a second Anthropic call after each proposal so the UI can
+    show "what I think you wanted vs. what was produced" inline."""
+
+    intent_summary: str = ""
+    coverage: list[DesignerCritiqueCoverage] = Field(default_factory=list)
+    risks: list[DesignerCritiqueRisk] = Field(default_factory=list)
+    suggestions: list[str] = Field(default_factory=list)
+    verdict: DesignerCritiqueVerdict = "looks_good"
+    confidence: float = 0.5
+    usage: Optional[dict] = None
+
+
+class DesignerCritiqueRequest(BaseModel):
+    proposal_id: str
+    user_request: Optional[str] = None
+
+
+class DesignerCritiqueResponse(BaseModel):
+    ok: bool = True
+    proposal_id: str
+    critique: DesignerCritique
 
 
 # ---------------------------------------------------------------------------
@@ -1330,6 +1502,7 @@ class EffectConversationOut(BaseModel):
     updated_at: str
     messages: list[EffectChatMessageOut] = Field(default_factory=list)
     last_proposal: Optional[EffectProposal] = None
+    last_critique: Optional[dict] = None
 
 
 class EffectConversationCreate(BaseModel):

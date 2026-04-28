@@ -19,6 +19,7 @@ export const COLOR_ROLES: ColorRole[] = [
   "a2",
   "uv",
   "uv2",
+  "color",
 ];
 
 export const SHAPES: LayoutShape[] = [
@@ -56,10 +57,32 @@ export function detectZones(channels: string[]): FixtureLayout {
   const motion: FixtureLayout["motion"] = {};
   const takenIds = new Set<string>();
 
+  // When a mode has multiple bare ``color`` channels (one per cell, e.g.
+  // Blizzard StormChaser 20CH), each becomes its own zone. A single
+  // standalone ``color`` is stashed as ``globals.color`` so the wheel
+  // drives the whole fixture from the flat RGB state.
+  const colorSlotCount = channels.filter((c) => c === "color").length;
+  const colorSlotsAsZones = colorSlotCount >= 2;
+
   let i = 0;
   let hasAnyRGB = false;
   while (i < channels.length) {
     const role = channels[i];
+    // Indexed-color slot — emit a zone (multi-cell case) or fall through
+    // to be picked up as globals.color below.
+    if (role === "color" && colorSlotsAsZones) {
+      const id = makeZoneId("c", takenIds);
+      zones.push({
+        id,
+        label: `Cell ${zones.length + 1}`,
+        kind: "pixel",
+        row: 0,
+        col: zones.length,
+        colors: { color: i },
+      });
+      i += 1;
+      continue;
+    }
     // Try to start a color zone if we see an r at this position.
     if (role === "r") {
       const colors: Partial<Record<ColorRole, number>> = { r: i };
@@ -138,6 +161,7 @@ export function detectZones(channels: string[]): FixtureLayout {
     else if (role === "strobe" && globals.strobe == null) globals.strobe = i;
     else if (role === "macro" && globals.macro == null) globals.macro = i;
     else if (role === "speed" && globals.speed == null) globals.speed = i;
+    else if (role === "color" && globals.color == null) globals.color = i;
     i += 1;
   }
 
@@ -244,7 +268,13 @@ export function channelOwners(
     }
   }
   if (layout.globals) {
-    for (const key of ["dimmer", "strobe", "macro", "speed"] as const) {
+    for (const key of [
+      "dimmer",
+      "strobe",
+      "macro",
+      "speed",
+      "color",
+    ] as const) {
       const off = layout.globals[key];
       if (typeof off === "number") out.set(off, `global:${key}`);
     }
