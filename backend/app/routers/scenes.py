@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 
 from ..artnet import manager
 from ..auth import AuthDep
+from ..base_state_log import log as base_state_log
 from ..db import get_session
 from ..engine import build_spec_from_layer, engine
 from ..lua import ScriptError
@@ -303,6 +304,13 @@ def apply_scene(sid: int, sess: Session = Depends(get_session)) -> dict:
             except ScriptError:
                 sess.delete(layer)
         sess.commit()
+    if applied or saved_layers:
+        base_state_log.record(
+            "scene",
+            title=f"Scene: {row.name}",
+            light_ids=list(affected),
+            controller_id=int(row.controller_id) if row.controller_id else None,
+        )
     return {"ok": True, "applied": applied, "layers": started}
 
 
@@ -326,4 +334,11 @@ def apply_blackout(cid: int, sess: Session = Depends(get_session)) -> dict:
         sess.add(light)
     sess.commit()
     manager.blackout(cid)
+    base_state_log.record(
+        "blackout",
+        title=f"Blackout · {ctrl.name}",
+        light_ids=list(affected),
+        controller_id=cid,
+        rgb=(0, 0, 0),
+    )
     return {"ok": True, "applied": len(lights)}

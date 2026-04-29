@@ -34,6 +34,7 @@ from ..engine import (
     build_spec_from_layer,
     engine,
     new_handle,
+    play_transient_layer,
 )
 from ..models import EffectLayer
 from ..lua import LuaScript, ScriptError, compile_script
@@ -67,6 +68,9 @@ ws_router = APIRouter(prefix="/api/effects", tags=["effects"])
 # ---------------------------------------------------------------------------
 _live_specs: dict[str, EffectSpec] = {}
 _live_palette: dict[str, Optional[int]] = {}
+# Maps engine handle -> EffectLayer row id created by /live so we can
+# delete the row on stop and surface the run in the Live rail.
+_live_layer_ids: dict[str, int] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +395,7 @@ def stop_all(sess: Session = Depends(get_session)) -> dict:
     sess.commit()
     _live_specs.clear()
     _live_palette.clear()
+    _live_layer_ids.clear()
     return {"ok": True, "stopped": n}
 
 
@@ -402,15 +407,23 @@ def active_effects() -> list[ActiveEffect]:
 # ---------------------------------------------------------------------------
 # Live (transient) effects
 # ---------------------------------------------------------------------------
-def _live_spec(payload: LiveEffectIn, sess: Session) -> EffectSpec:
+@router.post("/live")
+def play_live(
+    payload: LiveEffectIn, sess: Session = Depends(get_session)
+) -> dict:
+    """Push a live (unsaved) Lua effect onto the layer stack.
+
+    Creates a transient :class:`EffectLayer` row (``effect_id=None``) so
+    the run shows up in :class:`LiveLayersPanel` and the master fader.
+    The row is deleted on :func:`stop_live`; the in-memory ``_live_specs``
+    cache is kept so :func:`save_live` can still snapshot the source +
+    params at the time of play."""
     script = _compile_or_400(payload.source)
     schema = list(script.meta.param_schema)
     user_params = merge_with_schema(schema, payload.params or {})
     colors = _resolve_palette_colors(sess, payload.palette_id)
-    handle = new_handle()
-    return EffectSpec(
-        handle=handle,
-        effect_id=None,
+    layer, handle = play_transient_layer(
+        sess,
         name=payload.name or script.meta.name or "Live effect",
         script=script,
         palette_colors=colors,
@@ -418,29 +431,51 @@ def _live_spec(payload: LiveEffectIn, sess: Session) -> EffectSpec:
         targets=_targets_to_dicts(payload.targets),
         spread=payload.spread,
         params=user_params,
+        target_channels=list(payload.target_channels or ["rgb"]),
         intensity=float(payload.controls.intensity),
         fade_in_s=float(payload.controls.fade_in_s),
         fade_out_s=float(payload.controls.fade_out_s),
-        target_channels=list(payload.target_channels or ["rgb"]),
+        palette_id=payload.palette_id,
     )
-
-
-@router.post("/live")
-def play_live(
-    payload: LiveEffectIn, sess: Session = Depends(get_session)
-) -> dict:
-    spec = _live_spec(payload, sess)
-    _live_specs[spec.handle] = spec
-    _live_palette[spec.handle] = payload.palette_id
-    engine.play(spec)
-    return {"ok": True, "handle": spec.handle, "name": spec.name}
+    spec = EffectSpec(
+        handle=handle,
+        effect_id=None,
+        name=layer.name or "Live effect",
+        script=script,
+        palette_colors=colors,
+        light_ids=list(layer.light_ids or []),
+        targets=list(layer.targets or []),
+        spread=layer.spread,
+        params=user_params,
+        intensity=float(layer.intensity),
+        fade_in_s=float(layer.fade_in_s),
+        fade_out_s=float(layer.fade_out_s),
+        target_channels=list(layer.target_channels or ["rgb"]),
+    )
+    _live_specs[handle] = spec
+    _live_palette[handle] = payload.palette_id
+    _live_layer_ids[handle] = layer.id
+    return {
+        "ok": True,
+        "handle": handle,
+        "name": layer.name,
+        "layer_id": layer.id,
+    }
 
 
 @router.post("/live/{handle}/stop")
-def stop_live(handle: str) -> dict:
-    ok = engine.stop_by_handle(handle)
+def stop_live(
+    handle: str, sess: Session = Depends(get_session)
+) -> dict:
+    ok = engine.stop_by_handle(handle, immediate=True)
     _live_specs.pop(handle, None)
     _live_palette.pop(handle, None)
+    layer_id = _live_layer_ids.pop(handle, None)
+    if layer_id is not None:
+        old = sess.get(EffectLayer, layer_id)
+        if old is not None:
+            sess.delete(old)
+            sess.commit()
     if not ok:
         raise HTTPException(404, "live effect not running")
     return {"ok": True}

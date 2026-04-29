@@ -15,6 +15,7 @@ from sqlmodel import Session, select
 
 from ..artnet import manager
 from ..auth import AuthDep
+from ..base_state_log import log as base_state_log
 from ..db import get_session
 from ..engine import engine
 from ..models import Controller, Light, State
@@ -144,6 +145,13 @@ def apply_blackout_all(sess: Session = Depends(get_session)) -> dict:
     for ctrl in controllers:
         if ctrl.id is not None:
             manager.blackout(ctrl.id)
+    base_state_log.record(
+        "blackout",
+        title="Blackout · rig",
+        light_ids=list(affected),
+        controller_id=None,
+        rgb=(0, 0, 0),
+    )
     return {"ok": True, "applied": len(lights)}
 
 
@@ -171,4 +179,11 @@ def apply_state(sid: int, sess: Session = Depends(get_session)) -> dict:
     sess.commit()
     for light in lights:
         push_light(light)
+    if applied:
+        base_state_log.record(
+            "state",
+            title=f"State: {row.name}",
+            light_ids=list(by_id.keys()),
+            controller_id=None,
+        )
     return {"ok": True, "applied": applied}

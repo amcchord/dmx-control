@@ -1,16 +1,18 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { HexColorPicker } from "react-colorful";
 import {
   Api,
   ColorRequestBody,
   ColorTable,
   ColorTableEntry,
+  EffectLayer,
   ExtraColorRole,
   Light,
   LightModel,
   LightModelMode,
   PolicyRole,
 } from "../api";
+import { useLayerStore } from "../state/layers";
 
 type Props = {
   /** Lights this picker edits. One = single-light mode (full control over
@@ -43,6 +45,7 @@ export default function LightColorPicker({
 }: Props) {
   const isBulk = lights.length > 1;
   const seedLight = lights[0];
+  const { layers, patchLayer } = useLayerStore();
 
   const [hex, setHex] = useState<string>(() => rgbToHex(seedLight));
   const [dimmer, setDimmer] = useState<number>(() => seedLight?.dimmer ?? 255);
@@ -50,16 +53,36 @@ export default function LightColorPicker({
   const [aux, setAux] = useState<Partial<Record<PolicyRole, number>>>(() =>
     initialAuxFor(seedLight),
   );
+  const [busyLayers, setBusyLayers] = useState(false);
 
-  // When the lights array reference changes (e.g. picker opened for a
-  // different fixture) re-seed local state from the new selection so
-  // we don't show stale values.
+  // Stable identity key so bulk re-opens reset state when the *set* of
+  // selected lights changes (not just lights[0]). Otherwise the picker
+  // can show stale hex/dimmer/aux when the parent rebuilds the array
+  // but happens to keep the same first element instance.
+  const lightsKey = lights.map((l) => l.id).join(",");
+
   useEffect(() => {
     setHex(rgbToHex(seedLight));
     setDimmer(seedLight?.dimmer ?? 255);
     setOn(seedLight?.on ?? true);
     setAux(initialAuxFor(seedLight));
-  }, [seedLight]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lightsKey]);
+
+  // Layers competing with this selection: not muted, and either
+  // universal (no mask) or with a mask that overlaps our light ids.
+  // These overwrite any manual color we push within ~33ms (one engine
+  // tick), so we surface them with a banner + remediation buttons.
+  const selectedIds = useMemo(() => lights.map((l) => l.id), [lights]);
+  const competing = useMemo<EffectLayer[]>(() => {
+    if (selectedIds.length === 0) return [];
+    const sel = new Set(selectedIds);
+    return layers.filter((l) => {
+      if (l.mute || l.auto_muted) return false;
+      if (!l.mask_light_ids || l.mask_light_ids.length === 0) return true;
+      return l.mask_light_ids.some((id) => sel.has(id));
+    });
+  }, [layers, selectedIds]);
 
   // Resolve aux roles available across the selection. We surface every
   // W/A/UV/W*/A*/UV* role that appears in the mode's channel list, not
@@ -112,25 +135,159 @@ export default function LightColorPicker({
         const all = await Api.listLights();
         const ids = new Set(lights.map((l) => l.id));
         onApplied?.(all.filter((l) => ids.has(l.id)));
+        notify?.(
+          `Color applied to ${lights.length} light${lights.length === 1 ? "" : "s"}`,
+          "success",
+        );
       } else {
         const updated = await Api.setColor(seedLight.id, body);
         onApplied?.([updated]);
+        notify?.("Color applied", "success");
       }
     } catch (e) {
       notify?.(String(e), "error");
     }
   };
 
-  // Commit on slider release / hex picker mouseup so we don't flood the
-  // server. Hex inputs commit immediately because they're discrete.
-  const onHexCommit = (next: string) => {
-    setHex(next);
+  const onPauseLayers = async () => {
+    if (competing.length === 0) return;
+    setBusyLayers(true);
+    try {
+      for (const layer of competing) {
+        if (layer.layer_id != null) {
+          await patchLayer(layer.layer_id, { mute: true });
+        } else {
+          // Transient (unsaved) layer — stop it directly.
+          try {
+            await Api.stopLive(layer.handle);
+          } catch {
+            // Best-effort; the layer may already be gone.
+          }
+        }
+      }
+      notify?.(
+        `Paused ${competing.length} layer${competing.length === 1 ? "" : "s"}`,
+        "success",
+      );
+    } catch (e) {
+      notify?.(String(e), "error");
+    } finally {
+      setBusyLayers(false);
+    }
+  };
+
+  const onDropFromLayers = async () => {
+    if (competing.length === 0 || selectedIds.length === 0) return;
+    setBusyLayers(true);
+    const sel = new Set(selectedIds);
+    try {
+      // For universal layers (no mask), we need a concrete "every
+      // light minus the selection" mask — fetch the rig once.
+      let allLightIds: number[] | null = null;
+      const ensureAllIds = async () => {
+        if (allLightIds === null) {
+          const all = await Api.listLights();
+          allLightIds = all.map((l) => l.id);
+        }
+        return allLightIds;
+      };
+      let updated = 0;
+      for (const layer of competing) {
+        if (layer.layer_id == null) continue; // transient — Pause is the path.
+        const existing = layer.mask_light_ids ?? [];
+        let nextMask: number[];
+        if (existing.length === 0) {
+          const all = await ensureAllIds();
+          nextMask = all.filter((id) => !sel.has(id));
+        } else {
+          nextMask = existing.filter((id) => !sel.has(id));
+        }
+        await patchLayer(layer.layer_id, { mask_light_ids: nextMask });
+        updated += 1;
+      }
+      if (updated > 0) {
+        notify?.(
+          `Removed selection from ${updated} layer${updated === 1 ? "" : "s"}`,
+          "success",
+        );
+      }
+    } catch (e) {
+      notify?.(String(e), "error");
+    } finally {
+      setBusyLayers(false);
+    }
+  };
+
+  // We track the latest hex via a ref so window-scoped pointer listeners
+  // can read the freshest value without re-binding on every render. The
+  // wheel onChange fires on every pointermove during a drag; flooding
+  // the server is avoided via a trailing debounced commit, *plus* an
+  // explicit commit on pointer release that fires even if the user
+  // dragged outside the wheel before letting go.
+  const hexRef = useRef(hex);
+  useEffect(() => {
+    hexRef.current = hex;
+  }, [hex]);
+  const debounceRef = useRef<number | null>(null);
+  const draggingRef = useRef(false);
+
+  const commitHex = (next: string) => {
+    if (debounceRef.current !== null) {
+      window.clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
     void apply({
       r: parseHex(next)[0],
       g: parseHex(next)[1],
       b: parseHex(next)[2],
     });
   };
+
+  const onHexCommit = (next: string) => {
+    setHex(next);
+    hexRef.current = next;
+    commitHex(next);
+  };
+
+  const onWheelChange = (next: string) => {
+    setHex(next);
+    hexRef.current = next;
+    if (debounceRef.current !== null) {
+      window.clearTimeout(debounceRef.current);
+    }
+    debounceRef.current = window.setTimeout(() => {
+      debounceRef.current = null;
+      commitHex(hexRef.current);
+    }, 250);
+  };
+
+  const onWheelPointerDown = () => {
+    draggingRef.current = true;
+    const release = () => {
+      if (!draggingRef.current) return;
+      draggingRef.current = false;
+      window.removeEventListener("pointerup", release);
+      window.removeEventListener("pointercancel", release);
+      window.removeEventListener("touchend", release);
+      window.removeEventListener("touchcancel", release);
+      commitHex(hexRef.current);
+    };
+    window.addEventListener("pointerup", release);
+    window.addEventListener("pointercancel", release);
+    window.addEventListener("touchend", release);
+    window.addEventListener("touchcancel", release);
+  };
+
+  // Cancel any pending debounce on unmount so we don't fire after the
+  // modal closes.
+  useEffect(() => {
+    return () => {
+      if (debounceRef.current !== null) {
+        window.clearTimeout(debounceRef.current);
+        debounceRef.current = null;
+      }
+    };
+  }, []);
 
   const onAuxChange = (role: PolicyRole, value: number) => {
     setAux((prev) => ({ ...prev, [role]: value }));
@@ -152,12 +309,60 @@ export default function LightColorPicker({
         </div>
       )}
 
-      <HexColorPicker
-        color={hex}
-        onChange={setHex}
-        onMouseUp={() => onHexCommit(hex)}
-        onTouchEnd={() => onHexCommit(hex)}
-      />
+      {competing.length > 0 && (
+        <div className="rounded-md bg-amber-950/40 px-3 py-2 text-xs text-amber-100 ring-1 ring-amber-800">
+          <div className="font-semibold">
+            {competing.length} effect layer{competing.length === 1 ? "" : "s"}{" "}
+            running on{" "}
+            {selectedIds.length === 1
+              ? "this light"
+              : `these ${selectedIds.length} lights`}
+            .
+          </div>
+          <div className="mt-0.5 text-amber-200/80">
+            Manual color will be overwritten on the next engine tick. Pause
+            the layers, or remove these lights from their masks.
+          </div>
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+            {competing.slice(0, 4).map((l) => (
+              <span
+                key={l.handle}
+                className="rounded bg-amber-900/40 px-1.5 py-0.5 text-[10px] ring-1 ring-amber-800"
+                title={l.error ?? ""}
+              >
+                {l.name}
+              </span>
+            ))}
+            {competing.length > 4 && (
+              <span className="text-[10px] text-amber-200/70">
+                +{competing.length - 4} more
+              </span>
+            )}
+            <div className="ml-auto flex gap-1.5">
+              <button
+                type="button"
+                disabled={busyLayers}
+                onClick={onPauseLayers}
+                className="rounded-md bg-amber-700/40 px-2 py-1 text-[11px] font-semibold text-amber-50 ring-1 ring-amber-700 hover:bg-amber-700/60 disabled:opacity-50"
+              >
+                Pause FX
+              </button>
+              <button
+                type="button"
+                disabled={busyLayers}
+                onClick={onDropFromLayers}
+                className="rounded-md bg-amber-900/40 px-2 py-1 text-[11px] font-semibold text-amber-100 ring-1 ring-amber-800 hover:bg-amber-900/60 disabled:opacity-50"
+              >
+                Remove from FX
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div onPointerDown={onWheelPointerDown}>
+        <HexColorPicker color={hex} onChange={onWheelChange} />
+      </div>
 
       <div className="flex items-center gap-2">
         <div

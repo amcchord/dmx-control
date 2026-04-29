@@ -37,14 +37,14 @@ from ..auth import AuthDep
 from ..config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
 from ..db import get_session
 from ..engine import (
-    EffectSpec,
     engine as effect_engine,
-    new_handle,
+    play_transient_layer,
 )
 from ..models import (
     Controller,
     DesignerConversation,
     Effect,
+    EffectLayer,
     Light,
     LightModelMode,
     Palette,
@@ -71,6 +71,9 @@ from ..schemas import (
     DesignerConversationOut,
     DesignerConversationRename,
     DesignerConversationSummary,
+    DesignerCritique,
+    DesignerCritiqueRequest,
+    DesignerCritiqueResponse,
     DesignerEffectProposalBody,
     DesignerMessageIn,
     DesignerMessageOut,
@@ -82,6 +85,7 @@ from ..schemas import (
     EffectControls,
     PaletteEntry,
 )
+from ..base_state_log import log as base_state_log
 from ._capture import apply_state_to_light, push_light
 
 log = logging.getLogger(__name__)
@@ -1070,6 +1074,9 @@ def _convo_to_out(row: DesignerConversation) -> DesignerConversationOut:
                 rendered_p = _proposal_from_dict(p)
                 if rendered_p is not None:
                     last_props.append(rendered_p)
+    last_critique: Optional[dict[str, Any]] = None
+    if isinstance(row.last_critique, dict) and row.last_critique:
+        last_critique = dict(row.last_critique)
     return DesignerConversationOut(
         id=row.id,
         name=row.name or "",
@@ -1077,6 +1084,7 @@ def _convo_to_out(row: DesignerConversation) -> DesignerConversationOut:
         updated_at=row.updated_at.isoformat() if row.updated_at else "",
         messages=rendered,
         last_proposals=last_props,
+        last_critique=last_critique,
     )
 
 
@@ -1248,10 +1256,16 @@ def apply_proposal(
         params = merge_with_schema(
             list(script.meta.param_schema), body.get("params") or {}
         )
-        handle = new_handle()
-        spec = EffectSpec(
-            handle=handle,
-            effect_id=None,
+        # Replace any prior transient layer started from this chat so we
+        # don't pile up dead rows when the user clicks Play repeatedly.
+        if row.last_layer_id is not None:
+            old = sess.get(EffectLayer, row.last_layer_id)
+            if old is not None:
+                effect_engine.stop_by_layer_id(old.id, immediate=True)
+                sess.delete(old)
+                sess.commit()
+        layer, handle = play_transient_layer(
+            sess,
             name=str(prop.get("name") or "Live effect"),
             script=script,
             palette_colors=palette_colors,
@@ -1259,13 +1273,21 @@ def apply_proposal(
             targets=[],
             spread=str(body.get("spread", "across_lights")),
             params=params,
+            target_channels=target_channels,
             intensity=controls["intensity"],
             fade_in_s=controls["fade_in_s"],
             fade_out_s=controls["fade_out_s"],
-            target_channels=target_channels,
+            palette_id=palette_id if isinstance(palette_id, int) else None,
         )
-        effect_engine.play(spec)
-        return {"ok": True, "kind": "effect", "handle": handle}
+        row.last_layer_id = layer.id
+        sess.add(row)
+        sess.commit()
+        return {
+            "ok": True,
+            "kind": "effect",
+            "handle": handle,
+            "layer_id": layer.id,
+        }
 
     # Default: state / scene
     entries = [
@@ -1291,6 +1313,18 @@ def apply_proposal(
     sess.commit()
     for light in lights:
         push_light(light)
+    if applied:
+        prop_kind = "scene" if kind == "scene" else "state"
+        proposal_name = str(prop.get("name") or "Designer apply")
+        ctrl_ids = {int(l.controller_id) for l in lights}
+        ctrl_id = next(iter(ctrl_ids)) if len(ctrl_ids) == 1 else None
+        prefix = "Scene" if prop_kind == "scene" else "State"
+        base_state_log.record(
+            prop_kind,
+            title=f"{prefix} (Designer): {proposal_name}",
+            light_ids=list(by_id.keys()),
+            controller_id=ctrl_id,
+        )
     return {"ok": True, "applied": applied}
 
 
@@ -1419,6 +1453,356 @@ def save_proposal(
     sess.commit()
     sess.refresh(state)
     return {"ok": True, "kind": "state", "id": state.id, "name": name}
+
+
+# ---------------------------------------------------------------------------
+# Self-critique ("double-check")
+# ---------------------------------------------------------------------------
+_VERIFY_TOOL_NAME = "verify_design"
+
+_VERIFY_SYSTEM = (
+    "You are a design QA reviewer for a stage lighting controller. The "
+    "user gave a chat assistant a design request; the assistant returned "
+    "a structured proposal (a rig State, controller Scene, palette, or "
+    "Lua effect). Your job is to verify, objectively and conservatively, "
+    "whether the proposal addresses the user's request given the rig.\n\n"
+    "Always answer by calling the verify_design tool exactly once. Do not "
+    "answer in plain text. Be specific: cite light_ids, controller names, "
+    "color choices, target_channels, etc. as evidence. Do NOT propose "
+    "alternate designs - just review.\n\n"
+    "Verdict scale:\n"
+    "- looks_good: proposal cleanly addresses the request, no concerns.\n"
+    "- minor_issues: small mismatches the operator can decide to ignore.\n"
+    "- needs_review: meaningful gaps or wrong assumptions; user should "
+    "double-check before applying.\n"
+    "- regenerate: proposal materially mis-targets the request (wrong "
+    "lights, wrong colors, wrong concept) and should be redone."
+)
+
+
+def _verify_tool_schema() -> dict[str, Any]:
+    return {
+        "name": _VERIFY_TOOL_NAME,
+        "description": (
+            "Return a structured QA review of the proposal. Always call "
+            "this tool exactly once."
+        ),
+        "input_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "intent_summary": {
+                    "type": "string",
+                    "description": (
+                        "1-2 sentences describing what you think the user "
+                        "actually wanted, in your own words."
+                    ),
+                },
+                "coverage": {
+                    "type": "array",
+                    "description": (
+                        "Discrete requirements you extracted from the user "
+                        "request, each marked addressed=true/false with "
+                        "concrete evidence from the proposal."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "requirement": {"type": "string"},
+                            "addressed": {"type": "boolean"},
+                            "evidence": {"type": "string"},
+                        },
+                        "required": ["requirement", "addressed"],
+                    },
+                },
+                "risks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "issue": {"type": "string"},
+                            "severity": {
+                                "type": "string",
+                                "enum": ["low", "med", "high"],
+                            },
+                        },
+                        "required": ["issue", "severity"],
+                    },
+                },
+                "suggestions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Short, actionable nudges the user could ask for "
+                        "if they wanted a closer match. Optional."
+                    ),
+                },
+                "verdict": {
+                    "type": "string",
+                    "enum": [
+                        "looks_good",
+                        "minor_issues",
+                        "needs_review",
+                        "regenerate",
+                    ],
+                },
+                "confidence": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                },
+            },
+            "required": [
+                "intent_summary",
+                "coverage",
+                "verdict",
+                "confidence",
+            ],
+        },
+    }
+
+
+def _last_user_text_from_history(
+    messages: Iterable[dict[str, Any]],
+) -> Optional[str]:
+    """Walk back through the stored Anthropic-shaped log and return the
+    most recent user-authored plain text turn, if any."""
+    for m in reversed(list(messages)):
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            chunks: list[str] = []
+            for blk in content:
+                if not isinstance(blk, dict):
+                    continue
+                if blk.get("type") == "text":
+                    txt = blk.get("text") or ""
+                    if isinstance(txt, str) and txt.strip():
+                        chunks.append(txt.strip())
+            if chunks:
+                return "\n\n".join(chunks)
+    return None
+
+
+def _coerce_critique(payload: Any) -> DesignerCritique:
+    """Defensive parse of the verify_design tool input. Falls back to a
+    neutral critique shape if the model returns a malformed payload so
+    the UI always has *something* to render."""
+    if not isinstance(payload, dict):
+        return DesignerCritique(
+            intent_summary="(verifier returned malformed output)",
+            verdict="needs_review",
+            confidence=0.0,
+        )
+    coverage_raw = payload.get("coverage") or []
+    coverage: list[dict[str, Any]] = []
+    for c in coverage_raw if isinstance(coverage_raw, list) else []:
+        if not isinstance(c, dict):
+            continue
+        req = c.get("requirement")
+        if not isinstance(req, str) or not req.strip():
+            continue
+        coverage.append(
+            {
+                "requirement": req.strip()[:500],
+                "addressed": bool(c.get("addressed", False)),
+                "evidence": (
+                    c["evidence"].strip()[:500]
+                    if isinstance(c.get("evidence"), str)
+                    else None
+                ),
+            }
+        )
+    risks_raw = payload.get("risks") or []
+    risks: list[dict[str, Any]] = []
+    for r in risks_raw if isinstance(risks_raw, list) else []:
+        if not isinstance(r, dict):
+            continue
+        issue = r.get("issue")
+        if not isinstance(issue, str) or not issue.strip():
+            continue
+        sev = r.get("severity")
+        if sev not in ("low", "med", "high"):
+            sev = "low"
+        risks.append({"issue": issue.strip()[:500], "severity": sev})
+    suggestions_raw = payload.get("suggestions") or []
+    suggestions: list[str] = []
+    for s in suggestions_raw if isinstance(suggestions_raw, list) else []:
+        if isinstance(s, str) and s.strip():
+            suggestions.append(s.strip()[:500])
+    verdict = payload.get("verdict")
+    if verdict not in (
+        "looks_good", "minor_issues", "needs_review", "regenerate"
+    ):
+        verdict = "needs_review"
+    try:
+        confidence = float(payload.get("confidence") or 0.5)
+    except (TypeError, ValueError):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, confidence))
+    intent = payload.get("intent_summary")
+    if not isinstance(intent, str):
+        intent = ""
+    return DesignerCritique(
+        intent_summary=intent.strip()[:1000],
+        coverage=coverage,
+        risks=risks,
+        suggestions=suggestions,
+        verdict=verdict,
+        confidence=confidence,
+    )
+
+
+def _strip_proposal_for_critique(prop: dict[str, Any]) -> dict[str, Any]:
+    """Trim a proposal payload before sending it to the verifier so we
+    don't blow the context window with huge per-light arrays."""
+    out: dict[str, Any] = {
+        "proposal_id": prop.get("proposal_id"),
+        "kind": prop.get("kind"),
+        "name": prop.get("name"),
+        "notes": prop.get("notes"),
+        "controller_id": prop.get("controller_id"),
+    }
+    lights = prop.get("lights")
+    if isinstance(lights, list):
+        out["lights_count"] = len(lights)
+        out["lights"] = lights[:200]
+    palette_entries = prop.get("palette_entries")
+    if isinstance(palette_entries, list):
+        out["palette_entries"] = palette_entries[:32]
+    effect = prop.get("effect")
+    if isinstance(effect, dict):
+        out["effect"] = {
+            k: v
+            for k, v in effect.items()
+            if k in (
+                "spread",
+                "palette_id",
+                "target_channels",
+                "params",
+                "controls",
+                "light_ids",
+                "targets",
+                "builtin",
+                "source",
+            )
+        }
+        src = out["effect"].get("source")
+        if isinstance(src, str) and len(src) > 6000:
+            out["effect"]["source"] = src[:6000] + "\n-- (truncated for review)"
+    return out
+
+
+def _run_verifier(
+    rig: dict[str, Any],
+    user_request: str,
+    proposal: dict[str, Any],
+) -> tuple[DesignerCritique, Optional[dict[str, Any]]]:
+    """Call Anthropic with the verify_design tool. Returns the parsed
+    critique and an Anthropic ``usage`` dict (or ``None`` on failure)."""
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    system = (
+        _VERIFY_SYSTEM
+        + "\n\nRig snapshot (read-only, authoritative):\n"
+        + json.dumps(rig, ensure_ascii=False)
+    )
+    user_payload = {
+        "user_request": user_request,
+        "proposal": _strip_proposal_for_critique(proposal),
+    }
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "Review the proposal below against the user's request. "
+                "Call verify_design exactly once.\n\n"
+                + json.dumps(user_payload, ensure_ascii=False, indent=2)
+            ),
+        },
+    ]
+    resp = client.messages.create(
+        model=ANTHROPIC_MODEL,
+        max_tokens=2048,
+        system=system,
+        tools=[_verify_tool_schema()],
+        tool_choice={"type": "tool", "name": _VERIFY_TOOL_NAME},
+        messages=messages,
+    )
+    payload: Optional[dict[str, Any]] = None
+    for block in getattr(resp, "content", []) or []:
+        if getattr(block, "type", None) == "tool_use" and getattr(
+            block, "name", None
+        ) == _VERIFY_TOOL_NAME:
+            payload = getattr(block, "input", None) or {}
+            break
+    critique = _coerce_critique(payload)
+    usage_dict: Optional[dict[str, Any]] = None
+    usage = getattr(resp, "usage", None)
+    if usage is not None:
+        usage_dict = {
+            "input_tokens": getattr(usage, "input_tokens", None),
+            "output_tokens": getattr(usage, "output_tokens", None),
+        }
+        critique.usage = usage_dict
+    return critique, usage_dict
+
+
+@router.post(
+    "/conversations/{cid}/critique", response_model=DesignerCritiqueResponse
+)
+def critique_proposal(
+    cid: int,
+    payload: DesignerCritiqueRequest,
+    sess: Session = Depends(get_session),
+) -> DesignerCritiqueResponse:
+    """Run the verifier against the latest proposal in this conversation.
+
+    Persists the critique on ``DesignerConversation.last_critique`` keyed
+    by ``proposal_id`` so the UI can re-render it after a page reload
+    without re-spending tokens. Best-effort: on Anthropic failure we
+    return a "needs_review" verdict with the error in the intent summary
+    so the UI still renders a panel."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(503, "Claude is not configured on this server")
+    row = sess.get(DesignerConversation, cid)
+    if row is None:
+        raise HTTPException(404, "conversation not found")
+    prop = _find_proposal(row, payload.proposal_id)
+
+    user_request = (
+        (payload.user_request or "").strip()
+        or _last_user_text_from_history(row.messages or [])
+        or "(no user message recorded)"
+    )
+
+    rig = build_rig_context(sess)
+    try:
+        critique, _usage = _run_verifier(rig, user_request, prop)
+    except Exception as exc:
+        log.warning("verifier failed for designer cid=%s: %s", cid, exc)
+        critique = DesignerCritique(
+            intent_summary=f"Verifier unavailable: {exc}",
+            verdict="needs_review",
+            confidence=0.0,
+        )
+
+    cache = dict(row.last_critique or {})
+    cache[payload.proposal_id] = critique.model_dump()
+    row.last_critique = cache
+    row.updated_at = datetime.utcnow()
+    sess.add(row)
+    sess.commit()
+
+    return DesignerCritiqueResponse(
+        ok=True, proposal_id=payload.proposal_id, critique=critique
+    )
 
 
 # ---------------------------------------------------------------------------

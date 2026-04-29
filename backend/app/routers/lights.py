@@ -3,6 +3,7 @@ from sqlmodel import Session, select
 
 from ..artnet import manager, rebuild_manager_sync
 from ..auth import AuthDep
+from ..base_state_log import log as base_state_log
 from ..db import get_session
 from ..models import Controller, Light, LightModel, LightModelMode
 from ..schemas import (
@@ -270,6 +271,13 @@ def set_color(
     sess.commit()
     sess.refresh(l)
     _push(l)
+    base_state_log.record(
+        "manual_color",
+        title=f"Manual color · {l.name}",
+        light_ids=[l.id],
+        controller_id=l.controller_id,
+        rgb=(int(req.r), int(req.g), int(req.b)),
+    )
     return _to_out(l)
 
 
@@ -357,4 +365,23 @@ def bulk_color(req: BulkColorRequest, sess: Session = Depends(get_session)) -> d
             continue
         sess.refresh(l)
         _push(l)
+    if touched:
+        # Single shared controller? Pin the entry to it; otherwise log
+        # it as cross-controller so the UI doesn't claim a ctrl context
+        # it shouldn't.
+        ctrl_ids: set[int] = set()
+        for lid in touched:
+            row = by_id.get(lid)
+            if row is not None:
+                ctrl_ids.add(int(row.controller_id))
+        ctrl_id = next(iter(ctrl_ids)) if len(ctrl_ids) == 1 else None
+        n = len(touched)
+        title = f"Manual color · {n} {'light' if n == 1 else 'lights'}"
+        base_state_log.record(
+            "manual_color",
+            title=title,
+            light_ids=list(touched),
+            controller_id=ctrl_id,
+            rgb=(int(req.r), int(req.g), int(req.b)),
+        )
     return {"updated": len(touched)}

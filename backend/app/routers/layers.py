@@ -28,6 +28,7 @@ from fastapi import (
 from sqlmodel import Session, select
 
 from ..auth import AuthDep, is_authenticated_request
+from ..base_state_log import log as base_state_log
 from ..db import get_session
 from ..engine import build_spec_from_layer, engine
 from ..lua import ScriptError
@@ -269,12 +270,21 @@ async def layers_ws(websocket: WebSocket) -> None:
 
     queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=64)
     engine.subscribe(queue)
+    # The base-state log shares this WS so clients only have to manage
+    # one connection: it sends ``{type: "base_state", log: [...]}``
+    # frames whenever a manual color / scene / state / palette / blackout
+    # is recorded.
+    base_state_log.subscribe(queue)
     try:
-        # Initial snapshot.
+        # Initial snapshots — both stacks at once.
         await websocket.send_json({
             "type": "layers",
             "layers": engine.layer_snapshot(),
             "health": engine.health_snapshot(),
+        })
+        await websocket.send_json({
+            "type": "base_state",
+            "log": base_state_log.snapshot(),
         })
         while True:
             try:
@@ -291,6 +301,7 @@ async def layers_ws(websocket: WebSocket) -> None:
                 break
     finally:
         engine.unsubscribe(queue)
+        base_state_log.unsubscribe(queue)
         try:
             await websocket.close()
         except Exception:

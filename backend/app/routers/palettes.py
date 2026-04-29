@@ -19,6 +19,7 @@ from sqlmodel import Session, select
 
 from ..artnet import manager
 from ..auth import AuthDep
+from ..base_state_log import log as base_state_log
 from .. import config as _config
 from ..db import get_session
 from ..models import Light, LightModelMode, Palette
@@ -435,6 +436,20 @@ def apply_palette(
                 "zone_state": dict(light.zone_state or {}),
                 "motion_state": dict(light.motion_state or {}),
             },
+        )
+    if lights:
+        ctrl_ids = {int(l.controller_id) for l in lights if l.id is not None}
+        ctrl_id = next(iter(ctrl_ids)) if len(ctrl_ids) == 1 else None
+        rgb: Optional[tuple[int, int, int]] = None
+        if entries:
+            first = entries[0]
+            rgb = (int(first.r), int(first.g), int(first.b))
+        base_state_log.record(
+            "palette",
+            title=f"Palette: {p.name}",
+            light_ids=[l.id for l in lights if l.id is not None],
+            controller_id=ctrl_id,
+            rgb=rgb,
         )
     return {"updated": len(lights)}
 

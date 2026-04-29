@@ -10,6 +10,7 @@ import {
   ApiError,
   Controller,
   DEFAULT_EFFECT_CONTROLS,
+  DesignerCritique,
   Effect,
   EffectChatMessage,
   EffectControls,
@@ -29,7 +30,15 @@ import {
 import EffectParamsForm from "../components/EffectParamsForm";
 import LuaEditor from "../components/LuaEditor";
 import PaletteSwatch from "../components/PaletteSwatch";
+import VerificationPanel from "../components/VerificationPanel";
 import { useToast } from "../toast";
+
+const EFFECT_AUTO_VERIFY_KEY = "effectChat.autoVerify";
+
+type EffectCritiqueEntry = {
+  critique: DesignerCritique | null;
+  error: string | null;
+};
 
 const SPREADS: { key: PaletteSpread; label: string; hint: string }[] = [
   { key: "across_lights", label: "Lights", hint: "One step per fixture." },
@@ -170,6 +179,30 @@ export default function Effects() {
     attempts: number;
   } | null>(null);
   const chatAbortRef = useRef<(() => void) | null>(null);
+  const lastUserChatTextRef = useRef<string>("");
+  const [autoVerify, setAutoVerify] = useState<boolean>(() => {
+    try {
+      const v = window.localStorage.getItem(EFFECT_AUTO_VERIFY_KEY);
+      if (v === null) return true;
+      return v === "1" || v === "true";
+    } catch {
+      return true;
+    }
+  });
+  const [chatCritiques, setChatCritiques] = useState<
+    Record<string, EffectCritiqueEntry>
+  >({});
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        EFFECT_AUTO_VERIFY_KEY,
+        autoVerify ? "1" : "0",
+      );
+    } catch {
+      // ignore
+    }
+  }, [autoVerify]);
 
   const refreshAll = useCallback(async () => {
     try {
@@ -537,10 +570,42 @@ export default function Effects() {
       setActiveConvoId(cid);
       setChatMessages(convo.messages);
       setChatProposal(convo.last_proposal);
+      const cached = convo.last_critique || {};
+      const next: Record<string, EffectCritiqueEntry> = {};
+      for (const [pid, critique] of Object.entries(cached)) {
+        next[pid] = { critique, error: null };
+      }
+      setChatCritiques(next);
     } catch (e) {
       toast.push(String(e), "error");
     }
   }
+
+  const runEffectCritique = useCallback(
+    async (cid: number, p: EffectProposal, userText?: string) => {
+      setChatCritiques((prev) => ({
+        ...prev,
+        [p.proposal_id]: { critique: null, error: null },
+      }));
+      try {
+        const res = await Api.effectChat.critiqueProposal(
+          cid,
+          p.proposal_id,
+          userText,
+        );
+        setChatCritiques((prev) => ({
+          ...prev,
+          [p.proposal_id]: { critique: res.critique, error: null },
+        }));
+      } catch (e) {
+        setChatCritiques((prev) => ({
+          ...prev,
+          [p.proposal_id]: { critique: null, error: String(e) },
+        }));
+      }
+    },
+    [],
+  );
 
   async function sendChat() {
     const text = chatInput.trim();
@@ -553,6 +618,7 @@ export default function Effects() {
     setToolBuffer("");
     setChatRetry(null);
     setChatScriptError(null);
+    lastUserChatTextRef.current = text;
     const optimistic: EffectChatMessage = {
       role: "user",
       text,
@@ -587,6 +653,9 @@ export default function Effects() {
         setToolBuffer("");
         setChatRetry(null);
         setChatStreaming(false);
+        if (autoVerify && convo.last_proposal) {
+          void runEffectCritique(convo.id, convo.last_proposal, text);
+        }
       },
       onError: (msg) => {
         toast.push(msg, "error");
@@ -788,6 +857,23 @@ export default function Effects() {
           onLoadProposal={loadProposal}
           onApplyProposal={applyProposal}
           onSaveProposal={saveProposal}
+          autoVerify={autoVerify}
+          setAutoVerify={setAutoVerify}
+          critiques={chatCritiques}
+          onVerifyProposal={(p) => {
+            if (activeConvoId === null) return;
+            void runEffectCritique(
+              activeConvoId,
+              p,
+              lastUserChatTextRef.current || undefined,
+            );
+          }}
+          onRegenerate={(suggestion) => {
+            const seed = suggestion?.trim()
+              ? `Refine the previous proposal: ${suggestion.trim()}`
+              : "Regenerate the previous effect with a different approach.";
+            setChatInput(seed);
+          }}
         />
 
         <div className="space-y-3">
@@ -1550,6 +1636,11 @@ function ChatPanel({
   onLoadProposal,
   onApplyProposal,
   onSaveProposal,
+  autoVerify,
+  setAutoVerify,
+  critiques,
+  onVerifyProposal,
+  onRegenerate,
 }: {
   aiEnabled: boolean;
   conversations: EffectConversationSummary[];
@@ -1573,18 +1664,37 @@ function ChatPanel({
   onLoadProposal: (p: EffectProposal) => void;
   onApplyProposal: (p: EffectProposal) => void;
   onSaveProposal: (p: EffectProposal) => void;
+  autoVerify: boolean;
+  setAutoVerify: (v: boolean) => void;
+  critiques: Record<string, EffectCritiqueEntry>;
+  onVerifyProposal: (p: EffectProposal) => void;
+  onRegenerate: (suggestion?: string) => void;
 }) {
   const draftPreview = useMemo(() => extractDraftPreview(toolBuffer), [toolBuffer]);
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      {activeConvoId !== null && (
-        <button
-          className="btn-ghost mb-1 self-end !px-2 !py-0 text-[11px]"
-          onClick={onNewConvo}
+      <div className="mb-1 flex items-center justify-end gap-2">
+        <label
+          className="flex cursor-pointer items-center gap-1 rounded-md border border-line bg-bg-elev px-1.5 py-0.5 text-[10px] text-slate-200"
+          title="Run a second Claude pass to double-check each effect proposal."
         >
-          New chat
-        </button>
-      )}
+          <input
+            type="checkbox"
+            className="accent-accent"
+            checked={autoVerify}
+            onChange={(e) => setAutoVerify(e.currentTarget.checked)}
+          />
+          Auto-verify
+        </label>
+        {activeConvoId !== null && (
+          <button
+            className="btn-ghost !px-2 !py-0 text-[11px]"
+            onClick={onNewConvo}
+          >
+            New chat
+          </button>
+        )}
+      </div>
       {conversations.length > 0 && activeConvoId === null && (
         <div className="mb-2 max-h-20 space-y-1 overflow-y-auto pr-1">
           {conversations.map((c) => (
@@ -1599,17 +1709,44 @@ function ChatPanel({
         </div>
       )}
       <div className="flex-1 space-y-2 overflow-y-auto pr-1">
-        {chatMessages.map((m, i) => (
-          <ChatBubble
-            key={i}
-            role={m.role}
-            text={m.text}
-            proposal={m.proposal}
-            onLoad={onLoadProposal}
-            onApply={onApplyProposal}
-            onSave={onSaveProposal}
-          />
-        ))}
+        {chatMessages.map((m, i) => {
+          const entry = m.proposal
+            ? critiques[m.proposal.proposal_id]
+            : undefined;
+          return (
+            <div key={i}>
+              <ChatBubble
+                role={m.role}
+                text={m.text}
+                proposal={m.proposal}
+                onLoad={onLoadProposal}
+                onApply={onApplyProposal}
+                onSave={onSaveProposal}
+              />
+              {m.proposal && (autoVerify || entry !== undefined) && (
+                <div className="mt-1">
+                  <VerificationPanel
+                    enabled={autoVerify || entry !== undefined}
+                    critique={entry === undefined ? null : entry.critique}
+                    error={entry?.error ?? null}
+                    onVerify={() => onVerifyProposal(m.proposal!)}
+                    onRegenerate={onRegenerate}
+                  />
+                </div>
+              )}
+              {m.proposal && !autoVerify && entry === undefined && (
+                <div className="mt-1 text-right">
+                  <button
+                    className="btn-ghost !px-2 !py-0.5 text-[10px]"
+                    onClick={() => onVerifyProposal(m.proposal!)}
+                  >
+                    Verify
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
         {chatStreaming && (chatStream || toolBuffer || chatRetry) && (
           <div className="rounded-md bg-bg-elev p-2 text-xs ring-1 ring-line">
             <div className="text-[10px] uppercase tracking-wide text-muted">
@@ -1652,12 +1789,38 @@ function ChatPanel({
           </div>
         )}
         {!chatStreaming && chatProposal && (
-          <ProposalCard
-            proposal={chatProposal}
-            onLoad={onLoadProposal}
-            onApply={onApplyProposal}
-            onSave={onSaveProposal}
-          />
+          <div>
+            <ProposalCard
+              proposal={chatProposal}
+              onLoad={onLoadProposal}
+              onApply={onApplyProposal}
+              onSave={onSaveProposal}
+            />
+            {(() => {
+              const entry = critiques[chatProposal.proposal_id];
+              if (!autoVerify && entry === undefined) {
+                return (
+                  <div className="mt-1 text-right">
+                    <button
+                      className="btn-ghost !px-2 !py-0.5 text-[10px]"
+                      onClick={() => onVerifyProposal(chatProposal)}
+                    >
+                      Verify
+                    </button>
+                  </div>
+                );
+              }
+              return (
+                <VerificationPanel
+                  enabled={autoVerify || entry !== undefined}
+                  critique={entry === undefined ? null : entry.critique}
+                  error={entry?.error ?? null}
+                  onVerify={() => onVerifyProposal(chatProposal)}
+                  onRegenerate={onRegenerate}
+                />
+              );
+            })()}
+          </div>
         )}
       </div>
       <div className="mt-2 flex gap-1">

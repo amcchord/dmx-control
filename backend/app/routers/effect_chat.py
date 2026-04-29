@@ -22,7 +22,10 @@ from sqlmodel import Session, select
 from ..auth import AuthDep
 from ..config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
 from ..db import get_session
-from ..engine import EffectSpec, engine as effect_engine, new_handle
+from ..engine import (
+    engine as effect_engine,
+    play_transient_layer,
+)
 from ..lua import (
     LuaScript,
     ScriptError,
@@ -32,9 +35,12 @@ from ..lua import (
     smoke_test_source,
 )
 from ..lua.runtime import merge_with_schema
-from ..models import Effect, EffectConversation, Palette
+from ..models import Effect, EffectConversation, EffectLayer, Palette
 from ..rig_context import build_rig_context
 from ..schemas import (
+    DesignerCritique,
+    DesignerCritiqueRequest,
+    DesignerCritiqueResponse,
     EFFECT_FADE_MAX_S,
     EFFECT_TARGET_CHANNELS,
     EffectChatMessageOut,
@@ -45,6 +51,10 @@ from ..schemas import (
     EffectConversationSummary,
     EffectMessageIn,
     EffectProposal,
+)
+from .designer import (
+    _last_user_text_from_history as _last_user_text_from_history,
+    _run_verifier as _run_verifier,
 )
 
 log = logging.getLogger(__name__)
@@ -402,6 +412,9 @@ def _convo_to_out(row: EffectConversation) -> EffectConversationOut:
     last = None
     if isinstance(row.last_proposal, dict):
         last = _proposal_from_dict(row.last_proposal)
+    last_critique: Optional[dict] = None
+    if isinstance(row.last_critique, dict) and row.last_critique:
+        last_critique = dict(row.last_critique)
     return EffectConversationOut(
         id=row.id,
         name=row.name or "",
@@ -409,6 +422,7 @@ def _convo_to_out(row: EffectConversation) -> EffectConversationOut:
         updated_at=row.updated_at.isoformat() if row.updated_at else "",
         messages=rendered,
         last_proposal=last,
+        last_critique=last_critique,
     )
 
 
@@ -1051,10 +1065,17 @@ def apply_proposal(
     controls_raw = prop.get("controls") or {}
     controls = _sanitize_controls(controls_raw)
 
-    handle = new_handle()
-    spec = EffectSpec(
-        handle=handle,
-        effect_id=None,
+    # Replace any prior transient layer started from this chat so the
+    # layer rail stays clean across iterative re-plays.
+    if row.last_layer_id is not None:
+        old = sess.get(EffectLayer, row.last_layer_id)
+        if old is not None:
+            effect_engine.stop_by_layer_id(old.id, immediate=True)
+            sess.delete(old)
+            sess.commit()
+
+    layer, handle = play_transient_layer(
+        sess,
         name=str(prop.get("name") or "Live effect"),
         script=script,
         palette_colors=palette_colors,
@@ -1062,13 +1083,21 @@ def apply_proposal(
         targets=[],
         spread=str(prop.get("spread") or "across_lights"),
         params=params,
+        target_channels=list(prop.get("target_channels") or ["rgb"]),
         intensity=controls["intensity"],
         fade_in_s=controls["fade_in_s"],
         fade_out_s=controls["fade_out_s"],
-        target_channels=list(prop.get("target_channels") or ["rgb"]),
+        palette_id=pid if isinstance(pid, int) else None,
     )
-    effect_engine.play(spec)
-    return {"ok": True, "handle": handle, "name": spec.name}
+    row.last_layer_id = layer.id
+    sess.add(row)
+    sess.commit()
+    return {
+        "ok": True,
+        "handle": handle,
+        "name": layer.name,
+        "layer_id": layer.id,
+    }
 
 
 @router.post("/conversations/{cid}/save")
@@ -1115,3 +1144,83 @@ def save_proposal(
     sess.commit()
     sess.refresh(eff)
     return {"ok": True, "id": eff.id, "name": name}
+
+
+# ---------------------------------------------------------------------------
+# Self-critique ("double-check")
+# ---------------------------------------------------------------------------
+def _wrap_effect_proposal_for_review(prop: dict[str, Any]) -> dict[str, Any]:
+    """Reshape an effect-chat proposal into the same envelope the
+    designer verifier expects, so we can reuse the shared verifier."""
+    src = prop.get("source")
+    effect_body: dict[str, Any] = {
+        k: prop.get(k)
+        for k in (
+            "spread",
+            "palette_id",
+            "target_channels",
+            "params",
+            "controls",
+            "light_ids",
+            "targets",
+        )
+        if prop.get(k) is not None
+    }
+    if isinstance(src, str):
+        if len(src) > 6000:
+            effect_body["source"] = src[:6000] + "\n-- (truncated for review)"
+        else:
+            effect_body["source"] = src
+    return {
+        "proposal_id": prop.get("proposal_id"),
+        "kind": "effect",
+        "name": prop.get("name"),
+        "notes": prop.get("summary") or prop.get("description"),
+        "effect": effect_body,
+    }
+
+
+@router.post(
+    "/conversations/{cid}/critique", response_model=DesignerCritiqueResponse
+)
+def critique_proposal(
+    cid: int,
+    payload: DesignerCritiqueRequest,
+    sess: Session = Depends(get_session),
+) -> DesignerCritiqueResponse:
+    """Mirror of :func:`designer.critique_proposal` for the effect chat."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(503, "Claude is not configured on this server")
+    row = sess.get(EffectConversation, cid)
+    if row is None:
+        raise HTTPException(404, "conversation not found")
+    prop = _find_proposal(row, payload.proposal_id)
+
+    user_request = (
+        (payload.user_request or "").strip()
+        or _last_user_text_from_history(row.messages or [])
+        or "(no user message recorded)"
+    )
+
+    rig = build_rig_context(sess)
+    wrapped = _wrap_effect_proposal_for_review(prop)
+    try:
+        critique, _usage = _run_verifier(rig, user_request, wrapped)
+    except Exception as exc:
+        log.warning("verifier failed for effect-chat cid=%s: %s", cid, exc)
+        critique = DesignerCritique(
+            intent_summary=f"Verifier unavailable: {exc}",
+            verdict="needs_review",
+            confidence=0.0,
+        )
+
+    cache = dict(row.last_critique or {})
+    cache[payload.proposal_id] = critique.model_dump()
+    row.last_critique = cache
+    row.updated_at = datetime.utcnow()
+    sess.add(row)
+    sess.commit()
+
+    return DesignerCritiqueResponse(
+        ok=True, proposal_id=payload.proposal_id, critique=critique
+    )

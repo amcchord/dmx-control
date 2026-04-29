@@ -3,6 +3,8 @@ import { Link, useParams } from "react-router-dom";
 import { Api, Controller, Light, LightModel, LightModelMode } from "../api";
 import { useToast } from "../toast";
 import { rgbToHex } from "../util";
+import LightColorPicker from "../components/LightColorPicker";
+import Modal from "../components/Modal";
 
 type LightForm = {
   name: string;
@@ -156,6 +158,7 @@ export default function ControllerDetail() {
   const [models, setModels] = useState<LightModel[]>([]);
   const [lights, setLights] = useState<Light[]>([]);
   const [loading, setLoading] = useState(true);
+  const [colorOpen, setColorOpen] = useState(false);
 
   const refresh = async () => {
     try {
@@ -245,6 +248,16 @@ export default function ControllerDetail() {
               </p>
             )}
           </div>
+          <div className="shrink-0">
+            <button
+              className="btn-primary text-sm"
+              disabled={controllerLights.length === 0}
+              onClick={() => setColorOpen(true)}
+              title="Color every fixture on this controller"
+            >
+              Set color
+            </button>
+          </div>
         </div>
       </div>
 
@@ -254,6 +267,27 @@ export default function ControllerDetail() {
         lights={controllerLights}
         onChanged={refresh}
       />
+
+      <Modal
+        open={colorOpen}
+        onClose={() => setColorOpen(false)}
+        title={`Color · ${controller.name} (${controllerLights.length} ${
+          controllerLights.length === 1 ? "light" : "lights"
+        })`}
+        size="md"
+      >
+        {controllerLights.length > 0 && (
+          <LightColorPicker
+            lights={controllerLights}
+            models={models}
+            notify={(msg, kind) => toast.push(msg, kind)}
+            onApplied={(updated) => {
+              const byId = new Map(updated.map((l) => [l.id, l]));
+              setLights((prev) => prev.map((l) => byId.get(l.id) ?? l));
+            }}
+          />
+        )}
+      </Modal>
     </div>
   );
 }

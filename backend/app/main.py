@@ -16,6 +16,7 @@ from .engine import engine as effect_engine
 from .lua import ScriptError
 from .routers import ai as ai_router
 from .routers import auth as auth_router
+from .routers import base_state as base_state_router
 from .routers import controllers as controllers_router
 from .routers import designer as designer_router
 from .routers import effect_chat as effect_chat_router
@@ -155,6 +156,7 @@ app.include_router(layers_router.ws_router)
 app.include_router(scenes_router.router)
 app.include_router(states_router.router)
 app.include_router(state_router.router)
+app.include_router(base_state_router.router)
 app.include_router(ai_router.router)
 app.include_router(designer_router.router)
 app.include_router(effect_chat_router.router)

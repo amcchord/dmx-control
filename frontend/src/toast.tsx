@@ -18,9 +18,13 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   const push = useCallback((message: string, kind: ToastKind = "info") => {
     const id = Date.now() + Math.random();
     setToasts((ts) => [...ts, { id, kind, message }]);
+    // Errors linger longer so users don't miss them when a modal closes
+    // simultaneously (e.g. manual upload that yields no modes).
+    let lifetimeMs = 3200;
+    if (kind === "error") lifetimeMs = 7000;
     setTimeout(() => {
       setToasts((ts) => ts.filter((t) => t.id !== id));
-    }, 3200);
+    }, lifetimeMs);
   }, []);
 
   return (

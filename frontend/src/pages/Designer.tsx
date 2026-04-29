@@ -10,14 +10,25 @@ import {
   Controller,
   DesignerConversation,
   DesignerConversationSummary,
+  DesignerCritique,
   DesignerMessage,
   DesignerProposal,
   DesignerProposalLight,
   DesignerStreamHandle,
   Light,
 } from "../api";
+import VerificationPanel from "../components/VerificationPanel";
 import { useToast } from "../toast";
 import { rgbToHex } from "../util";
+
+const AUTO_VERIFY_KEY = "designer.autoVerify";
+
+type CritiqueEntry = {
+  /** ``null`` while the request is in flight; populated when it
+   *  resolves. */
+  critique: DesignerCritique | null;
+  error: string | null;
+};
 
 type TurnState =
   | { kind: "idle" }
@@ -49,8 +60,28 @@ export default function Designer() {
     proposal: DesignerProposal;
     name: string;
   } | null>(null);
+  const [autoVerify, setAutoVerify] = useState<boolean>(() => {
+    try {
+      const v = window.localStorage.getItem(AUTO_VERIFY_KEY);
+      if (v === null) return true;
+      return v === "1" || v === "true";
+    } catch {
+      return true;
+    }
+  });
+  const [critiques, setCritiques] = useState<Record<string, CritiqueEntry>>(
+    {},
+  );
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const autoScroll = useRef(true);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(AUTO_VERIFY_KEY, autoVerify ? "1" : "0");
+    } catch {
+      // ignore
+    }
+  }, [autoVerify]);
 
   // Reactive mirror of the streaming text so React renders every frame.
   // We batch updates through a ref to avoid re-rendering per token.
@@ -107,19 +138,60 @@ export default function Designer() {
   useEffect(() => {
     if (activeId === null) {
       setActiveConvo(null);
+      setCritiques({});
       return;
     }
     let cancelled = false;
     Api.designer
       .getConversation(activeId)
       .then((c) => {
-        if (!cancelled) setActiveConvo(c);
+        if (cancelled) return;
+        setActiveConvo(c);
+        const cached = c.last_critique || {};
+        const next: Record<string, CritiqueEntry> = {};
+        for (const [pid, critique] of Object.entries(cached)) {
+          next[pid] = { critique, error: null };
+        }
+        setCritiques(next);
       })
       .catch((e) => toast.push(String(e), "error"));
     return () => {
       cancelled = true;
     };
   }, [activeId]);
+
+  // ---- self-critique ("double check") ----------------------------------
+  const runCritique = useCallback(
+    async (cid: number, proposal: DesignerProposal, userText?: string) => {
+      setCritiques((prev) => ({
+        ...prev,
+        [proposal.proposal_id]: { critique: null, error: null },
+      }));
+      try {
+        const res = await Api.designer.critiqueProposal(
+          cid,
+          proposal.proposal_id,
+          userText,
+        );
+        setCritiques((prev) => ({
+          ...prev,
+          [proposal.proposal_id]: {
+            critique: res.critique,
+            error: null,
+          },
+        }));
+      } catch (e) {
+        setCritiques((prev) => ({
+          ...prev,
+          [proposal.proposal_id]: {
+            critique: null,
+            error: String(e),
+          },
+        }));
+      }
+    },
+    [],
+  );
 
   // Auto-scroll to bottom during streaming unless the user scrolled away.
   useEffect(() => {
@@ -273,6 +345,15 @@ export default function Designer() {
         });
         setTurn({ kind: "idle" });
         pendingText.current = "";
+
+        // Auto-verify each new proposal in this turn against the user's
+        // request. Fire-and-forget; the panel renders a spinner until
+        // the verifier replies.
+        if (autoVerify && full.last_proposals.length > 0) {
+          for (const p of full.last_proposals) {
+            void runCritique(full.id, p, text);
+          }
+        }
       },
       onError: (msg) => {
         setTurn({ kind: "error", message: msg, lastUserMessage: text });
@@ -464,6 +545,18 @@ export default function Designer() {
               per-controller and per-light notes.
             </p>
           </div>
+          <label
+            className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-md border border-line bg-bg-elev px-2 py-1 text-[11px] text-slate-200"
+            title="Run a second Claude pass to double-check each proposal."
+          >
+            <input
+              type="checkbox"
+              className="accent-accent"
+              checked={autoVerify}
+              onChange={(e) => setAutoVerify(e.currentTarget.checked)}
+            />
+            Auto-verify
+          </label>
         </header>
 
         <div
@@ -482,8 +575,20 @@ export default function Designer() {
               message={m}
               controllerById={controllerById}
               lightById={lightById}
+              critiques={critiques}
+              autoVerify={autoVerify}
               onApply={applyProposal}
               onSave={openSave}
+              onVerify={(p) => {
+                if (activeId === null) return;
+                void runCritique(activeId, p);
+              }}
+              onRegenerate={(suggestion) => {
+                const seed = suggestion?.trim()
+                  ? `Refine the previous proposal: ${suggestion.trim()}`
+                  : "Regenerate the previous proposal with a different approach.";
+                setInput(seed);
+              }}
             />
           ))}
 
@@ -603,14 +708,22 @@ function MessageBubble({
   message,
   controllerById,
   lightById,
+  critiques,
+  autoVerify,
   onApply,
   onSave,
+  onVerify,
+  onRegenerate,
 }: {
   message: DesignerMessage;
   controllerById: Map<number, Controller>;
   lightById: Map<number, Light>;
+  critiques: Record<string, CritiqueEntry>;
+  autoVerify: boolean;
   onApply: (p: DesignerProposal) => void;
   onSave: (p: DesignerProposal) => void;
+  onVerify: (p: DesignerProposal) => void;
+  onRegenerate: (suggestion?: string) => void;
 }) {
   const isUser = message.role === "user";
   return (
@@ -627,16 +740,47 @@ function MessageBubble({
           <div className="whitespace-pre-wrap">{message.text}</div>
         )}
         {!isUser &&
-          message.proposals.map((p) => (
-            <ProposalCard
-              key={p.proposal_id}
-              proposal={p}
-              controllerById={controllerById}
-              lightById={lightById}
-              onApply={() => onApply(p)}
-              onSave={() => onSave(p)}
-            />
-          ))}
+          message.proposals.map((p) => {
+            const entry = critiques[p.proposal_id];
+            // ``undefined`` means the verifier was never invoked for
+            // this proposal (e.g. auto-verify is off, or it's a stale
+            // proposal from before the toggle); leave the panel out of
+            // the DOM rather than showing a perpetual spinner.
+            const showPanel = autoVerify || entry !== undefined;
+            return (
+              <div key={p.proposal_id}>
+                <ProposalCard
+                  proposal={p}
+                  controllerById={controllerById}
+                  lightById={lightById}
+                  onApply={() => onApply(p)}
+                  onSave={() => onSave(p)}
+                />
+                {showPanel && (
+                  <VerificationPanel
+                    enabled={autoVerify || entry !== undefined}
+                    critique={
+                      entry === undefined ? null : entry.critique
+                    }
+                    error={entry?.error ?? null}
+                    onVerify={() => onVerify(p)}
+                    onRegenerate={onRegenerate}
+                  />
+                )}
+                {!showPanel && (
+                  <div className="mt-1.5 text-right">
+                    <button
+                      className="btn-ghost !px-2 !py-0.5 text-[10px]"
+                      onClick={() => onVerify(p)}
+                      title="Run the verifier on this proposal"
+                    >
+                      Verify
+                    </button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
       </div>
     </div>
   );

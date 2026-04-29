@@ -47,6 +47,31 @@ export default function LightsPage() {
     return lights.filter((l) => l.controller_id === selection.controllerId);
   }, [lights, selection.controllerId]);
 
+  // Prune ghost selections: when the user narrows the controller filter
+  // we drop any selected lights that aren't in the current view so the
+  // bottom action bar can't quietly apply to fixtures the user can't
+  // see.
+  const onControllerFilterChange = (id: number | null) => {
+    setControllerFilter(id);
+    if (id == null) return;
+    const allowed = new Set(
+      lights.filter((l) => l.controller_id === id).map((l) => l.id),
+    );
+    const next: number[] = [];
+    for (const lid of selection.lightIds) {
+      if (allowed.has(lid)) next.push(lid);
+    }
+    if (next.length !== selection.lightIds.size) {
+      setMany(next);
+    }
+  };
+
+  const onColorController = (cid: number, arr: Light[]) => {
+    setControllerFilter(cid);
+    setMany(arr.map((l) => l.id));
+    setPickerOpen(true);
+  };
+
   const groups = useMemo(() => {
     const map = new Map<number, Light[]>();
     for (const l of filteredLights) {
@@ -101,7 +126,7 @@ export default function LightsPage() {
           <ControllerFilter
             controllers={controllers}
             selected={selection.controllerId}
-            onChange={setControllerFilter}
+            onChange={onControllerFilterChange}
           />
           <button
             onClick={selectAll}
@@ -125,11 +150,22 @@ export default function LightsPage() {
         const ctrl = controllers.find((c) => c.id === cid);
         return (
           <section key={cid} className="card overflow-hidden">
-            <div className="flex items-center justify-between px-3 py-2 text-sm font-semibold">
-              <span>{ctrl?.name ?? `Controller #${cid}`}</span>
-              <span className="text-xs text-muted">
-                {arr.length} fixture{arr.length === 1 ? "" : "s"}
+            <div className="flex items-center justify-between gap-2 px-3 py-2 text-sm font-semibold">
+              <span className="truncate">
+                {ctrl?.name ?? `Controller #${cid}`}
               </span>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-muted">
+                  {arr.length} fixture{arr.length === 1 ? "" : "s"}
+                </span>
+                <button
+                  onClick={() => onColorController(cid, arr)}
+                  className="btn-secondary text-xs"
+                  title="Color every fixture on this controller"
+                >
+                  Set color
+                </button>
+              </div>
             </div>
             <div className="px-3 pb-3">
               <RigPreview

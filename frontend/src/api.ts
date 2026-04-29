@@ -629,6 +629,31 @@ export type EngineHealth = {
   tick_hz: number;
 };
 
+/** Kinds of base-state mutation tracked by the server-side log. */
+export type BaseStateKind =
+  | "manual_color"
+  | "scene"
+  | "state"
+  | "palette"
+  | "blackout";
+
+/** One recorded base-state change. The engine never reads this; it
+ *  only exists so the layers panel can show "why is this light red?"
+ *  even when no effect layer is running. */
+export type BaseStateChange = {
+  id: number;
+  kind: BaseStateKind;
+  title: string;
+  light_count: number;
+  light_ids: number[];
+  controller_id: number | null;
+  /** Best-effort representative color for swatches (manual color +
+   *  palette mostly). Tuple of [r,g,b] bytes when present. */
+  rgb?: [number, number, number] | null;
+  /** Unix epoch seconds. */
+  at: number;
+};
+
 export type SceneSavedLayer = {
   effect_id: number;
   name?: string | null;
@@ -933,6 +958,12 @@ export const Api = {
   deleteLayer: (id: number) => api.del<void>(`/api/layers/${id}`),
   clearLayers: () =>
     api.post<{ ok: boolean; stopped: number }>(`/api/layers/clear`),
+
+  /** Cold-start snapshot of the recent base-state change log. The same
+   *  payload is broadcast over `/api/layers/ws` as `{type:"base_state"}`
+   *  frames, so subscribers usually just need this for the initial
+   *  fetch. */
+  getBaseStateLog: () => api.get<BaseStateChange[]>("/api/base-state/log"),
 
   aiStatus: () => api.get<AiStatus>("/api/ai/status"),
   parseManual: (

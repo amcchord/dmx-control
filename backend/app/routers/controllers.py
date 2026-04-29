@@ -3,6 +3,7 @@ from sqlmodel import Session, select
 
 from ..artnet import manager, rebuild_manager_sync
 from ..auth import AuthDep
+from ..base_state_log import log as base_state_log
 from ..db import get_session
 from ..models import Controller
 from ..schemas import ControllerIn, ControllerOut
@@ -81,4 +82,11 @@ def blackout(cid: int, sess: Session = Depends(get_session)) -> dict:
         sess.add(light)
     sess.commit()
     manager.blackout(cid)
+    base_state_log.record(
+        "blackout",
+        title=f"Blackout · {c.name}",
+        light_ids=[l.id for l in lights if l.id is not None],
+        controller_id=cid,
+        rgb=(0, 0, 0),
+    )
     return {"ok": True}

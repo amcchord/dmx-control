@@ -9,6 +9,7 @@ import React, {
 } from "react";
 import {
   Api,
+  BaseStateChange,
   EffectLayer,
   EngineHealth,
   LayerPatchInput,
@@ -21,11 +22,19 @@ import { useAuth } from "../auth";
  * layer mutation through optimistic-then-reconciled patches. Every
  * surface that shows live layer state — mobile Now Playing pill,
  * desktop Live rail, the Effects Composer layer list — subscribes to
- * the same store so they never disagree. */
+ * the same store so they never disagree.
+ *
+ * The same WS also carries ``base_state`` frames (recent manual color /
+ * scene / state / palette / blackout applies). Surfacing those next to
+ * the running layer stack is what lets operators answer "why is this
+ * light red?" when nothing is running. */
 export type LayerStoreValue = {
   layers: EffectLayer[];
   health: EngineHealth | null;
   connected: boolean;
+  /** Recent base-state changes (manual color, scene/state/palette
+   *  apply, blackout). Newest first; capped server-side. */
+  baseStateLog: BaseStateChange[];
   refresh: () => Promise<void>;
   patchLayer: (layerId: number, patch: LayerPatchInput) => Promise<void>;
   removeLayer: (layerId: number) => Promise<void>;
@@ -49,6 +58,7 @@ export function LayerStoreProvider({
   const [layers, setLayers] = useState<EffectLayer[]>([]);
   const [health, setHealth] = useState<EngineHealth | null>(null);
   const [connected, setConnected] = useState(false);
+  const [baseStateLog, setBaseStateLog] = useState<BaseStateChange[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const stopRef = useRef(false);
@@ -60,9 +70,13 @@ export function LayerStoreProvider({
       type?: string;
       layers?: EffectLayer[];
       health?: EngineHealth;
+      log?: BaseStateChange[];
     };
     if (typed.type === "layers" && Array.isArray(typed.layers)) {
       setLayers([...typed.layers].sort(byZ));
+    }
+    if (typed.type === "base_state" && Array.isArray(typed.log)) {
+      setBaseStateLog([...typed.log]);
     }
     if (typed.health) {
       setHealth(typed.health);
@@ -71,12 +85,14 @@ export function LayerStoreProvider({
 
   const refresh = useCallback(async () => {
     try {
-      const [layerList, h] = await Promise.all([
+      const [layerList, h, log] = await Promise.all([
         Api.listLayers(),
         Api.health().catch(() => null),
+        Api.getBaseStateLog().catch(() => null),
       ]);
       setLayers([...layerList].sort(byZ));
       if (h) setHealth(h);
+      if (log) setBaseStateLog(log);
     } catch {
       // ignored — websocket will retry independently.
     }
@@ -86,6 +102,7 @@ export function LayerStoreProvider({
     if (!authenticated) {
       setLayers([]);
       setHealth(null);
+      setBaseStateLog([]);
       setConnected(false);
       return;
     }
@@ -230,13 +247,24 @@ export function LayerStoreProvider({
       layers,
       health,
       connected,
+      baseStateLog,
       refresh,
       patchLayer,
       removeLayer,
       reorder,
       clearAll,
     }),
-    [layers, health, connected, refresh, patchLayer, removeLayer, reorder, clearAll],
+    [
+      layers,
+      health,
+      connected,
+      baseStateLog,
+      refresh,
+      patchLayer,
+      removeLayer,
+      reorder,
+      clearAll,
+    ],
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

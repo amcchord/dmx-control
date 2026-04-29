@@ -273,6 +273,120 @@ def build_spec_from_layer(
     )
 
 
+def build_spec_from_transient_layer(
+    layer: EffectLayer,
+    script: LuaScript,
+    palette_colors: list[str],
+) -> EffectSpec:
+    """Build an :class:`EffectSpec` for a transient layer (``effect_id=None``).
+
+    Mirrors :func:`build_spec_from_layer` but takes a pre-compiled
+    :class:`LuaScript` directly instead of resolving an :class:`Effect`
+    row, so callers (Designer apply, Effect Chat apply, ``/api/effects/
+    live``) can register a real ``EffectLayer`` row in the live stack
+    without persisting a saved effect first. ``layer.id`` flows through
+    to ``spec.layer_id`` so the run shows up in ``LiveLayersPanel`` and
+    the master fader."""
+    light_ids = list(layer.light_ids or [])
+    targets = list(layer.targets or [])
+    if not light_ids and not targets:
+        try:
+            with Session(db_engine) as sess:
+                rows = sess.exec(select(Light.id)).all()
+                light_ids = [r for r in rows if r is not None]
+        except Exception:
+            log.exception(
+                "failed to resolve 'all lights' for transient layer %s",
+                layer.id,
+            )
+    target_channels = list(layer.target_channels or ["rgb"])
+    colors = list(palette_colors) if palette_colors else ["#FFFFFF"]
+    return EffectSpec(
+        handle=new_handle(),
+        effect_id=None,
+        name=layer.name or "Live effect",
+        script=script,
+        palette_colors=colors,
+        light_ids=light_ids,
+        targets=targets,
+        spread=str(layer.spread or "across_lights"),
+        params=dict(layer.params_override or {}),
+        intensity=float(layer.intensity),
+        fade_in_s=float(layer.fade_in_s),
+        fade_out_s=float(layer.fade_out_s),
+        target_channels=target_channels,
+        layer_id=layer.id,
+        z_index=int(layer.z_index),
+        blend_mode=str(layer.blend_mode or "normal"),
+        opacity=float(layer.opacity),
+        mask_light_ids=list(layer.mask_light_ids or []),
+        solo=bool(layer.solo),
+        mute=bool(layer.mute),
+    )
+
+
+def _next_layer_z(sess: Session) -> int:
+    rows = sess.exec(select(EffectLayer.z_index)).all()
+    top = 0
+    for v in rows:
+        if isinstance(v, int) and v > top:
+            top = v
+    return top + 100
+
+
+def play_transient_layer(
+    sess: Session,
+    *,
+    name: str,
+    script: LuaScript,
+    palette_colors: list[str],
+    light_ids: list[int],
+    targets: list[dict],
+    spread: str,
+    params: dict,
+    target_channels: list[str],
+    intensity: float,
+    fade_in_s: float,
+    fade_out_s: float,
+    palette_id: Optional[int] = None,
+) -> tuple[EffectLayer, str]:
+    """Persist a transient :class:`EffectLayer` (``effect_id=None``) and
+    push it onto the running stack.
+
+    Returns ``(layer, handle)``. The row carries the layer-side controls
+    (z_index/blend/opacity/mute/solo) and the script-facing knobs in
+    ``params_override``; the script source itself is intentionally not
+    persisted (transient layers are dropped on app restart by the
+    orphan-cleanup pass in ``main.py``).
+
+    Callers that want re-play idempotency (replace prior transient row
+    on a new "Play") should remember the returned ``layer.id`` and
+    delete it before calling this again."""
+    layer = EffectLayer(
+        effect_id=None,
+        name=name,
+        z_index=_next_layer_z(sess),
+        blend_mode="normal",
+        opacity=1.0,
+        intensity=float(intensity),
+        fade_in_s=float(fade_in_s),
+        fade_out_s=float(fade_out_s),
+        target_channels=list(target_channels or ["rgb"]),
+        spread=str(spread or "across_lights"),
+        light_ids=list(light_ids or []),
+        targets=list(targets or []),
+        palette_id=palette_id,
+        params_override=dict(params or {}),
+        is_active=True,
+    )
+    sess.add(layer)
+    sess.commit()
+    sess.refresh(layer)
+    spec = build_spec_from_transient_layer(layer, script, palette_colors)
+    handle = engine.play(spec)
+    return layer, handle
+
+
 def _split_params(
     raw: dict[str, Any], schema: list[dict[str, Any]]
 ) -> tuple[float, float, float, dict[str, Any]]:
@@ -333,6 +447,12 @@ class EffectEngine:
         if self._task is not None and not self._task.done():
             return
         self._loop = asyncio.get_running_loop()
+        # Hand the same loop to the base-state log so it can broadcast
+        # records over the layers WebSocket from request-handling
+        # threads (the routers call record() synchronously).
+        from .base_state_log import log as base_state_log
+
+        base_state_log.set_loop(self._loop)
         self._stop_event = asyncio.Event()
         self._task = asyncio.create_task(self._run(), name="effect-engine")
         log.info("effect engine started at %.1f FPS", TICK_HZ)
