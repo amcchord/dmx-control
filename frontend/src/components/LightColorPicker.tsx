@@ -236,10 +236,17 @@ export default function LightColorPicker({
       window.clearTimeout(debounceRef.current);
       debounceRef.current = null;
     }
+    // Picking a color implies the user wants to see it. If the fixture
+    // was stored as off (e.g. after a blackout) the renderer would
+    // short-circuit to all zeros and the swatch would never update —
+    // force ``on: true`` and reflect that in local state so the
+    // ON/OFF button shows the right label.
+    if (!on) setOn(true);
     void apply({
       r: parseHex(next)[0],
       g: parseHex(next)[1],
       b: parseHex(next)[2],
+      on: true,
     });
   };
 
@@ -289,16 +296,32 @@ export default function LightColorPicker({
     };
   }, []);
 
+  const commitDimmer = () => {
+    // Same rationale as commitHex: nudging the dimmer up is a "make it
+    // visible" gesture, so flip on=true if the fixture was off. The
+    // explicit OFF button is the one place that still sends on=false.
+    // Pulling the dimmer to 0 is left as-is so the user can still
+    // dim-to-black without losing the on/off intent.
+    let nextOn = on;
+    if (dimmer > 0) {
+      nextOn = true;
+    }
+    if (nextOn !== on) setOn(nextOn);
+    void apply({ dimmer, on: nextOn });
+  };
+
   const onAuxChange = (role: PolicyRole, value: number) => {
     setAux((prev) => ({ ...prev, [role]: value }));
   };
   const onAuxCommit = (role: PolicyRole, value: number) => {
-    void apply(
-      auxToBody(
+    if (!on) setOn(true);
+    void apply({
+      ...auxToBody(
         { ...aux, [role]: value },
         directRoles.map((r) => r.role),
       ),
-    );
+      on: true,
+    });
   };
 
   return (
@@ -441,9 +464,9 @@ export default function LightColorPicker({
           step={1}
           value={dimmer}
           onChange={(e) => setDimmer(parseInt(e.currentTarget.value, 10))}
-          onMouseUp={() => void apply({ dimmer })}
-          onTouchEnd={() => void apply({ dimmer })}
-          onKeyUp={() => void apply({ dimmer })}
+          onMouseUp={() => commitDimmer()}
+          onTouchEnd={() => commitDimmer()}
+          onKeyUp={() => commitDimmer()}
           className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-bg-elev accent-accent"
         />
       </div>
