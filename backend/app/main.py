@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -33,6 +34,25 @@ from .seed import seed
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("dmx")
 
+# How stale a controller's last send is allowed to be before the
+# keepalive task re-sends its current buffer. This lets a power-cycled
+# fixture or controller recover state without waiting for the next
+# user-driven change.
+KEEPALIVE_INTERVAL_S = 10.0
+# How often the keepalive task wakes up to check for stale controllers.
+# Keep small relative to KEEPALIVE_INTERVAL_S so worst-case recovery
+# latency is bounded.
+KEEPALIVE_POLL_S = 1.0
+
+
+async def _artnet_keepalive() -> None:
+    while True:
+        await asyncio.sleep(KEEPALIVE_POLL_S)
+        try:
+            await asyncio.to_thread(manager.send_stale, KEEPALIVE_INTERVAL_S)
+        except Exception:
+            log.exception("artnet keepalive failed")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -41,10 +61,18 @@ async def lifespan(app: FastAPI):
     rebuild_manager_sync()
     await effect_engine.start()
     _resume_active_effects()
+    keepalive_task = asyncio.create_task(
+        _artnet_keepalive(), name="artnet-keepalive"
+    )
     log.info("dmx-control backend started")
     try:
         yield
     finally:
+        keepalive_task.cancel()
+        try:
+            await keepalive_task
+        except (asyncio.CancelledError, Exception):
+            pass
         await effect_engine.stop()
         manager.close()
 

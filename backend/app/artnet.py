@@ -26,6 +26,7 @@ import asyncio
 import logging
 import socket
 import threading
+import time
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -674,6 +675,10 @@ class ArtNetManager:
         self._light_to_controller: dict[int, int] = {}
         # Controllers with pending writes awaiting flush_dirty().
         self._dirty: set[int] = set()
+        # controller_id -> monotonic timestamp of the last successful send.
+        # Used by send_stale() to drive a periodic keepalive that lets
+        # power-cycled fixtures recover their state without user input.
+        self._last_sent_at: dict[int, float] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle / sync helpers
@@ -707,6 +712,7 @@ class ArtNetManager:
             self._controllers.clear()
             self._light_to_controller.clear()
             self._dirty.clear()
+            self._last_sent_at.clear()
             for ctrl in controllers:
                 buf = UniverseBuffer(ctrl.net, ctrl.subnet, ctrl.universe)
                 self._controllers[ctrl.id] = (ctrl, buf)
@@ -904,6 +910,27 @@ class ArtNetManager:
                 if ctrl.enabled:
                     self._send_buffer(ctrl, buf)
 
+    def send_stale(self, max_age_s: float = 10.0) -> int:
+        """Resend any enabled controller whose buffer hasn't been sent
+        within ``max_age_s`` seconds.
+
+        Drives a periodic keepalive so a power-cycled fixture or
+        controller recovers the current rig state without the user
+        having to touch anything. A controller with no recorded send
+        (e.g. just-enabled) is treated as stale so it gets primed."""
+        sent = 0
+        now = time.monotonic()
+        with self._lock:
+            for cid, (ctrl, buf) in self._controllers.items():
+                if not ctrl.enabled:
+                    continue
+                last = self._last_sent_at.get(cid)
+                if last is not None and (now - last) < max_age_s:
+                    continue
+                self._send_buffer(ctrl, buf)
+                sent += 1
+        return sent
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
@@ -915,6 +942,8 @@ class ArtNetManager:
             self._sock.sendto(packet, (ctrl.ip, ctrl.port))
         except OSError as e:
             log.warning("Failed to send Art-Net to %s:%s: %s", ctrl.ip, ctrl.port, e)
+            return
+        self._last_sent_at[ctrl.id] = time.monotonic()
 
 
 manager = ArtNetManager()
