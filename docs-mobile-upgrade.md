@@ -37,7 +37,9 @@ Live changes keep up to 12 durable checkpoints containing base state and the
 active persisted layer stack. Restore is rig-wide and asks before changing live
 output. Slider updates within a short drag coalesce into one history entry.
 Scenes can save running effects with their target masks and parameter values.
-Fades are cancellable by the next live change; blackout remains immediate.
+Static color fades are cancellable by the next live change; saved effect layers
+use their fade-in envelopes so two renderers never compete for the same output.
+Blackout remains immediate.
 
 ## AI
 

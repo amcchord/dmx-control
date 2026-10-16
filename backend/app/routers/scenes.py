@@ -261,7 +261,7 @@ def apply_scene(sid: int, fade_s: float = Query(0, ge=0, le=10), sess: Session =
         sess.add(light)
         applied += 1
     sess.commit()
-    if fade_s > 0:
+    if fade_s > 0 and not saved_layers:
         from ..transitions import fade
         fade(by_id, fade_s, starts)
     else:
