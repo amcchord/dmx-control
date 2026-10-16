@@ -1,3 +1,4 @@
+import { createPortal } from "react-dom";
 import React, { useEffect, useId, useRef } from "react";
 type Props = {
   open: boolean;
@@ -59,7 +60,7 @@ export default function Modal({
   if (!open) return null;
   const max =
     size === "lg" ? "max-w-2xl" : size === "sm" ? "max-w-sm" : "max-w-md";
-  return (
+  return createPortal(
     <div
       className="fixed inset-0 z-[60] flex items-end justify-center bg-black/70 backdrop-blur-sm sm:items-center sm:p-4"
       onMouseDown={(e) => {
@@ -96,6 +97,7 @@ export default function Modal({
           </div>
         )}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
