@@ -1,4 +1,11 @@
-import React, { createContext, useCallback, useContext, useState } from "react";
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useState,
+  useEffect,
+  useRef,
+} from "react";
 
 type ToastKind = "info" | "success" | "error";
 type Toast = { id: number; kind: ToastKind; message: string };
@@ -14,6 +21,13 @@ export function useToast() {
 
 export function ToastProvider({ children }: { children: React.ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const timers = useRef(new Set<ReturnType<typeof setTimeout>>());
+  useEffect(
+    () => () => {
+      for (const timer of timers.current) clearTimeout(timer);
+    },
+    [],
+  );
 
   const push = useCallback((message: string, kind: ToastKind = "info") => {
     const id = Date.now() + Math.random();
@@ -22,9 +36,11 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
     // simultaneously (e.g. manual upload that yields no modes).
     let lifetimeMs = 3200;
     if (kind === "error") lifetimeMs = 7000;
-    setTimeout(() => {
+    const timer = setTimeout(() => {
+      timers.current.delete(timer);
       setToasts((ts) => ts.filter((t) => t.id !== id));
     }, lifetimeMs);
+    timers.current.add(timer);
   }, []);
 
   return (

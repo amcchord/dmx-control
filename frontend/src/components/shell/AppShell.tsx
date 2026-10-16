@@ -218,7 +218,7 @@ function MobileShell({ children }: { children: React.ReactNode }) {
 // ---------------------------------------------------------------------------
 // Panic / blackout bar (used in both shells)
 // ---------------------------------------------------------------------------
-function PanicBar({ compact = false }: { compact?: boolean }) {
+export function PanicBar({ compact = false }: { compact?: boolean }) {
   const { layers, clearAll, refresh } = useLayerStore();
   const { canOperate } = useAuth();
   const { push } = useToast();
