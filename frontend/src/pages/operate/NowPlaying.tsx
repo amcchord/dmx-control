@@ -14,6 +14,10 @@ import { useLayerStore } from "../../state/layers";
 import RigPreview from "../../components/RigPreview";
 import LiveLayersPanel from "../../components/LiveLayersPanel";
 import LightColorPicker from "../../components/LightColorPicker";
+import SaveLook from "../../components/SaveLook";
+import OutputStatus from "../../components/OutputStatus";
+import RestoreLook from "../../components/RestoreLook";
+import { useAuth } from "../../auth";
 import Modal from "../../components/Modal";
 import { useToast } from "../../toast";
 
@@ -25,6 +29,7 @@ import { useToast } from "../../toast";
  * with the full layer panel automatically (rendered by AppShell), so
  * this page focuses on rig preview + recent actions. */
 export default function NowPlaying() {
+  const { canOperate } = useAuth();
   const { isMobile } = useViewport();
   const { layers, patchLayer } = useLayerStore();
   const { push: notify } = useToast();
@@ -38,19 +43,31 @@ export default function NowPlaying() {
 
   useEffect(() => {
     void Promise.all([
-      Api.listLights().then(setLights).catch(() => null),
-      Api.listControllers().then(setControllers).catch(() => null),
-      Api.listModels().then(setModels).catch(() => null),
-      Api.listScenes().then(setScenes).catch(() => null),
-      Api.listStates().then(setStates).catch(() => null),
-      Api.listEffects().then(setEffects).catch(() => null),
+      Api.listLights()
+        .then(setLights)
+        .catch(() => null),
+      Api.listControllers()
+        .then(setControllers)
+        .catch(() => null),
+      Api.listModels()
+        .then(setModels)
+        .catch(() => null),
+      Api.listScenes()
+        .then(setScenes)
+        .catch(() => null),
+      Api.listStates()
+        .then(setStates)
+        .catch(() => null),
+      Api.listEffects()
+        .then(setEffects)
+        .catch(() => null),
     ]);
   }, []);
 
   const pickingLight =
     pickingLightId == null
       ? null
-      : lights.find((l) => l.id === pickingLightId) ?? null;
+      : (lights.find((l) => l.id === pickingLightId) ?? null);
 
   // Compute an aggregate "master" opacity = mean of running layer
   // opacities * intensities. Adjusting it drags every layer with it
@@ -65,7 +82,8 @@ export default function NowPlaying() {
     if (running.length === 0) return;
     const ratio = master <= 0.001 ? 1 : next / master;
     for (const l of running) {
-      const target = Math.max(0, Math.min(1, l.opacity * ratio));
+      const target =
+        master <= 0.001 ? next : Math.max(0, Math.min(1, l.opacity * ratio));
       if (l.layer_id != null) {
         void patchLayer(l.layer_id, { opacity: target }).catch(() => null);
       }
@@ -94,6 +112,11 @@ export default function NowPlaying() {
 
   return (
     <div className="flex flex-col gap-4">
+      <OutputStatus />
+      <div className="flex flex-wrap gap-2">
+        <SaveLook onSaved={() => void Api.listScenes().then(setScenes)} />
+        {!isMobile && <RestoreLook />}
+      </div>
       <section className="card overflow-hidden">
         <div className="flex items-center justify-between px-4 py-3">
           <div>
@@ -106,13 +129,10 @@ export default function NowPlaying() {
                 : `${running.length} layer${running.length === 1 ? "" : "s"} running`}
             </div>
             <div className="mt-0.5 text-[10px] text-muted">
-              Click a fixture to edit its color, dimmer, and aux channels.
+              Tap a fixture to edit its color and brightness.
             </div>
           </div>
-          <Link
-            to="/quick-fx"
-            className="btn-secondary px-2 py-1 text-xs"
-          >
+          <Link to="/quick-fx" className="btn-secondary px-2 py-1 text-xs">
             + Add FX
           </Link>
         </div>
@@ -120,7 +140,7 @@ export default function NowPlaying() {
           <RigPreview
             lights={lights}
             controllers={controllers}
-            onSelect={(id) => setPickingLightId(id)}
+            onSelect={canOperate ? (id) => setPickingLightId(id) : undefined}
             size={isMobile ? "md" : "lg"}
             showLabels
             compact
@@ -131,7 +151,7 @@ export default function NowPlaying() {
       <section className="card px-4 py-3">
         <div className="flex items-center justify-between">
           <div className="text-xs uppercase tracking-wider text-muted">
-            Master
+            Effects level
           </div>
           <span className="font-mono text-xs text-muted">
             {(master * 100).toFixed(0)}%
@@ -144,9 +164,9 @@ export default function NowPlaying() {
           step={0.01}
           value={master}
           onChange={(e) => onMasterChange(parseFloat(e.currentTarget.value))}
-          disabled={running.length === 0}
+          disabled={!canOperate || running.length === 0}
           className="mt-2 w-full accent-accent"
-          aria-label="Master intensity"
+          aria-label="Effects level"
         />
       </section>
 
@@ -157,7 +177,7 @@ export default function NowPlaying() {
         </section>
       )}
 
-      {scenes.length > 0 && (
+      {scenes.some((s) => !s.builtin && s.id != null) && (
         <section>
           <SectionHeader title="Scenes" />
           <div className="flex flex-wrap gap-2">
@@ -167,6 +187,7 @@ export default function NowPlaying() {
               .map((s) => (
                 <button
                   key={s.id}
+                  disabled={!canOperate}
                   onClick={() => onApplyScene(s)}
                   className="btn-secondary px-3 py-1.5 text-xs"
                 >
@@ -177,7 +198,7 @@ export default function NowPlaying() {
         </section>
       )}
 
-      {states.length > 0 && (
+      {states.some((s) => !s.builtin && s.id != null) && (
         <section>
           <SectionHeader title="Rig states" />
           <div className="flex flex-wrap gap-2">
@@ -187,6 +208,7 @@ export default function NowPlaying() {
               .map((s) => (
                 <button
                   key={s.id}
+                  disabled={!canOperate}
                   onClick={() => onApplyState(s)}
                   className="btn-secondary px-3 py-1.5 text-xs"
                 >
@@ -202,7 +224,10 @@ export default function NowPlaying() {
           <SectionHeader
             title="Quick FX"
             trailing={
-              <Link to="/quick-fx" className="text-xs text-accent hover:underline">
+              <Link
+                to="/quick-fx"
+                className="text-xs text-accent hover:underline"
+              >
                 See all
               </Link>
             }
@@ -218,11 +243,7 @@ export default function NowPlaying() {
       <Modal
         open={pickingLight !== null}
         onClose={() => setPickingLightId(null)}
-        title={
-          pickingLight
-            ? `Color: ${pickingLight.name}`
-            : "Color"
-        }
+        title={pickingLight ? `Color: ${pickingLight.name}` : "Color"}
         size="md"
       >
         {pickingLight && (
@@ -232,9 +253,7 @@ export default function NowPlaying() {
             notify={notify}
             onApplied={(updated) => {
               const byId = new Map(updated.map((l) => [l.id, l]));
-              setLights((prev) =>
-                prev.map((l) => byId.get(l.id) ?? l),
-              );
+              setLights((prev) => prev.map((l) => byId.get(l.id) ?? l));
             }}
           />
         )}
@@ -255,40 +274,23 @@ function SectionHeader({
       <div className="text-xs font-semibold uppercase tracking-widest text-muted">
         {title}
       </div>
-      {trailing && (
-        <div className="text-xs text-muted">{trailing}</div>
-      )}
+      {trailing && <div className="text-xs text-muted">{trailing}</div>}
     </div>
   );
 }
 
 function QuickFxChip({
   effect,
-  notify,
 }: {
   effect: Effect;
   notify: (m: string, k?: "success" | "error" | "info") => void;
 }) {
-  const [busy, setBusy] = useState(false);
-  const onPlay = async () => {
-    setBusy(true);
-    try {
-      await Api.playEffect(effect.id);
-      notify(`Started ${effect.name}`, "success");
-    } catch (e) {
-      notify(String(e), "error");
-    } finally {
-      setBusy(false);
-    }
-  };
   return (
-    <button
-      onClick={onPlay}
-      disabled={busy}
-      className="btn-secondary px-3 py-1.5 text-xs"
+    <Link
+      className="btn-secondary text-xs"
+      to={`/quick-fx?effect=${effect.id}`}
     >
-      {busy ? "..." : "+ "}
-      {effect.name}
-    </button>
+      {effect.name} · Preview
+    </Link>
   );
 }

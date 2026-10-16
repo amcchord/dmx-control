@@ -1,9 +1,12 @@
 import React, { useEffect, useState } from "react";
-import { Link, NavLink, useNavigate } from "react-router-dom";
+import { Link, NavLink, useNavigate, useLocation } from "react-router-dom";
 import { Api } from "../../api";
 import { useAuth } from "../../auth";
 import { useViewport } from "../../hooks/useViewport";
 import { useLayerStore } from "../../state/layers";
+import Modal from "../Modal";
+import { useToast } from "../../toast";
+import RestoreLook from "../RestoreLook";
 import LiveLayersPanel from "../LiveLayersPanel";
 
 type LinkDef = {
@@ -42,11 +45,22 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 // Desktop chrome
 // ---------------------------------------------------------------------------
 function DesktopShell({ children }: { children: React.ReactNode }) {
-  const { logout } = useAuth();
+  const { logout, isAdmin, user, canOperate } = useAuth();
   const navigate = useNavigate();
   const aiEnabled = useDesignerEnabled();
+  const location = useLocation();
+  const composer =
+    location.pathname === "/author/effects" ||
+    location.pathname === "/author/scenes";
   return (
-    <div className="grid h-full min-h-screen grid-cols-[16rem_minmax(0,1fr)_22rem] bg-bg">
+    <div
+      className={
+        "grid min-h-screen bg-bg " +
+        (composer
+          ? "grid-cols-[13rem_minmax(0,1fr)]"
+          : "grid-cols-[13rem_minmax(0,1fr)] xl:grid-cols-[13rem_minmax(0,1fr)_19rem]")
+      }
+    >
       <aside className="flex flex-col border-r border-line bg-bg-elev/40">
         <div className="flex items-center gap-3 px-4 py-4">
           <Logo />
@@ -61,8 +75,8 @@ function DesktopShell({ children }: { children: React.ReactNode }) {
         </div>
         <nav className="flex-1 overflow-y-auto px-2 pb-4">
           <NavGroup title="Operate" links={OPERATE_LINKS} />
-          <NavGroup title="Author" links={AUTHOR_LINKS} />
-          {aiEnabled && (
+          {canOperate && <NavGroup title="Author" links={AUTHOR_LINKS} />}
+          {aiEnabled && canOperate && (
             <NavGroup
               title="AI"
               links={[
@@ -70,7 +84,11 @@ function DesktopShell({ children }: { children: React.ReactNode }) {
               ]}
             />
           )}
-          <NavGroup title="Configure" links={CONFIG_LINKS} />
+          {isAdmin && <NavGroup title="Configure" links={CONFIG_LINKS} />}
+          <NavGroup
+            title="Account"
+            links={[{ to: "/me", label: user?.name || "Account", icon: "○" }]}
+          />
           <NavGroup
             title="Reference"
             links={[{ to: "/api-docs", label: "API", icon: "\u2630" }]}
@@ -89,16 +107,20 @@ function DesktopShell({ children }: { children: React.ReactNode }) {
         </div>
       </aside>
       <main className="min-w-0 overflow-y-auto">
-        <div className="mx-auto w-full max-w-6xl px-6 py-6">{children}</div>
-      </main>
-      <aside className="hidden border-l border-line bg-bg-elev/40 lg:block">
-        <div className="flex h-full flex-col p-3">
-          <PanicBar />
-          <div className="mt-3 flex-1 min-h-0">
-            <LiveLayersPanel variant="full" />
-          </div>
+        <div className="mx-auto w-full max-w-[1600px] px-4 py-5">
+          {children}
         </div>
-      </aside>
+      </main>
+      {!composer && (
+        <aside className="hidden border-l border-line bg-bg-elev/40 xl:block">
+          <div className="flex h-full flex-col p-3">
+            <PanicBar />
+            <div className="mt-3 flex-1 min-h-0">
+              <LiveLayersPanel variant="full" />
+            </div>
+          </div>
+        </aside>
+      )}
     </div>
   );
 }
@@ -146,19 +168,30 @@ const MOBILE_TABS: LinkDef[] = [
 ];
 
 function MobileShell({ children }: { children: React.ReactNode }) {
+  const { connected } = useLayerStore();
   return (
-    <div className="flex h-full min-h-screen flex-col bg-bg pb-16">
+    <div className="flex min-h-[100dvh] flex-col bg-bg">
       <header className="sticky top-0 z-30 border-b border-line bg-bg/95 backdrop-blur">
         <div className="flex items-center justify-between px-4 py-2">
           <div className="flex items-center gap-2">
             <Logo small />
-            <div className="text-sm font-semibold">DMX</div>
+            <div className="hidden min-[375px]:block text-sm font-semibold">
+              DMX
+            </div>
           </div>
           <PanicBar compact />
         </div>
       </header>
-      <main className="flex-1 px-4 pt-3 pb-4">{children}</main>
-      <nav className="fixed inset-x-0 bottom-0 z-40 border-t border-line bg-bg/95 backdrop-blur">
+      {!connected && (
+        <div
+          role="status"
+          className="bg-amber-950/60 px-3 py-2 text-xs text-amber-100"
+        >
+          Reconnecting… Displaying the last known look.
+        </div>
+      )}
+      <main className="phone-main min-w-0 flex-1 px-3 pt-3">{children}</main>
+      <nav className="phone-nav fixed inset-x-0 bottom-0 z-40 border-t border-line bg-bg/95 backdrop-blur">
         <div className="grid grid-cols-5">
           {MOBILE_TABS.map((t) => (
             <NavLink
@@ -186,79 +219,95 @@ function MobileShell({ children }: { children: React.ReactNode }) {
 // Panic / blackout bar (used in both shells)
 // ---------------------------------------------------------------------------
 function PanicBar({ compact = false }: { compact?: boolean }) {
-  const { layers, clearAll } = useLayerStore();
+  const { layers, clearAll, refresh } = useLayerStore();
+  const { canOperate } = useAuth();
+  const { push } = useToast();
+  const [action, setAction] = useState<"clear" | "blackout" | null>(null);
   const [busy, setBusy] = useState(false);
-
-  const onPanic = async () => {
-    if (
-      layers.length > 0 &&
-      !window.confirm(
-        `Stop all ${layers.length} running layer${
-          layers.length === 1 ? "" : "s"
-        }?`,
-      )
-    ) {
-      return;
-    }
-    setBusy(true);
-    try {
-      await clearAll();
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const onBlackout = async () => {
-    if (!window.confirm("Black out the entire rig?")) return;
-    setBusy(true);
-    try {
-      await Api.applyBlackoutState();
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  if (compact) {
-    return (
-      <div className="flex items-center gap-1.5">
+  if (!canOperate) return <span className="pill">View only</span>;
+  return (
+    <>
+      <div
+        className={
+          compact ? "flex items-center gap-1.5" : "flex flex-wrap gap-2"
+        }
+      >
+        <RestoreLook />
         <button
-          className="btn-secondary px-2 py-1 text-[11px]"
-          disabled={busy || layers.length === 0}
-          onClick={onPanic}
-          title="Stop all running layers"
+          className={
+            compact ? "btn-secondary px-2 text-xs" : "btn-secondary flex-1"
+          }
+          disabled={busy || !layers.length}
+          onClick={() => setAction("clear")}
         >
-          Clear
+          Stop FX
         </button>
         <button
-          className="btn-danger px-2 py-1 text-[11px]"
+          className={compact ? "btn-danger px-2 text-xs" : "btn-danger flex-1"}
           disabled={busy}
-          onClick={onBlackout}
-          title="Blackout"
+          onClick={() => setAction("blackout")}
         >
           Blackout
         </button>
       </div>
-    );
-  }
-
-  return (
-    <div className="flex gap-2">
-      <button
-        className="btn-secondary flex-1"
-        disabled={busy || layers.length === 0}
-        onClick={onPanic}
-        title="Stop all running layers"
+      <Modal
+        open={!!action}
+        title={
+          action === "blackout"
+            ? "Black out the whole rig?"
+            : "Stop all running effects?"
+        }
+        onClose={() => {
+          if (!busy) setAction(null);
+        }}
+        footer={
+          <>
+            <button
+              className="btn-secondary"
+              disabled={busy}
+              onClick={() => setAction(null)}
+            >
+              Cancel
+            </button>
+            <button
+              className="btn-danger"
+              disabled={busy}
+              onClick={async () => {
+                setBusy(true);
+                try {
+                  if (action === "blackout") await Api.applyBlackoutState();
+                  else await clearAll();
+                  await refresh();
+                  setAction(null);
+                  push(
+                    action === "blackout"
+                      ? "Rig blacked out. Restore brings back the previous look."
+                      : "Effects stopped",
+                    "success",
+                  );
+                } catch (e) {
+                  push(String(e), "error");
+                } finally {
+                  setBusy(false);
+                }
+              }}
+            >
+              {busy
+                ? "Applying…"
+                : action === "blackout"
+                  ? "Blackout whole rig"
+                  : "Stop all effects"}
+            </button>
+          </>
+        }
       >
-        Clear all
-      </button>
-      <button
-        className="btn-danger flex-1"
-        disabled={busy}
-        onClick={onBlackout}
-      >
-        Blackout
-      </button>
-    </div>
+        <p className="text-sm text-slate-200">
+          {action === "blackout"
+            ? "This turns off every configured fixture and stops its effects. Use Restore to bring back the previous look."
+            : `This stops ${layers.length} running effect layers and leaves base colors in place. Use Restore to undo.`}
+        </p>
+      </Modal>
+    </>
   );
 }
 
@@ -268,7 +317,13 @@ function PanicBar({ compact = false }: { compact?: boolean }) {
 function Logo({ small = false }: { small?: boolean }) {
   const cls = small ? "h-7 w-7" : "h-9 w-9";
   return (
-    <div className={"grid " + cls + " grid-cols-2 grid-rows-2 gap-0.5 overflow-hidden rounded-lg"}>
+    <div
+      className={
+        "grid " +
+        cls +
+        " grid-cols-2 grid-rows-2 gap-0.5 overflow-hidden rounded-lg"
+      }
+    >
       <span className="bg-[#7c4dff]" />
       <span className="bg-[#00e5ff]" />
       <span className="bg-[#2ef9b6]" />

@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session, select
 
 log = logging.getLogger(__name__)
@@ -50,6 +50,7 @@ def _row_to_out(row: Scene) -> SceneOut:
     return SceneOut(
         id=row.id,
         name=row.name,
+        favorite=row.favorite,
         controller_id=row.controller_id,
         cross_controller=bool(row.cross_controller),
         lights=[SceneLightState(**l) for l in (row.lights or [])],
@@ -158,10 +159,14 @@ def create_scene(
         )
     row = Scene(
         name=payload.name,
+        favorite=payload.favorite,
         controller_id=payload.controller_id,
         cross_controller=bool(payload.cross_controller),
         lights=captured,
     )
+    if payload.include_layers:
+        from ..look_helpers import saved_layers_for
+        row.layers = saved_layers_for(sess, {x["light_id"] for x in captured})
     sess.add(row)
     sess.commit()
     sess.refresh(row)
@@ -175,6 +180,8 @@ def update_scene(
     row = sess.get(Scene, sid)
     if row is None:
         raise HTTPException(404, "scene not found")
+    if payload.favorite is not None:
+        row.favorite = payload.favorite
     if payload.name is not None:
         row.name = payload.name
     if payload.controller_id is not None:
@@ -217,7 +224,7 @@ def delete_scene(sid: int, sess: Session = Depends(get_session)) -> None:
 # Apply
 # ---------------------------------------------------------------------------
 @router.post("/{sid}/apply")
-def apply_scene(sid: int, sess: Session = Depends(get_session)) -> dict:
+def apply_scene(sid: int, fade_s: float = Query(0, ge=0, le=10), sess: Session = Depends(get_session)) -> dict:
     """Atomically apply a scene: clear running layers, push the saved
     base snapshot onto every covered light, then start each saved layer
     on top in the order it was authored.
@@ -234,7 +241,9 @@ def apply_scene(sid: int, sess: Session = Depends(get_session)) -> dict:
     # Atomic swap: stop everything that touches these lights so the
     # snapshot lands clean; if any saved layer fails to compile we keep
     # the static base (no half-applied stack).
-    engine.stop_affecting(affected, immediate=True)
+    from ..look_helpers import stop_layers_for
+    starts = {x["light_id"]: x for x in capture_lights(list(sess.exec(select(Light)).all()), from_rendered=True)}
+    stop_layers_for(sess, affected)
     if not by_id and not saved_layers:
         return {"ok": True, "applied": 0, "layers": 0}
 
@@ -252,8 +261,12 @@ def apply_scene(sid: int, sess: Session = Depends(get_session)) -> dict:
         sess.add(light)
         applied += 1
     sess.commit()
-    for light in lights:
-        push_light(light)
+    if fade_s > 0:
+        from ..transitions import fade
+        fade(by_id, fade_s, starts)
+    else:
+        for light in lights:
+            push_light(light)
 
     # Push every saved layer.
     started = 0
@@ -274,9 +287,11 @@ def apply_scene(sid: int, sess: Session = Depends(get_session)) -> dict:
                 effect_id=effect_id,
                 z_index=int(spec.get("z_index") or z),
                 blend_mode=str(spec.get("blend_mode") or "normal"),
-                opacity=float(spec.get("opacity") or 1.0),
-                intensity=float(spec.get("intensity") or 1.0),
-                fade_in_s=float(spec.get("fade_in_s") or 0.25),
+                opacity=float(spec.get("opacity", 1.0)),
+                mute=bool(spec.get("mute", False)),
+                solo=bool(spec.get("solo", False)),
+                intensity=float(spec.get("intensity", 1.0)),
+                fade_in_s=max(fade_s, float(spec.get("fade_in_s", 0.25))),
                 fade_out_s=float(spec.get("fade_out_s") or 0.25),
                 target_channels=list(
                     spec.get("target_channels")
@@ -326,7 +341,8 @@ def apply_blackout(cid: int, sess: Session = Depends(get_session)) -> dict:
         raise HTTPException(404, "controller not found")
     lights = sess.exec(select(Light).where(Light.controller_id == cid)).all()
     affected = {l.id for l in lights if l.id is not None}
-    engine.stop_affecting(affected)
+    from ..look_helpers import stop_layers_for
+    stop_layers_for(sess, affected)
     for light in lights:
         light.r = light.g = light.b = light.w = light.a = light.uv = 0
         light.on = False

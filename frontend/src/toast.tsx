@@ -30,9 +30,10 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   return (
     <Ctx.Provider value={{ push }}>
       {children}
-      <div className="pointer-events-none fixed inset-x-0 bottom-4 z-50 flex flex-col items-center gap-2 px-4 sm:inset-auto sm:bottom-6 sm:right-6 sm:items-end">
+      <div className="pointer-events-none fixed inset-x-0 bottom-[calc(5rem+env(safe-area-inset-bottom))] z-[70] flex flex-col items-center gap-2 px-4 sm:inset-auto sm:bottom-6 sm:right-6 sm:items-end">
         {toasts.map((t) => (
           <div
+            role={t.kind === "error" ? "alert" : "status"}
             key={t.id}
             className={
               "pointer-events-auto w-full max-w-sm rounded-lg px-4 py-3 text-sm shadow-lg ring-1 backdrop-blur " +

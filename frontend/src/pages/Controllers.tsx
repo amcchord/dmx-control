@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { Api, Controller, Light } from "../api";
+import { ControllerStatus } from "../components/OutputStatus";
 import Modal from "../components/Modal";
 import { useToast } from "../toast";
 
@@ -43,6 +44,8 @@ export default function Controllers() {
 
   useEffect(() => {
     refresh();
+    const timer = window.setInterval(refresh, 5000);
+    return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -77,7 +80,12 @@ export default function Controllers() {
   };
 
   const remove = async (c: Controller) => {
-    if (!confirm(`Delete controller "${c.name}"? Its lights will also be removed.`)) return;
+    if (
+      !confirm(
+        `Delete controller "${c.name}"? Its lights will also be removed.`,
+      )
+    )
+      return;
     try {
       const cLights = lights.filter((l) => l.controller_id === c.id);
       for (const l of cLights) await Api.deleteLight(l.id);
@@ -111,19 +119,19 @@ export default function Controllers() {
           </div>
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+        <div className="grid grid-cols-1 gap-3 2xl:grid-cols-2">
           {controllers.map((c) => {
             const clights = lights.filter((l) => l.controller_id === c.id);
             let plural = "s";
             if (clights.length === 1) plural = "";
             return (
               <div key={c.id} className="card p-4">
-                <div className="flex items-start justify-between gap-2">
+                <div className="flex flex-wrap items-start justify-between gap-2">
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
                       <Link
                         to={`/controllers/${c.id}`}
-                        className="truncate font-semibold hover:text-accent"
+                        className="break-words font-semibold hover:text-accent"
                       >
                         {c.name}
                       </Link>
@@ -134,7 +142,9 @@ export default function Controllers() {
                       )}
                     </div>
                     <div className="mt-1 flex flex-wrap gap-1 text-xs text-muted">
-                      <span className="pill">{c.ip}:{c.port}</span>
+                      <span className="pill">
+                        {c.ip}:{c.port}
+                      </span>
                       <span className="pill">net {c.net}</span>
                       <span className="pill">subnet {c.subnet}</span>
                       <span className="pill">universe {c.universe}</span>
@@ -153,6 +163,7 @@ export default function Controllers() {
                     </button>
                   </div>
                 </div>
+                <ControllerStatus controller={c} />
                 <div className="mt-3">
                   <Link
                     to={`/controllers/${c.id}`}
@@ -207,7 +218,9 @@ export default function Controllers() {
                 className="input"
                 type="number"
                 value={form.port}
-                onChange={(e) => setForm({ ...form, port: Number(e.target.value) })}
+                onChange={(e) =>
+                  setForm({ ...form, port: Number(e.target.value) })
+                }
               />
             </Field>
           </div>
@@ -219,7 +232,9 @@ export default function Controllers() {
                 min={0}
                 max={127}
                 value={form.net}
-                onChange={(e) => setForm({ ...form, net: Number(e.target.value) })}
+                onChange={(e) =>
+                  setForm({ ...form, net: Number(e.target.value) })
+                }
               />
             </Field>
             <Field label="Subnet">
@@ -229,7 +244,9 @@ export default function Controllers() {
                 min={0}
                 max={15}
                 value={form.subnet}
-                onChange={(e) => setForm({ ...form, subnet: Number(e.target.value) })}
+                onChange={(e) =>
+                  setForm({ ...form, subnet: Number(e.target.value) })
+                }
               />
             </Field>
             <Field label="Universe">
@@ -239,7 +256,9 @@ export default function Controllers() {
                 min={0}
                 max={15}
                 value={form.universe}
-                onChange={(e) => setForm({ ...form, universe: Number(e.target.value) })}
+                onChange={(e) =>
+                  setForm({ ...form, universe: Number(e.target.value) })
+                }
               />
             </Field>
           </div>

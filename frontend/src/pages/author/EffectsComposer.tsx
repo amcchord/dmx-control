@@ -15,6 +15,8 @@ import { useLayerStore } from "../../state/layers";
 import { useSelection } from "../../state/selection";
 import { useUndo } from "../../state/undo";
 import RigPreview from "../../components/RigPreview";
+import EffectPreview from "../../components/EffectPreview";
+import { useAuth } from "../../auth";
 import LiveLayersPanel from "../../components/LiveLayersPanel";
 import EffectParamsForm from "../../components/EffectParamsForm";
 import LuaEditor from "../../components/LuaEditor";
@@ -41,6 +43,7 @@ const TARGET_CHANNELS: EffectTargetChannel[] = [
  * pushing onto the stack. Mobile users get a redirect since heavy Lua
  * editing isn't a phone activity. */
 export default function EffectsComposer() {
+  const { canOperate } = useAuth();
   const { isMobile } = useViewport();
   const { layers, patchLayer } = useLayerStore();
   const { selection } = useSelection();
@@ -80,9 +83,7 @@ export default function EffectsComposer() {
   // Pick a layer the inspector edits; default to top of stack.
   const selectedLayer = useMemo<EffectLayer | null>(() => {
     if (selectedLayerId == null) return null;
-    return (
-      layers.find((l) => l.layer_id === selectedLayerId) ?? null
-    );
+    return layers.find((l) => l.layer_id === selectedLayerId) ?? null;
   }, [layers, selectedLayerId]);
 
   useEffect(() => {
@@ -111,7 +112,15 @@ export default function EffectsComposer() {
 
   const onLaunch = async (e: Effect) => {
     const mask =
-      selection.lightIds.size > 0 ? [...selection.lightIds] : undefined;
+      selection.lightIds.size > 0
+        ? [...selection.lightIds]
+        : lights.map((l) => l.id);
+    if (
+      !window.confirm(
+        `Launch ${e.name} on ${mask.length} fixtures${selection.lightIds.size ? " selected" : " across the whole rig"}?`,
+      )
+    )
+      return;
     try {
       const created = await Api.createLayer({
         effect_id: e.id,
@@ -155,9 +164,7 @@ export default function EffectsComposer() {
         target_channels: selectedEffect.target_channels,
       });
       setSelectedEffect(next);
-      setEffects((prev) =>
-        prev.map((e) => (e.id === next.id ? next : e)),
-      );
+      setEffects((prev) => prev.map((e) => (e.id === next.id ? next : e)));
       setEditingDirty(false);
       notify("Saved", "success");
     } catch (err) {
@@ -165,26 +172,10 @@ export default function EffectsComposer() {
     }
   };
 
-  if (isMobile) {
-    return (
-      <div className="card p-6 text-center">
-        <div className="text-base font-semibold">Effects Composer</div>
-        <p className="mt-2 text-sm text-muted">
-          Layered effect authoring lives on desktop. On mobile, use{" "}
-          <Link to="/quick-fx" className="text-accent hover:underline">
-            Quick FX
-          </Link>{" "}
-          to launch presets and the layer pill on Now Playing to manage
-          the running stack.
-        </p>
-      </div>
-    );
-  }
-
   return (
-    <div className="grid grid-cols-[14rem_minmax(0,1fr)_18rem] gap-4">
+    <div className="grid grid-cols-1 lg:grid-cols-[13rem_minmax(0,1fr)] 2xl:grid-cols-[13rem_minmax(0,1fr)_17rem] gap-4">
       {/* Library */}
-      <aside className="flex flex-col gap-2">
+      <aside className="flex min-w-0 flex-col gap-2">
         <input
           type="search"
           value={search}
@@ -192,7 +183,7 @@ export default function EffectsComposer() {
           placeholder="Search presets..."
           className="input"
         />
-        <div className="card flex max-h-[70vh] flex-col overflow-hidden">
+        <div className="card flex max-h-[35vh] lg:max-h-[65vh] flex-col overflow-hidden">
           <div className="flex items-center justify-between border-b border-line px-3 py-2 text-xs">
             <span className="font-semibold uppercase tracking-wider text-muted">
               Library
@@ -207,7 +198,9 @@ export default function EffectsComposer() {
                 key={e.id}
                 className={
                   "group flex items-center gap-2 rounded-md p-2 text-sm hover:bg-bg-elev " +
-                  (selectedEffect?.id === e.id ? "bg-bg-elev ring-1 ring-line" : "")
+                  (selectedEffect?.id === e.id
+                    ? "bg-bg-elev ring-1 ring-line"
+                    : "")
                 }
               >
                 <button
@@ -263,20 +256,38 @@ export default function EffectsComposer() {
         <div className="card flex flex-col gap-2 p-3">
           <div className="flex items-center justify-between">
             <div className="text-xs uppercase tracking-widest text-muted">
-              Live preview
+              Preview only · no hardware output
             </div>
             <div className="flex gap-2">
               {selectedEffect && (
                 <button
                   className="btn-primary text-xs"
+                  disabled={!canOperate}
                   onClick={() => onLaunch(selectedEffect)}
                 >
-                  + Push as layer
+                  Launch live
                 </button>
               )}
             </div>
           </div>
-          <RigPreview lights={lights} compact size="md" />
+          {selectedEffect ? (
+            <EffectPreview
+              effect={{
+                ...selectedEffect,
+                source: editingSource || selectedEffect.source,
+              }}
+              params={selectedEffect.params}
+              palette={
+                palettesById.get(selectedEffect.palette_id || 0)?.colors || [
+                  "#ffffff",
+                ]
+              }
+            />
+          ) : (
+            <p className="text-sm text-muted">
+              Choose an effect to preview safely.
+            </p>
+          )}
         </div>
 
         {selectedEffect ? (
@@ -311,11 +322,7 @@ export default function EffectsComposer() {
                 {!selectedEffect.builtin && (
                   <button
                     onClick={async () => {
-                      if (
-                        !window.confirm(
-                          `Delete "${selectedEffect.name}"?`,
-                        )
-                      )
+                      if (!window.confirm(`Delete "${selectedEffect.name}"?`))
                         return;
                       await Api.deleteEffect(selectedEffect.id);
                       await refresh();
@@ -419,10 +426,7 @@ export default function EffectsComposer() {
         ) : (
           <div className="card p-6 text-center text-sm text-muted">
             Pick an effect from the library, or build one in the AI{" "}
-            <Link
-              to="/author/designer"
-              className="text-accent hover:underline"
-            >
+            <Link to="/author/designer" className="text-accent hover:underline">
               Designer
             </Link>
             .
@@ -431,7 +435,7 @@ export default function EffectsComposer() {
       </section>
 
       {/* Inspector for the currently-selected layer */}
-      <aside className="flex flex-col gap-3">
+      <aside className="flex min-w-0 flex-col gap-3 lg:col-span-2 2xl:col-span-1">
         <LiveLayersPanel variant="full" />
         {selectedLayer && (
           <LayerInspector
@@ -439,7 +443,9 @@ export default function EffectsComposer() {
             allLights={lights}
             onPatch={(patch) => {
               if (selectedLayer.layer_id != null)
-                void patchLayer(selectedLayer.layer_id, patch).catch(() => null);
+                void patchLayer(selectedLayer.layer_id, patch).catch(
+                  () => null,
+                );
             }}
           />
         )}

@@ -55,15 +55,9 @@ export default function SceneComposer() {
         name,
         controller_id: cid,
         cross_controller: false,
-        from_rendered: true,
+        from_rendered: false,
+        include_layers: true,
       });
-      // Tack on running layers as saved layers, if present.
-      if (layers.length > 0 && created.id != null) {
-        const saved: SceneSavedLayer[] = layers
-          .filter((l) => l.layer_id != null && l.effect_id != null)
-          .map(layerToSaved);
-        await Api.updateScene(created.id, { layers: saved });
-      }
       await refresh();
       notify(`Saved scene ${name}`, "success");
     } catch (e) {
@@ -99,23 +93,8 @@ export default function SceneComposer() {
     }
   };
 
-  if (isMobile) {
-    return (
-      <div className="card p-6 text-center">
-        <div className="text-base font-semibold">Scene Composer</div>
-        <p className="mt-2 text-sm text-muted">
-          Composing layered scenes is a desktop activity. On mobile, see{" "}
-          <Link to="/scenes" className="text-accent hover:underline">
-            Scenes
-          </Link>{" "}
-          to apply existing scenes.
-        </p>
-      </div>
-    );
-  }
-
   return (
-    <div className="grid grid-cols-[16rem_minmax(0,1fr)_18rem] gap-4">
+    <div className="grid grid-cols-1 lg:grid-cols-[13rem_minmax(0,1fr)] 2xl:grid-cols-[13rem_minmax(0,1fr)_17rem] gap-4">
       <aside className="card flex flex-col overflow-hidden">
         <div className="border-b border-line px-3 py-2 text-xs font-semibold uppercase tracking-widest text-muted">
           Scenes
@@ -160,7 +139,7 @@ export default function SceneComposer() {
         </ul>
       </aside>
 
-      <section className="flex flex-col gap-3">
+      <section className="flex min-w-0 flex-col gap-3">
         <div className="card p-3">
           <div className="text-xs uppercase tracking-widest text-muted">
             Live preview
@@ -202,8 +181,8 @@ export default function SceneComposer() {
           </div>
         ) : (
           <div className="card p-6 text-center text-sm text-muted">
-            Pick a scene from the left to inspect, or capture the current
-            state into a new scene.
+            Pick a scene from the left to inspect, or capture the current state
+            into a new scene.
           </div>
         )}
       </section>
@@ -246,8 +225,8 @@ function SavedLayersList({ saved }: { saved: SceneSavedLayer[] }) {
   if (saved.length === 0) {
     return (
       <div className="mt-3 rounded-md border border-dashed border-line p-4 text-center text-xs text-muted">
-        Base snapshot only. Capture a new scene with effects running to
-        save them as layers.
+        Base snapshot only. Capture a new scene with effects running to save
+        them as layers.
       </div>
     );
   }

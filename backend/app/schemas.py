@@ -222,6 +222,15 @@ class ControllerIn(BaseModel):
     enabled: bool = True
     notes: Optional[str] = None
 
+    @field_validator("ip")
+    @classmethod
+    def _ip(cls, value: str) -> str:
+        from ipaddress import IPv4Address
+        try:
+            return str(IPv4Address(value.strip()))
+        except ValueError:
+            raise ValueError("Enter an IPv4 address without leading zeros, for example 192.168.99.239")
+
     @field_validator("notes")
     @classmethod
     def _notes(cls, v: Optional[str]) -> Optional[str]:
@@ -263,8 +272,18 @@ class ControllerIn(BaseModel):
         return v
 
 
-class ControllerOut(ControllerIn):
+class ControllerOut(BaseModel):
+    # Read legacy invalid addresses so the UI can report and repair them.
     id: int
+    name: str
+    ip: str
+    port: int
+    net: int
+    subnet: int
+    universe: int
+    enabled: bool
+    notes: Optional[str] = None
+    health: dict = Field(default_factory=dict)
 
 
 class LightModelModeIn(BaseModel):
@@ -1048,9 +1067,11 @@ class SceneLightState(BaseModel):
 class SceneCreate(BaseModel):
     """Save the current state of one controller (or the whole rig)."""
 
+    favorite: bool = False
     name: str
     controller_id: int
     cross_controller: bool = False
+    include_layers: bool = False
     # When provided, only these lights are captured. Otherwise the snapshot
     # covers every light on ``controller_id`` (or every light at all when
     # ``cross_controller`` is true).
@@ -1075,6 +1096,7 @@ class SceneCreate(BaseModel):
 class SceneUpdate(BaseModel):
     """Rename, re-scope, or re-capture an existing scene."""
 
+    favorite: Optional[bool] = None
     name: Optional[str] = None
     controller_id: Optional[int] = None
     cross_controller: Optional[bool] = None
@@ -1135,6 +1157,7 @@ class SceneOut(BaseModel):
     model_config = _BASE_CONFIG
 
     id: Optional[int] = None
+    favorite: bool = False
     name: str
     controller_id: int
     cross_controller: bool
@@ -1168,6 +1191,7 @@ class StateCreate(BaseModel):
 class StateUpdate(BaseModel):
     """Rename or re-capture an existing rig-wide state."""
 
+    favorite: Optional[bool] = None
     name: Optional[str] = None
     recapture: bool = False
     from_rendered: bool = False
@@ -1195,6 +1219,7 @@ class StateOut(BaseModel):
     model_config = _BASE_CONFIG
 
     id: Optional[int] = None
+    favorite: bool = False
     name: str
     lights: list[SceneLightState] = Field(default_factory=list)
     builtin: bool = False

@@ -9,6 +9,8 @@ repeat.
 
 from __future__ import annotations
 
+from ..ai_runtime import request_options, serialize_content
+
 import asyncio
 import json
 import logging
@@ -20,7 +22,7 @@ from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select
 
 from ..auth import AuthDep
-from ..config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+from ..config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ANTHROPIC_FAST_MODEL
 from ..db import get_session
 from ..engine import (
     engine as effect_engine,
@@ -684,10 +686,10 @@ async def _run_anthropic_attempt(
             client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
             with client.messages.stream(
                 model=ANTHROPIC_MODEL,
-                max_tokens=4096,
+                max_tokens=8192,
                 system=system_prompt,
                 tools=[tool_schema],
-                tool_choice={"type": "tool", "name": _TOOL_NAME},
+                **request_options(),
                 messages=api_messages,
             ) as stream:
                 for event in stream:
@@ -706,8 +708,8 @@ async def _run_anthropic_attempt(
                     elif etype == "content_block_delta":
                         delta = getattr(event, "delta", None)
                         dtype = getattr(delta, "type", None)
-                        if dtype == "text_delta":
-                            t = getattr(delta, "text", "") or ""
+                        if dtype in {"text_delta", "thinking_delta"}:
+                            t = getattr(delta, "text", "") or getattr(delta, "thinking", "") or ""
                             if t:
                                 loop.call_soon_threadsafe(
                                     queue.put_nowait,
@@ -722,23 +724,7 @@ async def _run_anthropic_attempt(
                                 )
                 if not stop_flag["cancelled"]:
                     final = stream.get_final_message()
-                    blocks: list[dict[str, Any]] = []
-                    for blk in getattr(final, "content", []) or []:
-                        btype = getattr(blk, "type", None)
-                        if btype == "text":
-                            blocks.append({
-                                "type": "text",
-                                "text": getattr(blk, "text", "") or "",
-                            })
-                        elif btype == "tool_use":
-                            inp = getattr(blk, "input", None)
-                            blocks.append({
-                                "type": "tool_use",
-                                "id": getattr(blk, "id", "") or "",
-                                "name": getattr(blk, "name", "") or "",
-                                "input": inp if isinstance(inp, dict) else {},
-                            })
-                    final_blocks.extend(blocks)
+                    final_blocks.extend(serialize_content(final))
                     loop.call_soon_threadsafe(
                         queue.put_nowait, ("__done__", None)
                     )

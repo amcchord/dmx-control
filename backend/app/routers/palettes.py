@@ -10,6 +10,8 @@ RGB (e.g. the Designer rig snapshot fallback, the simulated preview).
 
 from __future__ import annotations
 
+from ..ai_runtime import request_options, serialize_content
+
 import logging
 import random
 from typing import Any, Optional
@@ -555,11 +557,11 @@ def generate_palette(payload: PaletteGenerateRequest) -> PaletteGenerateResponse
 
     try:
         message = client.messages.create(
-            model=_config.ANTHROPIC_MODEL,
-            max_tokens=2048,
+            model=_config.ANTHROPIC_FAST_MODEL,
+            max_tokens=4096,
             system=_GEN_SYSTEM_PROMPT,
             tools=[_build_palette_tool_schema()],
-            tool_choice={"type": "tool", "name": _GEN_TOOL_NAME},
+            **request_options(),
             messages=[{"role": "user", "content": content_text}],
         )
     except anthropic.APIStatusError as exc:

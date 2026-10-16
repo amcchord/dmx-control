@@ -737,8 +737,14 @@ async def preview_ws(websocket: WebSocket) -> None:
             await queue.put(msg)
 
     reader_task = asyncio.create_task(reader())
+    last_auth_check = time.monotonic()
     try:
         while True:
+            if time.monotonic() - last_auth_check > 5:
+                last_auth_check = time.monotonic()
+                if not is_authenticated_request(websocket):
+                    await websocket.close(code=4401)
+                    break
             try:
                 msg = await asyncio.wait_for(
                     queue.get(), timeout=PREVIEW_TICK_DT

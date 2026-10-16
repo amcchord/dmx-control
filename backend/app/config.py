@@ -12,7 +12,6 @@ DATABASE_URL = os.environ.get(
     f"sqlite:///{DATA_DIR / 'dmx.db'}",
 )
 
-DMX_PASSWORD = os.environ.get("DMX_PASSWORD", "secretsauce")
 
 # Secret key used to sign session cookies. Persist one to disk so sessions
 # survive restarts without configuring an env var.
@@ -80,4 +79,6 @@ def _load_anthropic_api_key() -> str:
 
 
 ANTHROPIC_API_KEY = _load_anthropic_api_key()
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-7").strip()
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-5-5").strip()
+
+ANTHROPIC_FAST_MODEL = os.environ.get("ANTHROPIC_FAST_MODEL", "claude-sonnet-5-5").strip()

@@ -1,0 +1,7 @@
+[Unit]
+Description=Back up DMX data and HTTPS storage
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/dmx-control/deploy/backup-state.sh
+UMask=0077

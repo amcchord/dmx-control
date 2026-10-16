@@ -83,6 +83,9 @@ def _migrate() -> None:
 
     with engine.begin() as conn:
         if is_sqlite:
+            for table in ("scene", "state"):
+                if "favorite" not in _table_columns(conn, table):
+                    conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN favorite BOOLEAN NOT NULL DEFAULT 0")
             # lightmodel.image_filename (new per-model image column)
             cols = _table_columns(conn, "lightmodel")
             if "image_filename" not in cols:

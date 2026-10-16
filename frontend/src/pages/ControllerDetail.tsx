@@ -4,6 +4,7 @@ import { Api, Controller, Light, LightModel, LightModelMode } from "../api";
 import { useToast } from "../toast";
 import { rgbToHex } from "../util";
 import LightColorPicker from "../components/LightColorPicker";
+import { ControllerStatus } from "../components/OutputStatus";
 import Modal from "../components/Modal";
 
 type LightForm = {
@@ -112,8 +113,7 @@ function ModelThumb({
         src={model.image_url}
         alt=""
         className={
-          cls +
-          " shrink-0 rounded-md object-cover ring-1 ring-line bg-bg-elev"
+          cls + " shrink-0 rounded-md object-cover ring-1 ring-line bg-bg-elev"
         }
       />
     );
@@ -224,7 +224,7 @@ export default function ControllerDetail() {
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <h1 className="truncate text-xl font-semibold">
+              <h1 className="break-words text-xl font-semibold">
                 {controller.name}
               </h1>
               {!controller.enabled && (
@@ -261,6 +261,7 @@ export default function ControllerDetail() {
         </div>
       </div>
 
+      <ControllerStatus controller={controller} />
       <LightsPanel
         controller={controller}
         models={models}
@@ -465,6 +466,21 @@ function LightsPanel({
     }
   };
 
+  const moveLight = async (id: number, offset: number) => {
+    const from = orderIds.indexOf(id),
+      to = from + offset;
+    if (from < 0 || to < 0 || to >= orderIds.length) return;
+    const next = moveItem(orderIds, from, to);
+    setOrderIds(next);
+    try {
+      await Api.reorderLights(next);
+      await onChanged();
+    } catch (e) {
+      toast.push(String(e), "error");
+      await onChanged();
+    }
+  };
+
   const handleDragStart = (id: number) => (e: React.DragEvent) => {
     setDragId(id);
     dragChanged.current = false;
@@ -639,7 +655,7 @@ function LightsPanel({
         </div>
       ) : (
         <div className="overflow-hidden rounded-lg ring-1 ring-line">
-          <div className="hidden bg-bg-elev px-3 py-2 text-xs uppercase tracking-wide text-muted sm:grid sm:grid-cols-[24px_48px_1fr_180px_24px_120px_160px] sm:items-center sm:gap-3">
+          <div className="hidden bg-bg-elev px-3 py-2 text-xs uppercase tracking-wide text-muted sm:grid 2xl:grid-cols-[24px_48px_1fr_180px_24px_120px_160px] sm:items-center sm:gap-3">
             <span />
             <span />
             <span>Name</span>
@@ -662,7 +678,7 @@ function LightsPanel({
               else if (m) chanCount = m.channel_count;
               const isDragging = dragId === l.id;
               let rowCls =
-                "grid grid-cols-[24px_48px_1fr_auto] items-center gap-3 px-3 py-2 sm:grid-cols-[24px_48px_1fr_180px_24px_120px_160px]";
+                "grid grid-cols-[48px_minmax(0,1fr)] items-center gap-3 px-3 py-2 2xl:grid-cols-[24px_48px_1fr_180px_24px_120px_160px]";
               if (isDragging) rowCls += " opacity-50";
               return (
                 <li
@@ -675,7 +691,7 @@ function LightsPanel({
                   onDrop={(e) => e.preventDefault()}
                 >
                   <span
-                    className="cursor-grab text-muted hover:text-slate-200 active:cursor-grabbing"
+                    className="hidden 2xl:block cursor-grab text-muted hover:text-slate-200 active:cursor-grabbing"
                     title="Drag to reorder"
                   >
                     <DragHandleIcon className="h-4 w-4" />
@@ -683,17 +699,14 @@ function LightsPanel({
                   <ModelThumb model={m} size="sm" />
                   <div className="min-w-0">
                     <div className="flex items-center gap-1">
-                      <span className="truncate font-medium">{l.name}</span>
+                      <span className="break-words font-medium">{l.name}</span>
                       {l.notes && (
-                        <span
-                          className="pill text-[9px]"
-                          title={l.notes}
-                        >
+                        <span className="pill text-[9px]" title={l.notes}>
                           notes
                         </span>
                       )}
                     </div>
-                    <div className="truncate text-xs text-muted sm:hidden">
+                    <div className="truncate text-xs text-muted 2xl:hidden">
                       {m?.name ?? "?"} &middot; {mode?.name ?? "?"} &middot;{" "}
                       <span className="font-mono">
                         {l.start_address}
@@ -701,22 +714,35 @@ function LightsPanel({
                       </span>
                     </div>
                   </div>
-                  <div className="hidden min-w-0 text-sm text-muted sm:block">
+                  <div className="hidden min-w-0 text-sm text-muted 2xl:block">
                     <div className="truncate">{m?.name ?? "?"}</div>
                     <div className="truncate text-xs">{mode?.name ?? "?"}</div>
                   </div>
-                  <div className="hidden sm:block">
+                  <div className="hidden 2xl:block">
                     <ColorSwatch light={l} />
                   </div>
-                  <div className="hidden font-mono text-sm sm:block">
+                  <div className="hidden font-mono text-sm 2xl:block">
                     {l.start_address}
                     {chanCount > 0 && `-${l.start_address + chanCount - 1}`}
                   </div>
-                  <div className="flex justify-end gap-1">
+                  <div className="col-span-2 flex flex-wrap justify-end gap-1 2xl:col-span-1">
                     <button
-                      className="btn-ghost"
-                      onClick={() => openEdit(l)}
+                      className="btn-ghost 2xl:hidden"
+                      aria-label={`Move ${l.name} earlier`}
+                      disabled={orderIds[0] === l.id}
+                      onClick={() => moveLight(l.id, -1)}
                     >
+                      ↑
+                    </button>
+                    <button
+                      className="btn-ghost 2xl:hidden"
+                      aria-label={`Move ${l.name} later`}
+                      disabled={orderIds[orderIds.length - 1] === l.id}
+                      onClick={() => moveLight(l.id, 1)}
+                    >
+                      ↓
+                    </button>
+                    <button className="btn-ghost" onClick={() => openEdit(l)}>
                       Edit
                     </button>
                     <button
