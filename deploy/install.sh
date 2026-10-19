@@ -106,6 +106,12 @@ else
     systemctl reload-or-restart caddy
 fi
 
+log "Installing nightly data and HTTPS backup..."
+install -m 644 "$DEPLOY_DIR/dmx-backup.service" /etc/systemd/system/dmx-backup.service
+install -m 644 "$DEPLOY_DIR/dmx-backup.timer" /etc/systemd/system/dmx-backup.timer
+systemctl daemon-reload
+systemctl enable --now dmx-backup.timer
+
 log "Waiting for backend to come up..."
 for i in 1 2 3 4 5 6 7 8 9 10; do
     if curl -fs http://127.0.0.1:8000/api/health >/dev/null; then
@@ -119,5 +125,5 @@ log "Done."
 echo
 echo "  Local:  http://127.0.0.1:8000"
 echo "  Public: https://dmx.50day.io"
-echo "  Login password (DMX_PASSWORD env on service): secretsauce"
+echo "  Create an administrator: sudo -u dmx env DMX_DATA_DIR=/var/lib/dmx-control $BACKEND_DIR/.venv/bin/python -m app.accounts austin"
 echo

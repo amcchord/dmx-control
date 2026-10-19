@@ -1,9 +1,12 @@
 import React, { createContext, useContext, useEffect, useState } from "react";
-import { Api, ApiError } from "./api";
+import { Api, ApiError, UserAccount } from "./api";
 
 type AuthState = {
   authenticated: boolean | null; // null = unknown, checking
-  login: (password: string) => Promise<boolean>;
+  user: UserAccount | null;
+  canOperate: boolean;
+  isAdmin: boolean;
+  login: (username: string, password: string) => Promise<boolean>;
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
 };
@@ -17,12 +20,14 @@ export function useAuth() {
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<UserAccount | null>(null);
   const [authed, setAuthed] = useState<boolean | null>(null);
 
   const refresh = async () => {
     try {
       const s = await Api.status();
       setAuthed(s.authenticated);
+      setUser(s.user);
     } catch {
       setAuthed(false);
     }
@@ -30,12 +35,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     refresh();
+    const expired = () => {
+      setAuthed(false);
+      setUser(null);
+    };
+    window.addEventListener("dmx:session-expired", expired);
+    return () => window.removeEventListener("dmx:session-expired", expired);
   }, []);
 
-  const login = async (password: string) => {
+  const login = async (username: string, password: string) => {
     try {
-      const r = await Api.login(password);
+      const r = await Api.login(username, password);
       setAuthed(r.authenticated);
+      setUser(r.user);
       return r.authenticated;
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
@@ -49,10 +61,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const logout = async () => {
     await Api.logout();
     setAuthed(false);
+    setUser(null);
   };
 
   return (
-    <Ctx.Provider value={{ authenticated: authed, login, logout, refresh }}>
+    <Ctx.Provider
+      value={{
+        authenticated: authed,
+        user,
+        canOperate: !!user && user.role !== "viewer",
+        isAdmin: user?.role === "admin",
+        login,
+        logout,
+        refresh,
+      }}
+    >
       {children}
     </Ctx.Provider>
   );

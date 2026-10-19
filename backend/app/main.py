@@ -25,6 +25,7 @@ from .routers import effects as effects_router
 from .routers import layers as layers_router
 from .routers import lights as lights_router
 from .routers import models as models_router
+from .routers import operations as operations_router
 from .routers import palettes as palettes_router
 from .routers import scenes as scenes_router
 from .routers import state as state_router
@@ -173,6 +174,7 @@ def _resume_active_effects() -> None:
 app = FastAPI(title="DMX Control", version="0.1.0", lifespan=lifespan)
 
 app.include_router(auth_router.router)
+app.include_router(operations_router.router)
 app.include_router(controllers_router.router)
 app.include_router(models_router.router)
 app.include_router(lights_router.router)
@@ -195,7 +197,9 @@ def health() -> dict:
     """Live engine health: tick count, last tick time, dropped frames,
     active layers. Polled by the desktop Live rail and Me screen."""
     snap = effect_engine.health_snapshot()
-    return {"ok": True, **snap}
+    controllers = manager.health_snapshot()
+    return {"ok": True, **snap,
+            "output_errors": sum(c["status"] == "error" for c in controllers)}
 
 
 # ---------------------------------------------------------------------------

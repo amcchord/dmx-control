@@ -1,287 +1,278 @@
-import React, { useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import React, { useEffect, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   Api,
   Effect,
+  Palette,
+  Light,
+  Controller,
   LayerBlendMode,
   LAYER_BLEND_MODES,
-  Palette,
+  EffectParams,
 } from "../../api";
-import PaletteSwatch from "../../components/PaletteSwatch";
-import { useLayerStore } from "../../state/layers";
 import { useSelection } from "../../state/selection";
+import { useLayerStore } from "../../state/layers";
+import { useAuth } from "../../auth";
 import { useToast } from "../../toast";
-
-/** Curated grid of saved effect presets.
- *
- * Designed for tap-to-launch: short tap pushes the preset onto the top
- * of the layer stack with default blend (normal/100%); long-press opens
- * a small inspector to set blend mode + opacity + mask before launch.
- *
- * The Lua editor lives on the desktop Effects Composer, not here. */
+import Modal from "../../components/Modal";
+import EffectPreview from "../../components/EffectPreview";
+import EffectParamsForm from "../../components/EffectParamsForm";
+import PaletteSwatch from "../../components/PaletteSwatch";
 export default function QuickFx() {
+  const [effects, setEffects] = useState<Effect[]>([]),
+    [palettes, setPalettes] = useState<Palette[]>([]),
+    [lights, setLights] = useState<Light[]>([]);
+  const [controllers, setControllers] = useState<Controller[]>([]);
+  useEffect(() => {
+    void Api.listControllers().then(setControllers);
+  }, []);
+  const [search, setSearch] = useState("");
+  const [selected, setSelected] = useState<Effect | null>(null);
+  const [error, setError] = useState("");
+  const [query] = useSearchParams();
   const { selection } = useSelection();
   const { layers } = useLayerStore();
-  const { push: notify } = useToast();
-  const [effects, setEffects] = useState<Effect[]>([]);
-  const [palettes, setPalettes] = useState<Palette[]>([]);
-  const [filter, setFilter] = useState<"all" | "rgb" | "aux">("all");
-  const [search, setSearch] = useState("");
-  const [pendingPreset, setPendingPreset] = useState<Effect | null>(null);
-
   useEffect(() => {
-    void Promise.all([
-      Api.listEffects().then(setEffects),
-      Api.listPalettes().then(setPalettes),
-    ]);
+    Promise.all([Api.listEffects(), Api.listPalettes(), Api.listLights()])
+      .then(([e, p, l]) => {
+        setEffects(e);
+        setPalettes(p);
+        setLights(l);
+        const id = Number(query.get("effect"));
+        if (id) setSelected(e.find((x) => x.id === id) || null);
+      })
+      .catch((e) => setError(String(e)));
   }, []);
-
-  const palettesById = useMemo(
-    () => new Map(palettes.map((p) => [p.id, p])),
-    [palettes],
+  return (
+    <div className="space-y-4">
+      <header>
+        <h1 className="text-xl font-semibold">Effects</h1>
+        <p className="mt-1 text-sm text-muted">
+          Preview a look, choose its fixtures, then launch it live.
+        </p>
+      </header>
+      <div className="rounded-xl bg-violet-950/40 p-3 text-sm ring-1 ring-violet-800">
+        {selection.lightIds.size
+          ? `${selection.lightIds.size} fixtures selected`
+          : "No selection · choose whole rig or a controller before launch"}
+        <Link to="/lights" className="btn-ghost ml-1">
+          Choose fixtures
+        </Link>
+      </div>
+      <input
+        className="input"
+        type="search"
+        aria-label="Search effects"
+        placeholder="Search effects…"
+        value={search}
+        onChange={(e) => setSearch(e.target.value)}
+      />
+      {error && (
+        <p role="alert" className="text-rose-200">
+          {error}
+        </p>
+      )}
+      <div className="grid grid-cols-1 gap-3 min-[380px]:grid-cols-2 xl:grid-cols-3">
+        {effects
+          .filter((e) =>
+            `${e.name} ${e.description}`
+              .toLowerCase()
+              .includes(search.toLowerCase()),
+          )
+          .map((e) => (
+            <article className="card flex flex-col gap-3 p-3" key={e.id}>
+              <div className="flex gap-2">
+                <h2 className="min-w-0 flex-1 break-words font-semibold">
+                  {e.name}
+                </h2>
+                {layers.some((l) => l.effect_id === e.id) && (
+                  <span className="pill self-start text-emerald-200">Live</span>
+                )}
+              </div>
+              <p className="text-xs text-muted">{e.description}</p>
+              <PaletteSwatch
+                colors={
+                  palettes
+                    .find((p) => p.id === e.palette_id)
+                    ?.colors.slice(0, 6) || ["#9b75ff"]
+                }
+              />
+              <button
+                className="btn-secondary mt-auto"
+                onClick={() => setSelected(e)}
+              >
+                Preview & configure
+              </button>
+            </article>
+          ))}
+      </div>
+      {selected && (
+        <Configure
+          key={selected.id}
+          effect={selected}
+          lights={lights}
+          controllers={controllers}
+          palettes={palettes}
+          onClose={() => setSelected(null)}
+        />
+      )}
+    </div>
   );
-
-  const filtered = useMemo(() => {
-    let out = effects;
-    if (filter === "rgb")
-      out = out.filter((e) => e.target_channels.includes("rgb"));
-    if (filter === "aux")
-      out = out.filter(
-        (e) =>
-          !e.target_channels.includes("rgb") ||
-          e.target_channels.length > 1,
-      );
-    if (search.trim()) {
-      const q = search.toLowerCase();
-      out = out.filter(
-        (e) =>
-          e.name.toLowerCase().includes(q) ||
-          (e.description ?? "").toLowerCase().includes(q),
-      );
-    }
-    return out;
-  }, [effects, filter, search]);
-
-  const launch = async (
-    e: Effect,
-    overrides?: {
-      blend_mode?: LayerBlendMode;
-      opacity?: number;
-      mask?: number[];
-    },
-  ) => {
+}
+function Configure({
+  effect,
+  lights,
+  controllers: controllerList,
+  palettes,
+  onClose,
+}: {
+  effect: Effect;
+  lights: Light[];
+  controllers: Controller[];
+  palettes: Palette[];
+  onClose: () => void;
+}) {
+  const { selection } = useSelection();
+  const { canOperate } = useAuth();
+  const { refresh } = useLayerStore();
+  const { push } = useToast();
+  const [scope, setScope] = useState(
+    selection.lightIds.size ? "selection" : "",
+  );
+  const [blend, setBlend] = useState<LayerBlendMode>("normal");
+  const [opacity, setOpacity] = useState(1);
+  const [params, setParams] = useState<EffectParams>(effect.params);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const controllers = [...new Set(lights.map((l) => l.controller_id))];
+  const ids = lights
+    .filter(
+      (l) =>
+        scope === "rig" ||
+        (scope === "selection"
+          ? selection.lightIds.has(l.id)
+          : l.controller_id === Number(scope)),
+    )
+    .map((l) => l.id);
+  const launch = async () => {
+    if (!ids.length) return;
+    setBusy(true);
+    setError("");
     try {
-      const mask = overrides?.mask ?? [...selection.lightIds];
       await Api.createLayer({
-        effect_id: e.id,
-        blend_mode: overrides?.blend_mode ?? "normal",
-        opacity: overrides?.opacity ?? 1.0,
-        mask_light_ids: mask,
+        effect_id: effect.id,
+        mask_light_ids: ids,
+        light_ids: ids,
+        opacity,
+        blend_mode: blend,
+        params_override: params,
       });
-      notify(`+ ${e.name}`, "success");
-    } catch (err) {
-      notify(String(err), "error");
+      await refresh();
+      push(`${effect.name} live on ${ids.length} fixtures`, "success");
+      onClose();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
     }
   };
-
-  const activeIds = new Set(
-    layers.map((l) => l.effect_id).filter((x): x is number => x != null),
-  );
-
   return (
-    <div className="flex flex-col gap-3 pb-24">
-      <div className="flex flex-wrap items-center gap-2">
-        <input
-          type="search"
-          value={search}
-          onChange={(e) => setSearch(e.currentTarget.value)}
-          placeholder="Search presets..."
-          className="input flex-1 min-w-[10rem]"
-        />
-        <div className="flex rounded-md ring-1 ring-line">
-          {(["all", "rgb", "aux"] as const).map((f) => (
-            <button
-              key={f}
-              onClick={() => setFilter(f)}
-              className={
-                "px-2.5 py-1 text-xs uppercase tracking-wider " +
-                (filter === f
-                  ? "bg-bg-elev text-white"
-                  : "text-muted hover:text-white")
-              }
-            >
-              {f}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {selection.lightIds.size > 0 && (
-        <div className="rounded-md bg-emerald-950/40 px-3 py-2 text-xs text-emerald-200 ring-1 ring-emerald-800">
-          Launching with mask: {selection.lightIds.size} selected light
-          {selection.lightIds.size === 1 ? "" : "s"}
-        </div>
-      )}
-
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4">
-        {filtered.map((e) => (
-          <PresetCard
-            key={e.id}
-            effect={e}
-            palette={
-              e.palette_id != null ? palettesById.get(e.palette_id) : undefined
-            }
-            running={activeIds.has(e.id)}
-            onLaunch={() => launch(e)}
-            onConfigure={() => setPendingPreset(e)}
-          />
-        ))}
-      </div>
-
-      {filtered.length === 0 && (
-        <div className="rounded-lg border border-dashed border-line p-8 text-center text-sm text-muted">
-          No presets match. Build one in the{" "}
-          <Link to="/author/effects" className="text-accent hover:underline">
-            Effects Composer
-          </Link>
-          .
-        </div>
-      )}
-
-      {pendingPreset && (
-        <PresetSheet
-          effect={pendingPreset}
-          onClose={() => setPendingPreset(null)}
-          onLaunch={(overrides) => {
-            void launch(pendingPreset, overrides);
-            setPendingPreset(null);
-          }}
-        />
-      )}
-    </div>
-  );
-}
-
-function PresetCard({
-  effect,
-  palette,
-  running,
-  onLaunch,
-  onConfigure,
-}: {
-  effect: Effect;
-  palette?: Palette;
-  running: boolean;
-  onLaunch: () => void;
-  onConfigure: () => void;
-}) {
-  return (
-    <button
-      onClick={onLaunch}
-      onContextMenu={(e) => {
-        e.preventDefault();
-        onConfigure();
-      }}
-      className={
-        "card flex flex-col gap-1.5 p-3 text-left transition hover:bg-bg-elev " +
-        (running ? "ring-2 ring-emerald-600" : "")
+    <Modal
+      open
+      title={effect.name}
+      onClose={onClose}
+      footer={
+        <button
+          className="btn-primary w-full"
+          disabled={busy || !ids.length || !canOperate}
+          onClick={launch}
+        >
+          {busy ? "Launching…" : `Launch live · ${ids.length} fixtures`}
+        </button>
       }
-      title="Tap to launch • Right-click / long-press to configure"
     >
-      <div className="flex items-center justify-between">
-        <span className="truncate text-sm font-semibold">{effect.name}</span>
-        {running && (
-          <span className="rounded-full bg-emerald-900/60 px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-emerald-200">
-            live
-          </span>
+      <div className="space-y-4">
+        <EffectPreview
+          effect={effect}
+          params={params}
+          palette={
+            palettes.find((p) => p.id === effect.palette_id)?.colors || [
+              "#ffffff",
+            ]
+          }
+          intensity={opacity}
+        />
+        <label className="block">
+          <span className="label">Send to</span>
+          <select
+            className="input mt-1"
+            value={scope}
+            onChange={(e) => setScope(e.target.value)}
+          >
+            <option value="">Choose target…</option>
+            <option value="selection" disabled={!selection.lightIds.size}>
+              Selected fixtures ({selection.lightIds.size})
+            </option>
+            <option value="rig">Whole rig ({lights.length} fixtures)</option>
+            {controllers.map((cid) => (
+              <option key={cid} value={cid}>
+                {controllerList.find((c) => c.id === cid)?.name ||
+                  `Controller #${cid}`}{" "}
+                ({lights.filter((l) => l.controller_id === cid).length}{" "}
+                fixtures)
+              </option>
+            ))}
+          </select>
+        </label>
+        <p className="text-xs text-muted break-words">
+          {ids.length
+            ? lights
+                .filter((l) => ids.includes(l.id))
+                .map((l) => l.name)
+                .join(" · ")
+            : "Nothing will launch until you choose a target."}
+        </p>
+        <label className="block">
+          <span className="label">Opacity · {Math.round(opacity * 100)}%</span>
+          <input
+            className="w-full"
+            aria-label="Effect opacity"
+            type="range"
+            min="0"
+            max="1"
+            step=".01"
+            value={opacity}
+            onChange={(e) => setOpacity(Number(e.target.value))}
+          />
+        </label>
+        {effect.param_schema.length > 0 && (
+          <EffectParamsForm
+            schema={effect.param_schema}
+            values={params}
+            onChange={setParams}
+          />
+        )}
+        <details>
+          <summary className="btn-secondary cursor-pointer">
+            Layer blending
+          </summary>
+          <select
+            aria-label="Blend mode"
+            className="input mt-2"
+            value={blend}
+            onChange={(e) => setBlend(e.target.value as LayerBlendMode)}
+          >
+            {LAYER_BLEND_MODES.map((b) => (
+              <option key={b}>{b}</option>
+            ))}
+          </select>
+        </details>
+        {error && (
+          <p role="alert" className="text-rose-200">
+            {error}
+          </p>
         )}
       </div>
-      {effect.description && (
-        <div className="line-clamp-2 text-[11px] text-muted">
-          {effect.description}
-        </div>
-      )}
-      {palette && <PaletteSwatch colors={palette.colors.slice(0, 8)} />}
-      <div className="flex flex-wrap gap-1 pt-1">
-        {effect.target_channels.map((tc) => (
-          <span
-            key={tc}
-            className="rounded bg-bg-card px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-muted ring-1 ring-line"
-          >
-            {tc}
-          </span>
-        ))}
-      </div>
-    </button>
-  );
-}
-
-function PresetSheet({
-  effect,
-  onClose,
-  onLaunch,
-}: {
-  effect: Effect;
-  onClose: () => void;
-  onLaunch: (overrides: {
-    blend_mode: LayerBlendMode;
-    opacity: number;
-  }) => void;
-}) {
-  const [blend, setBlend] = useState<LayerBlendMode>("normal");
-  const [opacity, setOpacity] = useState(1.0);
-  return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 sm:items-center">
-      <div className="w-full max-w-md rounded-t-2xl bg-bg-card p-4 ring-1 ring-line sm:rounded-2xl">
-        <div className="mb-3 flex items-center justify-between">
-          <div className="text-sm font-semibold">{effect.name}</div>
-          <button
-            onClick={onClose}
-            className="btn-ghost px-2 py-1 text-xs"
-            aria-label="Close"
-          >
-            {"\u00D7"}
-          </button>
-        </div>
-        <div className="space-y-3">
-          <div>
-            <label className="label">Blend mode</label>
-            <select
-              value={blend}
-              onChange={(e) =>
-                setBlend(e.currentTarget.value as LayerBlendMode)
-              }
-              className="input"
-            >
-              {LAYER_BLEND_MODES.map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="label">
-              Opacity {(opacity * 100).toFixed(0)}%
-            </label>
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.01}
-              value={opacity}
-              onChange={(e) => setOpacity(parseFloat(e.currentTarget.value))}
-              className="w-full accent-accent"
-            />
-          </div>
-          <button
-            onClick={() => onLaunch({ blend_mode: blend, opacity })}
-            className="btn-primary w-full"
-          >
-            Launch as new layer
-          </button>
-        </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

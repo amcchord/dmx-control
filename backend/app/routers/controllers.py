@@ -22,6 +22,7 @@ def _to_out(c: Controller) -> ControllerOut:
         universe=c.universe,
         enabled=c.enabled,
         notes=c.notes,
+        health=manager.controller_health(c.id),
     )
 
 
@@ -76,6 +77,8 @@ def blackout(cid: int, sess: Session = Depends(get_session)) -> dict:
     from ..models import Light
 
     lights = sess.exec(select(Light).where(Light.controller_id == cid)).all()
+    from ..look_helpers import stop_layers_for
+    stop_layers_for(sess, {l.id for l in lights})
     for light in lights:
         light.r = light.g = light.b = light.w = light.a = light.uv = 0
         light.on = False

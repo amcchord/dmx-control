@@ -37,8 +37,17 @@ async function request<T>(
       (data && typeof data === "object" && "detail" in data
         ? (data as { detail: unknown }).detail
         : null) || res.statusText;
-    throw new ApiError(String(detail), res.status, data);
+    const message = Array.isArray(detail)
+      ? detail
+          .map((d: { msg?: string }) => d.msg || "Check your entries")
+          .join(" · ")
+      : String(detail);
+    if (res.status === 401 && !path.startsWith("/api/auth/"))
+      window.dispatchEvent(new Event("dmx:session-expired"));
+    throw new ApiError(message, res.status, data);
   }
+  if (method !== "GET" && !path.startsWith("/api/auth/"))
+    window.dispatchEvent(new Event("dmx:changed"));
   return data as T;
 }
 
@@ -107,8 +116,7 @@ function xhrUpload<T>(
       onProgress?.({ phase: "processing", percent: 1 });
     };
 
-    xhr.onerror = () =>
-      reject(new ApiError("network error", 0, null));
+    xhr.onerror = () => reject(new ApiError("network error", 0, null));
     xhr.onabort = () => reject(new ApiError("upload aborted", 0, null));
     xhr.onload = () => {
       const text = xhr.responseText || "";
@@ -143,6 +151,7 @@ export const api = {
 };
 
 export type Controller = {
+  health?: OutputHealth;
   id: number;
   name: string;
   ip: string;
@@ -182,12 +191,7 @@ export type ZoneKind =
   | "global"
   | "other";
 
-export type LayoutShape =
-  | "single"
-  | "linear"
-  | "grid"
-  | "ring"
-  | "cluster";
+export type LayoutShape = "single" | "linear" | "grid" | "ring" | "cluster";
 
 export type FixtureZone = {
   id: string;
@@ -403,7 +407,22 @@ export type PaletteGenerateResponse = {
   summary?: string | null;
 };
 
-export type AuthStatus = { authenticated: boolean };
+export type UserAccount = {
+  id: number;
+  username: string;
+  name: string;
+  role: "admin" | "operator" | "viewer";
+  enabled: boolean;
+};
+export type AuthStatus = { authenticated: boolean; user: UserAccount | null };
+export type OutputHealth = {
+  status: "error" | "sending" | "waiting" | "disabled" | "simulation";
+  last_error?: string;
+  last_sent_at?: number;
+  last_error_at?: number;
+  sent_count?: number;
+  error_count?: number;
+};
 
 export type AiStatus = { enabled: boolean; model: string };
 
@@ -455,10 +474,7 @@ export type ColorRequestBody = {
 
 export type BulkTarget = { light_id: number; zone_id?: string | null };
 
-export type PaletteSpread =
-  | "across_lights"
-  | "across_fixture"
-  | "across_zones";
+export type PaletteSpread = "across_lights" | "across_fixture" | "across_zones";
 
 /** Channel groups an effect overlay can drive. */
 export type EffectTargetChannel =
@@ -740,6 +756,7 @@ export type SceneLightState = {
  * is true in that case. `cross_controller` means the captured state may
  * cover lights on other controllers too. */
 export type Scene = {
+  favorite?: boolean;
   id: number | null;
   name: string;
   controller_id: number;
@@ -753,6 +770,8 @@ export type Scene = {
 };
 
 export type SceneCreateInput = {
+  include_layers?: boolean;
+  favorite?: boolean;
   name: string;
   controller_id: number;
   cross_controller?: boolean;
@@ -765,6 +784,7 @@ export type SceneCreateInput = {
 };
 
 export type SceneUpdateInput = {
+  favorite?: boolean;
   name?: string;
   controller_id?: number;
   cross_controller?: boolean;
@@ -783,6 +803,7 @@ export type SceneUpdateInput = {
  * applies to the whole rig. `id` is null for the virtual Blackout entry
  * (which always has `builtin: true`). */
 export type State = {
+  favorite?: boolean;
   id: number | null;
   name: string;
   lights: SceneLightState[];
@@ -797,6 +818,7 @@ export type StateCreateInput = {
 };
 
 export type StateUpdateInput = {
+  favorite?: boolean;
   name?: string;
   /** When true, re-capture the snapshot from the current state. */
   recapture?: boolean;
@@ -804,8 +826,26 @@ export type StateUpdateInput = {
 };
 
 export const Api = {
-  login: (password: string) =>
-    api.post<AuthStatus>("/api/auth/login", { password }),
+  login: (username: string, password: string) =>
+    api.post<AuthStatus>("/api/auth/login", { username, password }),
+  users: () => api.get<UserAccount[]>("/api/auth/users"),
+  createUser: (body: {
+    username: string;
+    name: string;
+    password: string;
+    role: string;
+  }) => api.post<UserAccount>("/api/auth/users", body),
+  updateUser: (
+    id: number,
+    body: { role?: string; enabled?: boolean; password?: string },
+  ) => api.patch<UserAccount>(`/api/auth/users/${id}`, body),
+  lookHistory: () =>
+    api.get<{
+      available: boolean;
+      entries: { id: number; label: string; created_at: string }[];
+    }>("/api/looks/history"),
+  restoreLook: (id?: number) =>
+    api.post<{ ok: boolean }>("/api/looks/restore", { checkpoint_id: id }),
   logout: () => api.post<AuthStatus>("/api/auth/logout"),
   status: () => api.get<AuthStatus>("/api/auth/status"),
 
@@ -848,15 +888,9 @@ export const Api = {
     api.post<{ updated: number }>(`/api/lights/reorder`, {
       light_ids: lightIds,
     }),
-  setColor: (
-    id: number,
-    rgb: ColorRequestBody,
-  ) => api.post<Light>(`/api/lights/${id}/color`, rgb),
-  bulkColor: (
-    ids: number[],
-    rgb: ColorRequestBody,
-    targets?: BulkTarget[],
-  ) =>
+  setColor: (id: number, rgb: ColorRequestBody) =>
+    api.post<Light>(`/api/lights/${id}/color`, rgb),
+  bulkColor: (ids: number[], rgb: ColorRequestBody, targets?: BulkTarget[]) =>
     api.post<{ updated: number }>(`/api/lights/bulk-color`, {
       light_ids: ids,
       targets,
@@ -884,7 +918,10 @@ export const Api = {
     id: number,
     lightIds: number[],
     mode: "cycle" | "random" | "gradient",
-    spread: "across_lights" | "across_fixture" | "across_zones" = "across_lights",
+    spread:
+      | "across_lights"
+      | "across_fixture"
+      | "across_zones" = "across_lights",
   ) =>
     api.post<{ updated: number }>(`/api/palettes/${id}/apply`, {
       light_ids: lightIds,
@@ -923,26 +960,28 @@ export const Api = {
         ? `/api/scenes?controller_id=${controllerId}`
         : `/api/scenes`,
     ),
-  createScene: (body: SceneCreateInput) =>
-    api.post<Scene>(`/api/scenes`, body),
+  createScene: (body: SceneCreateInput) => api.post<Scene>(`/api/scenes`, body),
   updateScene: (id: number, body: SceneUpdateInput) =>
     api.patch<Scene>(`/api/scenes/${id}`, body),
   deleteScene: (id: number) => api.del<void>(`/api/scenes/${id}`),
-  applyScene: (id: number) =>
-    api.post<{ ok: boolean; applied: number }>(`/api/scenes/${id}/apply`),
+  applyScene: (id: number, fadeS = 0) =>
+    api.post<{ ok: boolean; applied: number }>(
+      `/api/scenes/${id}/apply?fade_s=${fadeS}`,
+    ),
   applyBlackoutScene: (controllerId: number) =>
     api.post<{ ok: boolean; applied: number }>(
       `/api/scenes/blackout/${controllerId}/apply`,
     ),
 
   listStates: () => api.get<State[]>(`/api/states`),
-  createState: (body: StateCreateInput) =>
-    api.post<State>(`/api/states`, body),
+  createState: (body: StateCreateInput) => api.post<State>(`/api/states`, body),
   updateState: (id: number, body: StateUpdateInput) =>
     api.patch<State>(`/api/states/${id}`, body),
   deleteState: (id: number) => api.del<void>(`/api/states/${id}`),
-  applyState: (id: number) =>
-    api.post<{ ok: boolean; applied: number }>(`/api/states/${id}/apply`),
+  applyState: (id: number, fadeS = 0) =>
+    api.post<{ ok: boolean; applied: number }>(
+      `/api/states/${id}/apply?fade_s=${fadeS}`,
+    ),
   applyBlackoutState: () =>
     api.post<{ ok: boolean; applied: number }>(`/api/states/blackout/apply`),
 
@@ -966,10 +1005,7 @@ export const Api = {
   getBaseStateLog: () => api.get<BaseStateChange[]>("/api/base-state/log"),
 
   aiStatus: () => api.get<AiStatus>("/api/ai/status"),
-  parseManual: (
-    file: File,
-    onProgress?: (p: UploadProgress) => void,
-  ) => {
+  parseManual: (file: File, onProgress?: (p: UploadProgress) => void) => {
     const form = new FormData();
     form.append("file", file);
     return xhrUpload<ParsedManual>(
@@ -982,9 +1018,7 @@ export const Api = {
   designer: {
     status: () => api.get<AiStatus>("/api/designer/status"),
     listConversations: () =>
-      api.get<DesignerConversationSummary[]>(
-        "/api/designer/conversations",
-      ),
+      api.get<DesignerConversationSummary[]>("/api/designer/conversations"),
     createConversation: (name?: string) =>
       api.post<DesignerConversation>(`/api/designer/conversations`, {
         name: name ?? null,
@@ -1011,11 +1045,7 @@ export const Api = {
          *  transient layer (so the run shows in the Live rail). */
         layer_id?: number;
       }>(`/api/designer/conversations/${cid}/apply`, { proposal_id }),
-    saveProposal: (
-      cid: number,
-      proposal_id: string,
-      name?: string,
-    ) =>
+    saveProposal: (cid: number, proposal_id: string, name?: string) =>
       api.post<{
         ok: boolean;
         kind: "state" | "scene" | "palette" | "effect";
@@ -1049,9 +1079,7 @@ export const Api = {
         name: name ?? null,
       }),
     getConversation: (cid: number) =>
-      api.get<EffectConversationData>(
-        `/api/effect-chat/conversations/${cid}`,
-      ),
+      api.get<EffectConversationData>(`/api/effect-chat/conversations/${cid}`),
     renameConversation: (cid: number, name: string) =>
       api.patch<EffectConversationData>(
         `/api/effect-chat/conversations/${cid}`,
@@ -1354,14 +1382,10 @@ function streamDesignerMessage(
           handlers.onStart?.(parsed as { conversation_id: number });
           break;
         case "text":
-          handlers.onText?.(
-            (parsed as { delta?: string })?.delta ?? "",
-          );
+          handlers.onText?.((parsed as { delta?: string })?.delta ?? "");
           break;
         case "tool_start":
-          handlers.onToolStart?.(
-            (parsed as { tool?: string })?.tool ?? "",
-          );
+          handlers.onToolStart?.((parsed as { tool?: string })?.tool ?? "");
           break;
         case "tool_delta":
           handlers.onToolDelta?.(
@@ -1380,8 +1404,7 @@ function streamDesignerMessage(
             "conversation" in parsed
           ) {
             handlers.onDone?.(
-              (parsed as { conversation: DesignerConversation })
-                .conversation,
+              (parsed as { conversation: DesignerConversation }).conversation,
             );
           }
           break;
@@ -1498,14 +1521,10 @@ function streamEffectChatMessage(
           handlers.onStart?.(parsed as { conversation_id: number });
           break;
         case "text":
-          handlers.onText?.(
-            (parsed as { delta?: string })?.delta ?? "",
-          );
+          handlers.onText?.((parsed as { delta?: string })?.delta ?? "");
           break;
         case "tool_start":
-          handlers.onToolStart?.(
-            (parsed as { tool?: string })?.tool ?? "",
-          );
+          handlers.onToolStart?.((parsed as { tool?: string })?.tool ?? "");
           break;
         case "tool_delta":
           handlers.onToolDelta?.(
@@ -1540,8 +1559,7 @@ function streamEffectChatMessage(
             "conversation" in parsed
           ) {
             handlers.onDone?.(
-              (parsed as { conversation: EffectConversationData })
-                .conversation,
+              (parsed as { conversation: EffectConversationData }).conversation,
             );
           }
           break;

@@ -59,8 +59,8 @@ def _runtime_layer_to_out(snap: dict) -> LayerOut:
         runtime_s=float(snap.get("runtime_s") or 0.0),
         z_index=int(snap.get("z_index") or 100),
         blend_mode=snap.get("blend_mode") or "normal",
-        opacity=float(snap.get("opacity") or 1.0),
-        intensity=float(snap.get("intensity") or 1.0),
+        opacity=float(snap.get("opacity", 1.0)),
+        intensity=float(snap.get("intensity", 1.0)),
         target_channels=list(snap.get("target_channels") or ["rgb"]),
         mute=bool(snap.get("mute")),
         solo=bool(snap.get("solo")),
@@ -237,6 +237,11 @@ def delete_layer(layer_id: int, sess: Session = Depends(get_session)) -> None:
     # fade-out so callers reading state right after see a clean rig.
     engine.stop_by_layer_id(layer_id, immediate=True)
     sess.delete(row)
+    if row.effect_id:
+        effect = sess.get(Effect, row.effect_id)
+        if effect:
+            effect.is_active = False
+            sess.add(effect)
     sess.commit()
 
 
@@ -245,6 +250,9 @@ def clear_layers(sess: Session = Depends(get_session)) -> dict:
     """Panic stop: stop every running layer and delete every persisted
     layer row. Used by the panic/blackout button."""
     n = engine.stop_all(immediate=True)
+    for effect in sess.exec(select(Effect).where(Effect.is_active == True)).all():
+        effect.is_active = False
+        sess.add(effect)
     rows = sess.exec(select(EffectLayer)).all()
     for row in rows:
         sess.delete(row)
@@ -287,6 +295,9 @@ async def layers_ws(websocket: WebSocket) -> None:
             "log": base_state_log.snapshot(),
         })
         while True:
+            if not is_authenticated_request(websocket):
+                await websocket.close(code=4401)
+                break
             try:
                 msg = await asyncio.wait_for(queue.get(), timeout=5.0)
             except asyncio.TimeoutError:

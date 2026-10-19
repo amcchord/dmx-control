@@ -1,4 +1,4 @@
-import React from "react";
+import React, { Suspense, lazy } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { AuthProvider, useAuth } from "./auth";
 import { ToastProvider } from "./toast";
@@ -14,16 +14,17 @@ import QuickFx from "./pages/operate/QuickFx";
 import ScenesOperate from "./pages/operate/Scenes";
 import Me from "./pages/operate/Me";
 
-import EffectsComposer from "./pages/author/EffectsComposer";
+const EffectsComposer = lazy(() => import("./pages/author/EffectsComposer"));
 import SceneComposer from "./pages/author/SceneComposer";
 
 import Controllers from "./pages/Controllers";
 import ControllerDetail from "./pages/ControllerDetail";
 import Models from "./pages/Models";
-import ModelEditor from "./pages/ModelEditor";
+const ModelEditor = lazy(() => import("./pages/ModelEditor"));
 import Palettes from "./pages/Palettes";
-import Designer from "./pages/Designer";
-import ApiDocs from "./pages/ApiDocs";
+const Designer = lazy(() => import("./pages/Designer"));
+const ApiDocs = lazy(() => import("./pages/ApiDocs"));
+const Accounts = lazy(() => import("./pages/Accounts"));
 
 function Protected({ children }: { children: React.ReactNode }) {
   const { authenticated } = useAuth();
@@ -42,12 +43,20 @@ function Protected({ children }: { children: React.ReactNode }) {
 }
 
 function ProtectedShell({ children }: { children: React.ReactNode }) {
+  const { authenticated, isAdmin } = useAuth();
+  const location = useLocation();
+  if (authenticated && location.pathname.startsWith("/config/") && !isAdmin)
+    return <Navigate to="/me" replace />;
   return (
     <Protected>
       <SelectionProvider>
         <LayerStoreProvider>
           <UndoProvider>
-            <AppShell>{children}</AppShell>
+            <AppShell>
+              <Suspense fallback={<p className="p-4 text-muted">Opening…</p>}>
+                {children}
+              </Suspense>
+            </AppShell>
           </UndoProvider>
         </LayerStoreProvider>
       </SelectionProvider>
@@ -138,6 +147,14 @@ export default function App() {
             }
           />
 
+          <Route
+            path="/config/accounts"
+            element={
+              <ProtectedShell>
+                <Accounts />
+              </ProtectedShell>
+            }
+          />
           {/* Configure */}
           <Route
             path="/config/controllers"
@@ -190,13 +207,34 @@ export default function App() {
           />
 
           {/* Legacy redirects keep old links and bookmarks alive. */}
-          <Route path="/effects" element={<Navigate to="/author/effects" replace />} />
-          <Route path="/palettes" element={<Navigate to="/author/palettes" replace />} />
-          <Route path="/designer" element={<Navigate to="/author/designer" replace />} />
-          <Route path="/controllers" element={<Navigate to="/config/controllers" replace />} />
-          <Route path="/controllers/:id" element={<RedirectControllerLegacy />} />
-          <Route path="/models" element={<Navigate to="/config/models" replace />} />
-          <Route path="/models/new" element={<Navigate to="/config/models/new" replace />} />
+          <Route
+            path="/effects"
+            element={<Navigate to="/author/effects" replace />}
+          />
+          <Route
+            path="/palettes"
+            element={<Navigate to="/author/palettes" replace />}
+          />
+          <Route
+            path="/designer"
+            element={<Navigate to="/author/designer" replace />}
+          />
+          <Route
+            path="/controllers"
+            element={<Navigate to="/config/controllers" replace />}
+          />
+          <Route
+            path="/controllers/:id"
+            element={<RedirectControllerLegacy />}
+          />
+          <Route
+            path="/models"
+            element={<Navigate to="/config/models" replace />}
+          />
+          <Route
+            path="/models/new"
+            element={<Navigate to="/config/models/new" replace />}
+          />
           <Route path="/models/:id/edit" element={<RedirectModelLegacy />} />
 
           <Route path="*" element={<Navigate to="/" replace />} />

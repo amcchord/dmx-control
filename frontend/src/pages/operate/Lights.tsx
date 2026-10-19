@@ -1,15 +1,11 @@
 import React, { useEffect, useMemo, useState } from "react";
-import {
-  Api,
-  Controller,
-  Light,
-  LightModel,
-  Palette,
-  Scene,
-} from "../../api";
+import { Api, Controller, Light, LightModel, Palette, Scene } from "../../api";
 import { useSelection } from "../../state/selection";
 import RigPreview from "../../components/RigPreview";
 import LightColorPicker from "../../components/LightColorPicker";
+import { Link } from "react-router-dom";
+import { useAuth } from "../../auth";
+import OutputStatus from "../../components/OutputStatus";
 import Modal from "../../components/Modal";
 import { useToast } from "../../toast";
 
@@ -20,14 +16,23 @@ import { useToast } from "../../toast";
  * Heavy authoring (per-zone editing, motion, palette policy) lives on
  * the desktop config pages — keeping mobile fast and forgiving. */
 export default function LightsPage() {
-  const { selection, toggle, setMany, clear, hasSelection, size, setControllerFilter } =
-    useSelection();
+  const {
+    selection,
+    toggle,
+    setMany,
+    clear,
+    hasSelection,
+    size,
+    setControllerFilter,
+  } = useSelection();
   const { push: notify } = useToast();
   const [lights, setLights] = useState<Light[]>([]);
   const [controllers, setControllers] = useState<Controller[]>([]);
   const [models, setModels] = useState<LightModel[]>([]);
   const [palettes, setPalettes] = useState<Palette[]>([]);
   const [scenes, setScenes] = useState<Scene[]>([]);
+  const { canOperate, isAdmin } = useAuth();
+  const [search, setSearch] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
 
   useEffect(() => {
@@ -36,16 +41,24 @@ export default function LightsPage() {
       Api.listControllers().then(setControllers),
       Api.listModels().then(setModels),
       Api.listPalettes().then(setPalettes),
-      Api.listScenes().then(setScenes).catch(() => null),
+      Api.listScenes()
+        .then(setScenes)
+        .catch(() => null),
     ]);
   }, []);
 
   const selectedLights = lights.filter((l) => selection.lightIds.has(l.id));
 
   const filteredLights = useMemo(() => {
-    if (selection.controllerId == null) return lights;
-    return lights.filter((l) => l.controller_id === selection.controllerId);
-  }, [lights, selection.controllerId]);
+    return lights.filter(
+      (l) =>
+        (selection.controllerId == null ||
+          l.controller_id === selection.controllerId) &&
+        `${l.name} ${l.notes || ""} ${l.start_address}`
+          .toLowerCase()
+          .includes(search.toLowerCase()),
+    );
+  }, [lights, selection.controllerId, search]);
 
   // Prune ghost selections: when the user narrows the controller filter
   // we drop any selected lights that aren't in the current view so the
@@ -121,6 +134,15 @@ export default function LightsPage() {
 
   return (
     <div className="flex flex-col gap-4 pb-32">
+      <OutputStatus />
+      <input
+        className="input"
+        type="search"
+        aria-label="Find fixtures"
+        placeholder="Find by name, location, or DMX address…"
+        value={search}
+        onChange={(e) => setSearch(e.target.value)}
+      />
       <section className="card px-3 py-2">
         <div className="flex flex-wrap items-center gap-2">
           <ControllerFilter
@@ -141,7 +163,9 @@ export default function LightsPage() {
             </button>
           )}
           <span className="ml-auto text-xs text-muted">
-            {hasSelection ? `${size} selected` : `${filteredLights.length} fixtures`}
+            {hasSelection
+              ? `${size} selected`
+              : `${filteredLights.length} fixtures`}
           </span>
         </div>
       </section>
@@ -159,6 +183,7 @@ export default function LightsPage() {
                   {arr.length} fixture{arr.length === 1 ? "" : "s"}
                 </span>
                 <button
+                  disabled={!canOperate}
                   onClick={() => onColorController(cid, arr)}
                   className="btn-secondary text-xs"
                   title="Color every fixture on this controller"
@@ -170,7 +195,8 @@ export default function LightsPage() {
             <div className="px-3 pb-3">
               <RigPreview
                 lights={arr}
-                onSelect={toggle}
+                onSelect={canOperate ? toggle : undefined}
+                showLabels
                 selected={selection.lightIds}
                 size="lg"
                 compact
@@ -180,8 +206,8 @@ export default function LightsPage() {
         );
       })}
 
-      {hasSelection && (
-        <div className="fixed inset-x-0 bottom-16 z-30 border-t border-line bg-bg-elev/95 px-3 py-3 backdrop-blur md:bottom-0">
+      {hasSelection && canOperate && (
+        <div className="phone-actions fixed inset-x-0 bottom-16 z-30 border-t border-line bg-bg-elev/95 px-3 py-3 backdrop-blur md:bottom-0">
           <div className="mx-auto flex max-w-3xl flex-col gap-2">
             <div className="flex items-center gap-2">
               <button
@@ -197,42 +223,16 @@ export default function LightsPage() {
                 Off
               </button>
             </div>
-            {palettes.length > 0 && (
-              <div className="flex flex-wrap gap-1.5">
-                {palettes.slice(0, 6).map((p) => (
-                  <button
-                    key={p.id}
-                    onClick={() => onApplyPalette(p)}
-                    className="rounded-full bg-bg-card px-3 py-1 text-[11px] ring-1 ring-line hover:bg-bg-elev"
-                  >
-                    {p.name}
-                  </button>
-                ))}
-              </div>
-            )}
-            {scenes.filter((s) => !s.builtin && s.id != null).length > 0 && (
-              <div className="flex flex-wrap gap-1.5">
-                {scenes
-                  .filter((s) => !s.builtin && s.id != null)
-                  .slice(0, 4)
-                  .map((s) => (
-                    <button
-                      key={s.id}
-                      onClick={async () => {
-                        if (s.id == null) return;
-                        try {
-                          await Api.applyScene(s.id);
-                          notify(`Applied ${s.name}`, "success");
-                        } catch (e) {
-                          notify(String(e), "error");
-                        }
-                      }}
-                      className="rounded-full bg-emerald-950/40 px-3 py-1 text-[11px] text-emerald-200 ring-1 ring-emerald-800 hover:bg-emerald-900/40"
-                    >
-                      {s.name}
-                    </button>
-                  ))}
-              </div>
+            <Link to="/quick-fx" className="btn-secondary text-sm">
+              Preview FX for {size} selected fixtures
+            </Link>
+            {isAdmin && size === 1 && (
+              <Link
+                to={`/config/controllers/${selectedLights[0]?.controller_id}`}
+                className="btn-ghost text-xs"
+              >
+                Edit fixture name, location & patch
+              </Link>
             )}
           </div>
         </div>
@@ -255,9 +255,7 @@ export default function LightsPage() {
             notify={notify}
             onApplied={(updated) => {
               const byId = new Map(updated.map((l) => [l.id, l]));
-              setLights((prev) =>
-                prev.map((l) => byId.get(l.id) ?? l),
-              );
+              setLights((prev) => prev.map((l) => byId.get(l.id) ?? l));
             }}
           />
         )}

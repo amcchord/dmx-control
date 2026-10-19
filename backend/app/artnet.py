@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from ipaddress import IPv4Address
 import socket
 import threading
 import time
@@ -679,6 +681,10 @@ class ArtNetManager:
         # Used by send_stale() to drive a periodic keepalive that lets
         # power-cycled fixtures recover their state without user input.
         self._last_sent_at: dict[int, float] = {}
+        self._health: dict[int, dict] = {}
+        self._retry_after: dict[int, float] = {}
+        self._last_warning: dict[int, float] = {}
+        self.output_enabled = os.environ.get("DMX_OUTPUT_ENABLED", "true").lower() != "false"
 
     # ------------------------------------------------------------------
     # Lifecycle / sync helpers
@@ -713,6 +719,9 @@ class ArtNetManager:
             self._light_to_controller.clear()
             self._dirty.clear()
             self._last_sent_at.clear()
+            self._health.clear()
+            self._retry_after.clear()
+            self._last_warning.clear()
             for ctrl in controllers:
                 buf = UniverseBuffer(ctrl.net, ctrl.subnet, ctrl.universe)
                 self._controllers[ctrl.id] = (ctrl, buf)
@@ -934,16 +943,55 @@ class ArtNetManager:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+    def controller_health(self, controller_id: int) -> dict:
+        with self._lock:
+            entry = self._controllers.get(controller_id)
+            ctrl = entry[0] if entry else None
+            data = dict(self._health.get(controller_id, {}))
+            data.setdefault("sent_count", 0)
+            data.setdefault("error_count", 0)
+            if ctrl and not ctrl.enabled:
+                data["status"] = "disabled"
+            else:
+                try:
+                    if ctrl:
+                        IPv4Address(ctrl.ip)
+                    data.setdefault("status", "waiting" if self.output_enabled else "simulation")
+                except ValueError:
+                    data["status"] = "error"
+                    data["last_error"] = "Invalid IPv4 address. Remove leading zeros and verify the intended device before saving."
+            return data
+
+    def health_snapshot(self) -> list[dict]:
+        with self._lock:
+            return [{"id": cid, "name": ctrl.name, "ip": ctrl.ip,
+                     **self.controller_health(cid)}
+                    for cid, (ctrl, _) in self._controllers.items()]
+
     def _send_buffer(self, ctrl: Controller, buf: UniverseBuffer) -> None:
-        packet = build_artdmx_packet(
-            ctrl.net, ctrl.subnet, ctrl.universe, bytes(buf.data)
-        )
-        try:
-            self._sock.sendto(packet, (ctrl.ip, ctrl.port))
-        except OSError as e:
-            log.warning("Failed to send Art-Net to %s:%s: %s", ctrl.ip, ctrl.port, e)
+        if not self.output_enabled:
             return
-        self._last_sent_at[ctrl.id] = time.monotonic()
+        now = time.monotonic()
+        if now < self._retry_after.get(ctrl.id, 0):
+            return
+        health = self._health.setdefault(ctrl.id, {"sent_count": 0, "error_count": 0})
+        health["last_attempt_at"] = time.time()
+        try:
+            IPv4Address(ctrl.ip)
+            packet = build_artdmx_packet(ctrl.net, ctrl.subnet, ctrl.universe, bytes(buf.data))
+            self._sock.sendto(packet, (ctrl.ip, ctrl.port))
+        except (OSError, ValueError) as error:
+            health.update(status="error", last_error=str(error), last_error_at=time.time())
+            health["error_count"] += 1
+            # Back off failing destinations and rate-limit logs, not render ticks.
+            self._retry_after[ctrl.id] = now + min(30, 2 ** min(health["error_count"], 5))
+            if now - self._last_warning.get(ctrl.id, -60) >= 60:
+                log.warning("Art-Net output failed for %s (%s:%s): %s", ctrl.name, ctrl.ip, ctrl.port, error)
+                self._last_warning[ctrl.id] = now
+            return
+        health.update(status="sending", last_error=None, last_sent_at=time.time())
+        health["sent_count"] += 1
+        self._last_sent_at[ctrl.id] = now
 
 
 manager = ArtNetManager()

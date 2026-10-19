@@ -539,7 +539,7 @@ class EffectEngine:
             for handle, rs in self._active.items():
                 if rs.fade_out_start is not None:
                     continue
-                covers: set[int] = set(rs.spec.light_ids or [])
+                covers: set[int] = set(rs.spec.mask_light_ids or rs.spec.light_ids or [])
                 for t in rs.spec.targets or []:
                     lid = t.get("light_id")
                     if isinstance(lid, int):

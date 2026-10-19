@@ -43,6 +43,7 @@ type TurnState =
 
 export default function Designer() {
   const toast = useToast();
+  const [showChats, setShowChats] = useState(false);
   const [aiEnabled, setAiEnabled] = useState<boolean | null>(null);
   const [conversations, setConversations] = useState<
     DesignerConversationSummary[]
@@ -69,9 +70,7 @@ export default function Designer() {
       return true;
     }
   });
-  const [critiques, setCritiques] = useState<Record<string, CritiqueEntry>>(
-    {},
-  );
+  const [critiques, setCritiques] = useState<Record<string, CritiqueEntry>>({});
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const autoScroll = useRef(true);
 
@@ -204,8 +203,7 @@ export default function Designer() {
   const handleScroll = () => {
     const el = transcriptRef.current;
     if (!el) return;
-    const nearBottom =
-      el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
     autoScroll.current = nearBottom;
   };
 
@@ -243,8 +241,7 @@ export default function Designer() {
   };
 
   const renameConversation = async (cid: number) => {
-    const current =
-      conversations.find((c) => c.id === cid)?.name ?? "Chat";
+    const current = conversations.find((c) => c.id === cid)?.name ?? "Chat";
     const name = window.prompt("Rename chat", current);
     if (!name) return;
     try {
@@ -307,10 +304,7 @@ export default function Designer() {
     if (convo) {
       setActiveConvo({
         ...convo,
-        messages: [
-          ...convo.messages,
-          { role: "user", text, proposals: [] },
-        ],
+        messages: [...convo.messages, { role: "user", text, proposals: [] }],
       });
     }
 
@@ -477,9 +471,20 @@ export default function Designer() {
   }
 
   return (
-    <div className="flex h-[calc(100vh-8rem)] flex-col gap-3 sm:flex-row">
+    <div className="flex h-[calc(100dvh-10rem)] min-h-[420px] flex-col gap-3 sm:flex-row">
+      <button
+        className="btn-secondary shrink-0 sm:hidden"
+        onClick={() => setShowChats(!showChats)}
+      >
+        {showChats ? "Back to design" : "Chats & new design"}
+      </button>
       {/* Sidebar */}
-      <aside className="flex w-full shrink-0 flex-col gap-2 sm:w-56">
+      <aside
+        className={
+          (showChats ? "flex " : "hidden ") +
+          "w-full shrink-0 flex-col gap-2 sm:flex sm:w-56"
+        }
+      >
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-semibold">Chats</h2>
           <button
@@ -534,8 +539,8 @@ export default function Designer() {
       </aside>
 
       {/* Chat panel */}
-      <section className="card flex min-h-0 flex-1 flex-col">
-        <header className="flex items-center justify-between gap-2 border-b border-line px-4 py-3">
+      <section className="card flex min-h-0 min-w-0 flex-1 flex-col">
+        <header className="flex flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-3">
           <div className="min-w-0">
             <h1 className="truncate text-lg font-semibold">
               {activeConvo?.name || "New chat"}
@@ -661,9 +666,7 @@ export default function Designer() {
         <SaveModal
           value={savePrompt.name}
           kind={savePrompt.proposal.kind}
-          onChange={(name) =>
-            setSavePrompt((s) => (s ? { ...s, name } : s))
-          }
+          onChange={(name) => setSavePrompt((s) => (s ? { ...s, name } : s))}
           onCancel={() => setSavePrompt(null)}
           onSubmit={submitSave}
         />
@@ -759,9 +762,7 @@ function MessageBubble({
                 {showPanel && (
                   <VerificationPanel
                     enabled={autoVerify || entry !== undefined}
-                    critique={
-                      entry === undefined ? null : entry.critique
-                    }
+                    critique={entry === undefined ? null : entry.critique}
                     error={entry?.error ?? null}
                     onVerify={() => onVerify(p)}
                     onRegenerate={onRegenerate}
@@ -891,10 +892,7 @@ function ProposalCard({
           >
             Save
           </button>
-          <button
-            className="btn-primary !px-2 !py-1 text-xs"
-            onClick={onApply}
-          >
+          <button className="btn-primary !px-2 !py-1 text-xs" onClick={onApply}>
             {applyLabel}
           </button>
         </div>
@@ -933,7 +931,13 @@ function ProposalCard({
         <div className="mt-2 text-[11px] text-muted">
           spread {proposal.effect.spread}
           {typeof proposal.effect.params?.speed_hz === "number" && (
-            <> · speed {(proposal.effect.params.speed_hz as number).toFixed(2)} Hz</>
+            <>
+              {" "}
+              · speed {(proposal.effect.params.speed_hz as number).toFixed(
+                2,
+              )}{" "}
+              Hz
+            </>
           )}
           {" · channels "}
           {proposal.effect.target_channels.join("+")}

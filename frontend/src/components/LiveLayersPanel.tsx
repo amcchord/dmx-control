@@ -8,6 +8,7 @@ import {
   LayerBlendMode,
 } from "../api";
 import { useLayerStore } from "../state/layers";
+import {useAuth} from "../auth";
 import { useToast } from "../toast";
 
 type Props = {
@@ -38,6 +39,7 @@ export default function LiveLayersPanel({
     removeLayer,
     clearAll,
   } = useLayerStore();
+  const {canOperate} = useAuth();
   const { push: notify } = useToast();
   const [busy, setBusy] = useState<number | null>(null);
 
@@ -104,7 +106,7 @@ export default function LiveLayersPanel({
   }
 
   return (
-    <div className="card flex h-full flex-col overflow-hidden">
+    <fieldset disabled={!canOperate} className="card flex h-full min-w-0 flex-col overflow-hidden">
       <div className="flex items-center justify-between border-b border-line px-3 py-2">
         <div>
           <div className="text-xs font-semibold uppercase tracking-wide text-muted">
@@ -196,7 +198,7 @@ export default function LiveLayersPanel({
           <span>dropped {health.dropped_frames}</span>
         </div>
       )}
-    </div>
+    </fieldset>
   );
 }
 
@@ -426,7 +428,7 @@ function BaseRow({ change }: { change: BaseStateChange | null }) {
     ? `${change.light_count} ${
         change.light_count === 1 ? "light" : "lights"
       } · ${formatRelative(change.at)}`
-    : "Direct DB writes show up here once any color/scene is applied.";
+    : "Your most recent color or scene change appears here.";
   return (
     <div
       className="flex items-center gap-2 rounded-md bg-bg-elev/60 px-2 py-1.5 ring-1 ring-line"

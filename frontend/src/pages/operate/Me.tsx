@@ -8,11 +8,22 @@ import { useLayerStore } from "../../state/layers";
  *  hot-path control here. */
 export default function Me() {
   const navigate = useNavigate();
-  const { logout } = useAuth();
+  const { logout, user, isAdmin } = useAuth();
   const { health, connected } = useLayerStore();
 
   return (
     <div className="flex flex-col gap-3">
+      <section className="card p-4">
+        <h1 className="text-xl font-semibold">{user?.name}</h1>
+        <p className="text-sm text-muted">
+          {user?.username} · {user?.role}
+        </p>
+        {isAdmin && (
+          <Link to="/config/accounts" className="btn-secondary mt-3">
+            People & access
+          </Link>
+        )}
+      </section>
       <section className="card p-4">
         <div className="text-xs uppercase tracking-widest text-muted">
           Engine
@@ -53,11 +64,13 @@ export default function Me() {
           Authoring
         </div>
         <p className="mt-1 text-xs text-muted">
-          Lua editing, palette authoring, scene composing, and AI design
-          live on the desktop. Open the same URL from a desktop browser
-          to jump in.
+          Create effects, palettes and saved looks here on your phone. For
+          detailed Lua editing, a larger screen can help.
         </p>
         <div className="mt-3 flex flex-col gap-1.5 text-sm">
+          <Link to="/author/designer" className="btn-secondary justify-start">
+            AI Designer
+          </Link>
           <Link to="/author/effects" className="btn-secondary justify-start">
             Effects Composer
           </Link>
@@ -73,22 +86,24 @@ export default function Me() {
         </div>
       </section>
 
-      <section className="card p-4">
-        <div className="text-xs uppercase tracking-widest text-muted">
-          Configure
-        </div>
-        <div className="mt-2 flex flex-col gap-1.5 text-sm">
-          <Link
-            to="/config/controllers"
-            className="btn-secondary justify-start"
-          >
-            Controllers
-          </Link>
-          <Link to="/config/models" className="btn-secondary justify-start">
-            Light models
-          </Link>
-        </div>
-      </section>
+      {isAdmin && (
+        <section className="card p-4">
+          <div className="text-xs uppercase tracking-widest text-muted">
+            Configure
+          </div>
+          <div className="mt-2 flex flex-col gap-1.5 text-sm">
+            <Link
+              to="/config/controllers"
+              className="btn-secondary justify-start"
+            >
+              Controllers
+            </Link>
+            <Link to="/config/models" className="btn-secondary justify-start">
+              Light models
+            </Link>
+          </div>
+        </section>
+      )}
 
       <button
         className="btn-ghost"

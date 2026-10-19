@@ -17,12 +17,14 @@ plumbing or conversation state."""
 
 from __future__ import annotations
 
+from .ai_runtime import request_options, serialize_content
+
 import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from .config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+from .config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ANTHROPIC_FAST_MODEL
 from .lua import ScriptError, compile_script, smoke_test_source
 
 log = logging.getLogger(__name__)
@@ -266,11 +268,11 @@ def refine_lua_source(
         attempts += 1
         try:
             msg = client.messages.create(
-                model=ANTHROPIC_MODEL,
-                max_tokens=4096,
+                model=ANTHROPIC_FAST_MODEL,
+                max_tokens=8192,
                 system=_REFINER_SYSTEM,
                 tools=[tool],
-                tool_choice={"type": "tool", "name": "propose_effect"},
+                **request_options(),
                 messages=history,
             )
         except Exception as exc:  # network / rate limit / etc.
@@ -313,15 +315,7 @@ def refine_lua_source(
             current_source = new_source
             history.append({
                 "role": "assistant",
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "id": getattr(tool_blocks[0], "id", "")
-                        or "tool_refine",
-                        "name": "propose_effect",
-                        "input": dict(inp),
-                    }
-                ],
+                "content": serialize_content(msg),
             })
             history.append({
                 "role": "user",
@@ -357,15 +351,7 @@ def refine_lua_source(
         # expects after a tool_use.
         history.append({
             "role": "assistant",
-            "content": [
-                {
-                    "type": "tool_use",
-                    "id": getattr(tool_blocks[0], "id", "")
-                    or "tool_refine",
-                    "name": "propose_effect",
-                    "input": dict(inp),
-                }
-            ],
+            "content": serialize_content(msg),
         })
         history.append({
             "role": "user",

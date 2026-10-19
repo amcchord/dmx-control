@@ -7,6 +7,7 @@ export default function Login() {
   const { authenticated, login } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const toast = useToast();
@@ -26,9 +27,9 @@ export default function Login() {
     e.preventDefault();
     setSubmitting(true);
     try {
-      const ok = await login(password);
+      const ok = await login(username, password);
       if (!ok) {
-        toast.push("Incorrect password", "error");
+        toast.push("Username or password is incorrect", "error");
       }
     } catch (err) {
       toast.push(String(err), "error");
@@ -45,7 +46,7 @@ export default function Login() {
       <form
         onSubmit={onSubmit}
         className="card relative w-full max-w-sm p-7"
-        autoComplete="off"
+        autoComplete="on"
       >
         <div className="mb-6 flex items-center gap-3">
           <div className="grid h-10 w-10 grid-cols-2 grid-rows-2 gap-0.5 overflow-hidden rounded-lg">
@@ -59,6 +60,8 @@ export default function Login() {
             <div className="text-xs text-muted">Art-Net lighting console</div>
           </div>
         </div>
+        <label htmlFor="username" className="label">Username</label>
+        <input id="username" name="username" autoComplete="username" autoCapitalize="none" spellCheck={false} className="input mt-1 mb-4" value={username} onChange={e => setUsername(e.target.value)} autoFocus required />
         <label htmlFor="pw" className="label">
           Password
         </label>
@@ -68,13 +71,14 @@ export default function Login() {
           className="input mt-1"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
-          autoFocus
+          name="password"
+          autoComplete="current-password"
           required
         />
         <button
           className="btn-primary mt-5 w-full"
           type="submit"
-          disabled={submitting || !password}
+          disabled={submitting || !password || !username}
         >
           {submitting ? "Signing in..." : "Sign in"}
         </button>

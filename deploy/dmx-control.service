@@ -8,7 +8,7 @@ Type=simple
 User=dmx
 Group=dmx
 WorkingDirectory=/opt/dmx-control/backend
-Environment=DMX_PASSWORD=secretsauce
+Environment=DMX_COOKIE_SECURE=true
 Environment=DMX_DATA_DIR=/var/lib/dmx-control
 # Optional: holds ANTHROPIC_API_KEY for the Claude-based manual parser.
 # The leading '-' makes systemd tolerate the file being absent.

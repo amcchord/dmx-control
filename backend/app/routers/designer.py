@@ -23,6 +23,8 @@ turn.
 
 from __future__ import annotations
 
+from ..ai_runtime import request_options, serialize_content
+
 import asyncio
 import json
 import logging
@@ -34,7 +36,7 @@ from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select
 
 from ..auth import AuthDep
-from ..config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+from ..config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ANTHROPIC_FAST_MODEL
 from ..db import get_session
 from ..engine import (
     engine as effect_engine,
@@ -1728,11 +1730,11 @@ def _run_verifier(
         },
     ]
     resp = client.messages.create(
-        model=ANTHROPIC_MODEL,
-        max_tokens=2048,
+        model=ANTHROPIC_FAST_MODEL,
+        max_tokens=4096,
         system=system,
         tools=[_verify_tool_schema()],
-        tool_choice={"type": "tool", "name": _VERIFY_TOOL_NAME},
+        **request_options(),
         messages=messages,
     )
     payload: Optional[dict[str, Any]] = None
@@ -1923,7 +1925,7 @@ async def stream_message(
                     max_tokens=8192,
                     system=system_prompt,
                     tools=tool_schemas,
-                    tool_choice={"type": "any"},
+                    **request_options("medium"),
                     messages=api_messages,
                 ) as stream:
                     for event in stream:
@@ -1942,8 +1944,8 @@ async def stream_message(
                         elif etype == "content_block_delta":
                             delta = getattr(event, "delta", None)
                             dtype = getattr(delta, "type", None)
-                            if dtype == "text_delta":
-                                t = getattr(delta, "text", "") or ""
+                            if dtype in {"text_delta", "thinking_delta"}:
+                                t = getattr(delta, "text", "") or getattr(delta, "thinking", "") or ""
                                 if t:
                                     loop.call_soon_threadsafe(
                                         queue.put_nowait,
@@ -1963,30 +1965,7 @@ async def stream_message(
                         # we collect the final message after the loop.
                     if not stop_flag["cancelled"]:
                         final = stream.get_final_message()
-                        blocks: list[dict[str, Any]] = []
-                        for blk in getattr(final, "content", []) or []:
-                            btype = getattr(blk, "type", None)
-                            if btype == "text":
-                                blocks.append(
-                                    {
-                                        "type": "text",
-                                        "text": getattr(blk, "text", "") or "",
-                                    }
-                                )
-                            elif btype == "tool_use":
-                                inp = getattr(blk, "input", None)
-                                blocks.append(
-                                    {
-                                        "type": "tool_use",
-                                        "id": getattr(blk, "id", "") or "",
-                                        "name": getattr(blk, "name", "")
-                                        or "",
-                                        "input": inp
-                                        if isinstance(inp, dict)
-                                        else {},
-                                    }
-                                )
-                        final_content_blocks.extend(blocks)
+                        final_content_blocks.extend(serialize_content(final))
                         loop.call_soon_threadsafe(
                             queue.put_nowait, ("__done__", None)
                         )

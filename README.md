@@ -154,8 +154,8 @@ a Caddy + systemd deployment that fronts everything at
   scene clears every running layer that touches affected lights,
   pushes the base state, then starts each saved layer in order — a
   whole-show recall in one click.
-- Single shared password ("secretsauce" by default) via a signed session
-  cookie.
+- Named administrator, operator, and viewer accounts with signed secure
+  session cookies and sign-in throttling.
 - Everything persists to SQLite and is restored to the physical rig on
   service restart.
 
@@ -177,9 +177,9 @@ It will:
 5. Drop `deploy/Caddyfile` at `/etc/caddy/Caddyfile` and reload Caddy so
    `https://dmx.50day.io` terminates TLS and reverse-proxies the backend.
 
-Override the login password by editing `DMX_PASSWORD=` in
-`deploy/dmx-control.service` before running the installer (or
-`systemctl edit dmx-control.service` after).
+Create an initial administrator with `python -m app.accounts` from the backend
+directory. See [Phone operator upgrade](docs-mobile-upgrade.md) for account setup,
+mobile workflows, backup and recovery procedures.
 
 ## Local development
 
@@ -188,7 +188,7 @@ Override the login password by editing `DMX_PASSWORD=` in
 cd backend
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-DMX_PASSWORD=secretsauce .venv/bin/uvicorn app.main:app --reload --port 8000
+DMX_COOKIE_SECURE=false DMX_OUTPUT_ENABLED=false .venv/bin/uvicorn app.main:app --reload --port 8000
 
 # Frontend (in a second terminal)
 cd frontend
@@ -198,10 +198,10 @@ npm run dev   # http://localhost:5173, proxies /api to :8000
 
 ## REST API
 
-All endpoints live under `/api`. Auth is a single shared password:
+All endpoints live under `/api`. Auth uses a named account and secure session cookie:
 
 ```
-POST /api/auth/login     { "password": "..." }      -> sets dmx_session cookie
+POST /api/auth/login     { "username": "...", "password": "..." }      -> sets dmx_session cookie
 POST /api/auth/logout
 GET  /api/auth/status
 ```
@@ -807,8 +807,9 @@ prompt. They live on `POST /api/controllers` / `POST /api/lights` (plus
 the matching `PATCH` endpoints) as an optional `notes: string | null`.
 
 Requires `ANTHROPIC_API_KEY` (env var or `claudeKey.env` at the repo
-root); the model defaults to `claude-opus-4-7` and is overridable via
-`ANTHROPIC_MODEL`.
+root); the models default to `claude-opus-5-5` for design/chat and `claude-sonnet-5-5`
+for extraction, palette generation and repair. Override using `ANTHROPIC_MODEL`
+and `ANTHROPIC_FAST_MODEL`.
 
 ## Architecture
 

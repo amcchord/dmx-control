@@ -10,7 +10,7 @@ a row."""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session, select
 
 from ..artnet import manager
@@ -42,6 +42,7 @@ def _row_to_out(row: State) -> StateOut:
     return StateOut(
         id=row.id,
         name=row.name,
+        favorite=row.favorite,
         lights=[SceneLightState(**l) for l in (row.lights or [])],
         builtin=False,
     )
@@ -103,6 +104,8 @@ def update_state(
     row = sess.get(State, sid)
     if row is None:
         raise HTTPException(404, "state not found")
+    if payload.favorite is not None:
+        row.favorite = payload.favorite
     if payload.name is not None:
         row.name = payload.name
     if payload.recapture:
@@ -134,7 +137,8 @@ def apply_blackout_all(sess: Session = Depends(get_session)) -> dict:
     """Rig-wide blackout: zero every light on every controller."""
     lights = sess.exec(select(Light)).all()
     affected = {l.id for l in lights if l.id is not None}
-    engine.stop_affecting(affected)
+    from ..look_helpers import stop_layers_for
+    stop_layers_for(sess, affected)
     for light in lights:
         light.r = light.g = light.b = light.w = light.a = light.uv = 0
         light.on = False
@@ -156,7 +160,7 @@ def apply_blackout_all(sess: Session = Depends(get_session)) -> dict:
 
 
 @router.post("/{sid}/apply")
-def apply_state(sid: int, sess: Session = Depends(get_session)) -> dict:
+def apply_state(sid: int, fade_s: float = Query(0, ge=0, le=10), sess: Session = Depends(get_session)) -> dict:
     row = sess.get(State, sid)
     if row is None:
         raise HTTPException(404, "state not found")
@@ -165,7 +169,9 @@ def apply_state(sid: int, sess: Session = Depends(get_session)) -> dict:
     if not by_id:
         return {"ok": True, "applied": 0}
 
-    engine.stop_affecting(set(by_id.keys()))
+    from ..look_helpers import stop_layers_for
+    starts = {x["light_id"]: x for x in capture_lights(list(sess.exec(select(Light)).all()), from_rendered=True)}
+    stop_layers_for(sess, set(by_id.keys()))
 
     lights = sess.exec(select(Light).where(Light.id.in_(list(by_id.keys())))).all()
     applied = 0
@@ -177,8 +183,12 @@ def apply_state(sid: int, sess: Session = Depends(get_session)) -> dict:
         sess.add(light)
         applied += 1
     sess.commit()
-    for light in lights:
-        push_light(light)
+    if fade_s > 0:
+        from ..transitions import fade
+        fade(by_id, fade_s, starts)
+    else:
+        for light in lights:
+            push_light(light)
     if applied:
         base_state_log.record(
             "state",

@@ -209,6 +209,7 @@ class Scene(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
+    favorite: bool = False
     controller_id: int = Field(foreign_key="controller.id", index=True)
     cross_controller: bool = False
     lights: list[dict] = Field(default_factory=list, sa_column=Column(JSON))
@@ -358,4 +359,23 @@ class State(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
+    favorite: bool = False
     lights: list[dict] = Field(default_factory=list, sa_column=Column(JSON))
+
+
+class User(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    username: str = Field(index=True, unique=True)
+    name: str
+    password_hash: str
+    role: str = "operator"
+    enabled: bool = True
+    session_version: int = 1
+
+
+class LookCheckpoint(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    label: str
+    created_at: str
+    lights: list[dict] = Field(default_factory=list, sa_column=Column(JSON))
+    layers: list[dict] = Field(default_factory=list, sa_column=Column(JSON))

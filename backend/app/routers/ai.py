@@ -7,6 +7,8 @@ reliable structured output.
 
 from __future__ import annotations
 
+from ..ai_runtime import request_options, serialize_content
+
 import base64
 import logging
 from typing import Any
@@ -14,7 +16,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, UploadFile
 
 from ..auth import AuthDep
-from ..config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+from ..config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ANTHROPIC_FAST_MODEL
 from ..schemas import CHANNEL_ROLES
 
 log = logging.getLogger(__name__)
@@ -338,7 +340,7 @@ _SYSTEM_PROMPT = (
 
 @router.get("/ai/status")
 def ai_status() -> dict[str, Any]:
-    return {"enabled": bool(ANTHROPIC_API_KEY), "model": ANTHROPIC_MODEL}
+    return {"enabled": bool(ANTHROPIC_API_KEY), "model": ANTHROPIC_FAST_MODEL}
 
 
 @router.post("/models/parse-manual")
@@ -479,16 +481,12 @@ async def _run_anthropic(client, content: list[dict[str, Any]]):
 
     def _do_call():
         return client.messages.create(
-            model=ANTHROPIC_MODEL,
-            # Opus 4.7's new tokenizer uses up to ~35% more output tokens
-            # than 4.6, and complex pixel-bar / multi-zone fixtures emit
-            # large layout JSON. 4096 truncated mid tool_use on the OK-062
-            # manual; 32768 leaves comfortable headroom inside Opus 4.7's
-            # 128K output cap.
+            model=ANTHROPIC_FAST_MODEL,
+            # Large multi-zone fixture manuals need room for layout JSON.
             max_tokens=32768,
             system=_SYSTEM_PROMPT,
             tools=[_build_tool_schema()],
-            tool_choice={"type": "tool", "name": _TOOL_NAME},
+            **request_options(),
             messages=[{"role": "user", "content": content}],
         )
 

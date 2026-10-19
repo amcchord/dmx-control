@@ -37,7 +37,7 @@ export default function RigPreview({
   lights,
   onSelect,
   selected,
-  hz = 4,
+  hz = 2,
   size = "md",
   className = "",
   compact = false,
@@ -53,6 +53,7 @@ export default function RigPreview({
 
     const tick = async () => {
       try {
+        if (document.hidden) return;
         const data = await Api.listRenderedLights();
         if (!cancelled) setRendered(data);
       } catch {
@@ -69,11 +70,7 @@ export default function RigPreview({
   }, [hz]);
 
   const cellClass =
-    size === "sm"
-      ? "h-6 w-6"
-      : size === "lg"
-        ? "h-12 w-12"
-        : "h-9 w-9";
+    size === "sm" ? "h-6 w-6" : size === "lg" ? "h-12 w-12" : "h-9 w-9";
 
   if (lights.length === 0) {
     return (
@@ -186,7 +183,13 @@ function CellGrid({
   showLabels: boolean;
 }) {
   return (
-    <div className="flex flex-wrap gap-2">
+    <div
+      className={
+        showLabels
+          ? "grid grid-cols-[repeat(auto-fill,minmax(108px,1fr))] gap-2"
+          : "flex flex-wrap gap-2"
+      }
+    >
       {lights.map((light) => {
         const r = rendered[String(light.id)];
         const swatch = r
@@ -228,9 +231,7 @@ function CellGrid({
                     key={zid}
                     className="h-full w-full"
                     style={{
-                      background: z.on
-                        ? `rgb(${z.r}, ${z.g}, ${z.b})`
-                        : "#000",
+                      background: z.on ? `rgb(${z.r}, ${z.g}, ${z.b})` : "#000",
                     }}
                   />
                 ))}
@@ -240,8 +241,11 @@ function CellGrid({
         );
 
         const label = showLabels ? (
-          <span className="block max-w-[5rem] truncate text-center text-[10px] text-muted">
+          <span className="block w-full break-words text-center text-xs leading-snug text-slate-200">
             {light.name}
+            <span className="mt-1 block text-[10px] text-muted">
+              DMX {light.start_address} · #{light.id}
+            </span>
           </span>
         ) : null;
 
@@ -250,8 +254,8 @@ function CellGrid({
             <button
               key={light.id}
               onClick={() => onSelect(light.id)}
-              className="group flex flex-col items-center gap-1 rounded-md focus:outline-none focus:ring-2 focus:ring-accent"
-              aria-label={`${light.name}`}
+              className="group flex min-w-0 flex-col items-center gap-2 rounded-lg bg-bg-card/70 p-2 focus:outline-none focus:ring-2 focus:ring-accent"
+              aria-label={`${light.name}, DMX ${light.start_address}, fixture ${light.id}`}
               aria-pressed={isSelected ? true : false}
               title={`${light.name} (#${light.id})`}
             >
